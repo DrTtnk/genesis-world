@@ -468,11 +468,23 @@ class MPMEntity(ParticleEntity):
 
         Parameters
         ----------
-        actu_grad : torch.Tensor
-            A tensor containing gradients for actuation inputs.
+        actu_grad : torch.Tensor, shape (B, n_particles, n_groups)
+            Output tensor, filled with the gradient of the actuation input. Its shape matches the
+            actuation target recorded by `set_actuation`.
         """
+        envs_idx = self._scene._sanitize_envs_idx(None)
+        if actu_grad.shape[0] != len(envs_idx):
+            gs.raise_exception(
+                "Actuation gradients are only supported when actuation is set for every environment. "
+                f"Got a target for {actu_grad.shape[0]} environments out of {len(envs_idx)}."
+            )
         self.solver._kernel_set_particles_actu_grad(
-            self._sim.cur_substep_local, self._particle_start, self._n_particles, actu_grad
+            self._sim.cur_substep_local,
+            self._particle_start,
+            self._n_particles,
+            self.material.n_groups,
+            envs_idx,
+            actu_grad,
         )
 
     def get_particles_actu(self, envs_idx=None):

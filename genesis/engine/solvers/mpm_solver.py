@@ -704,6 +704,10 @@ class MPMSolver(Solver):
             self.particles.grad[i_f, i_p, i_b].U = qd.Matrix.zero(gs.qd_float, 3, 3)
             self.particles.grad[i_f, i_p, i_b].V = qd.Matrix.zero(gs.qd_float, 3, 3)
             self.particles.grad[i_f, i_p, i_b].S = qd.Matrix.zero(gs.qd_float, 3, 3)
+            # actu accumulates with += like every other gradient field, so it must be cleared
+            # here too. Omitting it leaks the actuation gradient of later steps into earlier
+            # ones, silently, for any rollout longer than one checkpoint segment.
+            self.particles.grad[i_f, i_p, i_b].actu = gs.qd_float(0.0)
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ gradient --------------------------------------
@@ -1077,13 +1081,20 @@ class MPMSolver(Solver):
         f: qd.i32,
         particle_start: qd.i32,
         n_particles: qd.i32,
+        n_groups: qd.i32,
         envs_idx: qd.types.ndarray(),
-        actus_grad: qd.types.ndarray(),  # shape [B, n_particles]
+        actus_grad: qd.types.ndarray(),  # shape [B, n_particles, n_groups]
     ):
-        for i_p_, i_g, i_b_ in qd.ndrange(n_particles, envs_idx.shape[0]):
+        # Adjoint of _kernel_set_particles_actu, which writes actus[i_b_, i_p_, i_g] into a
+        # particle only when that particle belongs to group i_g. The gradient therefore
+        # reaches the input at exactly those entries and is zero everywhere else.
+        for i_p_, i_g, i_b_ in qd.ndrange(n_particles, n_groups, envs_idx.shape[0]):
             i_p = i_p_ + particle_start
             i_b = envs_idx[i_b_]
-            actus_grad[i_b_, i_p_] = self.particles.grad[f, i_p, i_b].actu
+            if self.particles_info[i_p].muscle_group == i_g:
+                actus_grad[i_b_, i_p_, i_g] = self.particles.grad[f, i_p, i_b].actu
+            else:
+                actus_grad[i_b_, i_p_, i_g] = 0.0
 
     @qd.kernel
     def _kernel_get_particles_actu(
