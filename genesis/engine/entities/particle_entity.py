@@ -433,7 +433,13 @@ class ParticleEntity(Entity):
             index = self._sim.cur_step_local - self._sim._steps_local
             for key in self._tgt_keys:
                 self._tgt[key] = self._tgt_buffer[key][index]
-        else:
+        elif self._sim.requires_grad:
+            # The buffer exists solely so the backward pass can replay the inputs of each step.
+            # Without gradients nothing ever drains it: process_input_grad, save_ckpt and
+            # reset_grad are the only consumers and none of them run. Appending regardless
+            # retains one GPU tensor per step forever, which is invisible for pos and vel because
+            # those targets are None except on reset, and a steady leak for actu because a control
+            # loop sets it every step. Measured at 3.5 MB per step with 32 environments.
             for key in self._tgt_keys:
                 self._tgt_buffer[key].append(self._tgt[key])
 
