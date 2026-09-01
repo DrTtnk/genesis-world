@@ -457,8 +457,14 @@ class MPMEntity(ParticleEntity):
         particles_idx_local = self._sanitize_particles_idx_local(particles_idx_local, envs_idx)
         particles_idx = particles_idx_local + self._particle_start
         actus = self._sanitize_particles_tensor(actus, gs.tc_float, particles_idx, envs_idx, (self.material.n_groups,))
+        # One actuation command covers the whole step, so it is written to every substep frame.
         self.solver._kernel_set_particles_actu(
-            self._sim.cur_substep_local, self.material.n_groups, particles_idx, envs_idx, actus
+            self._sim.cur_substep_local,
+            self._sim.substeps_local,
+            self.material.n_groups,
+            particles_idx,
+            envs_idx,
+            actus,
         )
 
     @gs.assert_built
@@ -480,6 +486,7 @@ class MPMEntity(ParticleEntity):
             )
         self.solver._kernel_set_particles_actu_grad(
             self._sim.cur_substep_local,
+            self._sim.substeps_local,
             self._particle_start,
             self._n_particles,
             self.material.n_groups,

@@ -1063,38 +1063,48 @@ class MPMSolver(Solver):
     @qd.kernel
     def _kernel_set_particles_actu(
         self,
-        f: qd.i32,
+        f_start: qd.i32,
+        f_end: qd.i32,
         n_groups: qd.i32,
         particles_idx: qd.types.ndarray(),
         envs_idx: qd.types.ndarray(),
         actus: qd.types.ndarray(),  # shape [B, n_particles, n_groups]
     ):
-        for i_p_, i_g, i_b_ in qd.ndrange(particles_idx.shape[1], n_groups, envs_idx.shape[0]):
+        # External input is given per step, not per substep, so one actuation command applies to
+        # every substep frame of that step. Writing only the frame process_input ran on leaves the
+        # remaining substeps unactuated, because copy_frame does not carry `actu` forward. That is
+        # invisible when substeps_local is 1, and costs an order of magnitude of muscle force under
+        # requires_grad, where substeps_local equals substeps.
+        for i_f, i_p_, i_g, i_b_ in qd.ndrange(
+            (f_start, f_end + 1), particles_idx.shape[1], n_groups, envs_idx.shape[0]
+        ):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
             if self.particles_info[i_p].muscle_group == i_g:
-                self.particles[f, i_p, i_b].actu = actus[i_b_, i_p_, i_g]
+                self.particles[i_f, i_p, i_b].actu = actus[i_b_, i_p_, i_g]
 
     @qd.kernel
     def _kernel_set_particles_actu_grad(
         self,
-        f: qd.i32,
+        f_start: qd.i32,
+        f_end: qd.i32,
         particle_start: qd.i32,
         n_particles: qd.i32,
         n_groups: qd.i32,
         envs_idx: qd.types.ndarray(),
         actus_grad: qd.types.ndarray(),  # shape [B, n_particles, n_groups]
     ):
-        # Adjoint of _kernel_set_particles_actu, which writes actus[i_b_, i_p_, i_g] into a
-        # particle only when that particle belongs to group i_g. The gradient therefore
-        # reaches the input at exactly those entries and is zero everywhere else.
+        # Adjoint of _kernel_set_particles_actu. That kernel copies one input entry into every
+        # substep frame of the step, and only for particles belonging to group i_g, so the
+        # gradient of the input is the sum over those frames and is zero for other groups.
         for i_p_, i_g, i_b_ in qd.ndrange(n_particles, n_groups, envs_idx.shape[0]):
             i_p = i_p_ + particle_start
             i_b = envs_idx[i_b_]
+            total = gs.qd_float(0.0)
             if self.particles_info[i_p].muscle_group == i_g:
-                actus_grad[i_b_, i_p_, i_g] = self.particles.grad[f, i_p, i_b].actu
-            else:
-                actus_grad[i_b_, i_p_, i_g] = 0.0
+                for i_f in range(f_start, f_end + 1):
+                    total += self.particles.grad[i_f, i_p, i_b].actu
+            actus_grad[i_b_, i_p_, i_g] = total
 
     @qd.kernel
     def _kernel_get_particles_actu(
