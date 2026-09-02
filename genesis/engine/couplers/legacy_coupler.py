@@ -94,6 +94,7 @@ class LegacyCoupler(RBC):
 
         if self._mpm_pbd:
             self.mpm_pbd_stencil_size = int(np.floor(self.mpm_solver.dx / self.pbd_solver.hash_grid_cell_size) + 2)
+            self._build_pbd_face_adjacency()
 
         ## DEBUG
         self._dx = 1 / 1024
@@ -123,6 +124,62 @@ class LegacyCoupler(RBC):
     def _kernel_reset_sph(self, envs_idx: qd.types.ndarray()):
         for i_p, i_g, i_b_ in qd.ndrange(self.sph_solver.n_particles, self.rigid_solver.n_geoms, envs_idx.shape[0]):
             self.sph_rigid_normal[i_p, i_g, envs_idx[i_b_]] = 0.0
+
+    def _build_pbd_face_adjacency(self) -> None:
+        """
+        Static (topology never changes) triangle buffer plus a per-vertex CSR of incident triangles, built once
+        from each PBD entity's own remeshed physics mesh (`entity._mesh.faces`, global-indexed by adding
+        `entity._particle_start`) -- NOT the solver's `vfaces_indices`, which holds the pre-remesh render mesh
+        and does not correspond 1:1 to particles. The MPM<->PBD barrier walks this to find, for a cloth
+        particle already found near an MPM grid node through the existing spatial hash, the triangles it
+        belongs to.
+        """
+        n_particles = self.pbd_solver.n_particles
+        faces_list = [entity._mesh.faces + entity._particle_start for entity in self.pbd_solver._entities]
+        faces = np.concatenate(faces_list, axis=0).astype(np.int32) if faces_list else np.zeros((0, 3), np.int32)
+        n_faces = len(faces)
+
+        self.pbd_faces = qd.field(dtype=gs.qd_ivec3, shape=(max(n_faces, 1),))
+        self.pbd_faces.from_numpy(faces if n_faces else np.zeros((1, 3), np.int32))
+
+        vert_ids = faces.reshape(-1) if n_faces else np.zeros((0,), np.int32)
+        face_ids = np.repeat(np.arange(n_faces, dtype=np.int32), 3) if n_faces else np.zeros((0,), np.int32)
+        order = np.argsort(vert_ids, kind="stable")
+        counts = np.bincount(vert_ids[order], minlength=n_particles)
+        starts = np.zeros(n_particles + 1, dtype=np.int32)
+        starts[1:] = np.cumsum(counts)
+
+        self.pbd_vert_face_start = qd.field(gs.qd_int, shape=(n_particles + 1,))
+        self.pbd_vert_face_start.from_numpy(starts)
+        self.pbd_vert_face_list = qd.field(gs.qd_int, shape=(max(len(face_ids), 1),))
+        self.pbd_vert_face_list.from_numpy(face_ids[order] if n_faces else np.zeros((1,), np.int32))
+
+        # Staging buffer for the momentum the barrier hands from MPM to the cloth. `mpm_grid_op` parallelises
+        # over grid nodes, and several nodes can independently contact the same triangle in one call; each
+        # node's own bounce (below) is self-contained (computed against its own mass only, so it can never
+        # blow up regardless of how many other nodes touch the same patch), and the exact momentum it removes
+        # from the MPM side is atomically summed here per cloth vertex -- a real superposition of contact
+        # impulses, not a race -- then applied to the cloth once, after the whole grid is done, by
+        # `_kernel_apply_pbd_contact_momentum`. Applying it inside the node loop instead (one node's read,
+        # modify, write racing another's) is what caused the barrier to fling particles through the skin
+        # during development: many nodes each computed a correction sized to zero the *entire* relative
+        # velocity against one triangle's small mass, and those corrections stacked instead of summing a
+        # bounded quantity.
+        self.pbd_contact_dmv = qd.Vector.field(3, dtype=gs.qd_float, shape=(n_particles, self.pbd_solver._B))
+
+    @qd.kernel
+    def _kernel_zero_pbd_contact_momentum(self):
+        for i_p, i_b in qd.ndrange(self.pbd_solver.n_particles, self.pbd_solver._B):
+            self.pbd_contact_dmv[i_p, i_b] = qd.Vector([0.0, 0.0, 0.0])
+
+    @qd.kernel
+    def _kernel_apply_pbd_contact_momentum(self):
+        for i_p, i_b in qd.ndrange(self.pbd_solver.n_particles, self.pbd_solver._B):
+            dmv = self.pbd_contact_dmv[i_p, i_b]
+            if dmv.norm_sqr() > 0:
+                s = self.pbd_solver.particles_ng[i_p, i_b].reordered_idx
+                if self.pbd_solver.particles_reordered[s, i_b].free:
+                    self.pbd_solver.particles_reordered[s, i_b].vel += dmv / self.pbd_solver.particles_info[i_p].mass
 
     @qd.func
     def _func_collide_with_rigid(
@@ -310,6 +367,53 @@ class LegacyCoupler(RBC):
         return vel
 
     @qd.func
+    def _func_closest_point_on_triangle(self, p, a, b, c):
+        """
+        Closest point on triangle (a, b, c) to p, and its barycentric weights, by region (Ericson,
+        Real-Time Collision Detection 5.1.5). No early return: quadrants funcs favor a single exit,
+        so every region sets `bary` and falls through.
+        """
+        ab = b - a
+        ac = c - a
+        ap = p - a
+        d1 = ab.dot(ap)
+        d2 = ac.dot(ap)
+        bp = p - b
+        d3 = ab.dot(bp)
+        d4 = ac.dot(bp)
+        cp = p - c
+        d5 = ab.dot(cp)
+        d6 = ac.dot(cp)
+        vc = d1 * d4 - d3 * d2
+        vb = d5 * d2 - d1 * d6
+        va = d3 * d6 - d5 * d4
+
+        bary = qd.Vector([1.0, 0.0, 0.0])
+        if d1 <= 0 and d2 <= 0:
+            bary = qd.Vector([1.0, 0.0, 0.0])
+        elif d3 >= 0 and d4 <= d3:
+            bary = qd.Vector([0.0, 1.0, 0.0])
+        elif vc <= 0 and d1 >= 0 and d3 <= 0:
+            v = d1 / (d1 - d3)
+            bary = qd.Vector([1 - v, v, 0.0])
+        elif d6 >= 0 and d5 <= d6:
+            bary = qd.Vector([0.0, 0.0, 1.0])
+        elif vb <= 0 and d2 >= 0 and d6 <= 0:
+            w = d2 / (d2 - d6)
+            bary = qd.Vector([1 - w, 0.0, w])
+        elif va <= 0 and (d4 - d3) >= 0 and (d5 - d6) >= 0:
+            w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+            bary = qd.Vector([0.0, 1 - w, w])
+        else:
+            denom = 1.0 / (va + vb + vc)
+            v = vb * denom
+            w = vc * denom
+            bary = qd.Vector([1 - v - w, v, w])
+
+        closest = a * bary[0] + b * bary[1] + c * bary[2]
+        return closest, bary
+
+    @qd.func
     def _func_mpm_tool(self, f, pos_world, vel, i_b):
         for entity in qd.static(self.tool_solver.entities):
             if qd.static(entity.material.collision):
@@ -417,17 +521,29 @@ class LegacyCoupler(RBC):
                     # using the lower corner of MPM cell to find the corresponding PBD base cell
                     base = self.pbd_solver.sh.pos_to_grid(pos - 0.5 * self.mpm_solver.dx)
 
-                    # ---------- PBD -> MPM ----------
-                    # Momentum-conserving exchange: the grid node and the cloth particles in its cell
-                    # take their common centre-of-mass velocity, and each side receives the momentum
-                    # change in proportion to its mass. The previous version made the node adopt the
-                    # cloth velocity and pushed the whole momentum change onto the cloth, so a light
-                    # cloth (4 kg/m2, 0.1 g per 5 mm particle) against a grid node carrying grams of
-                    # MPM was kicked hundreds of times too hard and every particle left the domain
-                    # on the first substep.
-                    pbd_mv = qd.Vector([0.0, 0.0, 0.0])
-                    pbd_mass = gs.qd_float(0.0)
-                    colliding_particles = 0
+                    # Barrier contact against the cloth's own triangle surface, not a velocity average: the
+                    # previous version (see git history) made the grid node and the cloth particles within
+                    # half a cell adopt a shared momentum-conserving velocity with no signed distance and no
+                    # normal, so MPM passed clean through the membrane between particles -- a skin cannot
+                    # contain a muscle that way. Here, for every cloth particle already found near this node
+                    # through the existing spatial hash, we walk its incident triangles (the static per-vertex
+                    # CSR built once in `_build_pbd_face_adjacency`, keyed on the entities' own remeshed
+                    # physics mesh) and keep the single closest triangle within half a cell. Two-sided: the
+                    # normal is oriented from the triangle towards the node's current side, so containment
+                    # holds whichever side the node is approaching from -- muscle outside, prey inside. No
+                    # friction: only the inward relative-normal-velocity component is removed, mass-weighted
+                    # by the closest point's barycentric coordinates, the same impulse split used against a
+                    # rigid SDF in `_func_collide_in_rigid_geom` but here the reaction lands on the triangle's
+                    # three cloth vertices instead of a rigid body.
+                    margin = self.mpm_solver.dx * 0.5
+                    best_dist = margin
+                    found = 0
+                    best_v0 = 0
+                    best_v1 = 0
+                    best_v2 = 0
+                    best_bary = qd.Vector([0.0, 0.0, 0.0])
+                    best_normal = qd.Vector([0.0, 0.0, 0.0])
+
                     for offset in qd.grouped(
                         qd.ndrange(self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size)
                     ):
@@ -440,33 +556,82 @@ class LegacyCoupler(RBC):
                                 qd.abs(pos - self.pbd_solver.particles_reordered.pos[i, i_b]).max()
                                 < self.mpm_solver.dx * 0.5
                             ):
-                                m_i = self.pbd_solver.particles_info_reordered[i, i_b].mass
-                                pbd_mv += m_i * self.pbd_solver.particles_reordered.vel[i, i_b]
-                                pbd_mass += m_i
-                                colliding_particles += 1
-                    if colliding_particles > 0:
-                        vel_old = vel_mpm
-                        vel_mpm = (mass_mpm * vel_old + pbd_mv) / (mass_mpm + pbd_mass)
-
-                        # ---------- MPM -> PBD ----------
-                        # Each cloth particle's velocity becomes the common velocity: its momentum
-                        # change is m_i * (v_common - v_i), which sums to -delta_mv over the cell.
-
-                        for offset in qd.grouped(
-                            qd.ndrange(self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size)
-                        ):
-                            slot_idx = self.pbd_solver.sh.grid_to_slot(base + offset)
-                            for i in range(
-                                self.pbd_solver.sh.slot_start[slot_idx, i_b],
-                                self.pbd_solver.sh.slot_start[slot_idx, i_b]
-                                + self.pbd_solver.sh.slot_size[slot_idx, i_b],
-                            ):
-                                if (
-                                    qd.abs(pos - self.pbd_solver.particles_reordered.pos[i, i_b]).max()
-                                    < self.mpm_solver.dx * 0.5
+                                gid = self.pbd_solver.particles_ng_reordered[i, i_b].orig_idx
+                                for fi in range(
+                                    self.pbd_vert_face_start[gid], self.pbd_vert_face_start[gid + 1]
                                 ):
-                                    if self.pbd_solver.particles_reordered[i, i_b].free:
-                                        self.pbd_solver.particles_reordered[i, i_b].vel = vel_mpm
+                                    face = self.pbd_faces[self.pbd_vert_face_list[fi]]
+                                    v0, v1, v2 = face[0], face[1], face[2]
+                                    s0 = self.pbd_solver.particles_ng[v0, i_b].reordered_idx
+                                    s1 = self.pbd_solver.particles_ng[v1, i_b].reordered_idx
+                                    s2 = self.pbd_solver.particles_ng[v2, i_b].reordered_idx
+                                    p0 = self.pbd_solver.particles_reordered[s0, i_b].pos
+                                    p1 = self.pbd_solver.particles_reordered[s1, i_b].pos
+                                    p2 = self.pbd_solver.particles_reordered[s2, i_b].pos
+
+                                    closest, bary = self._func_closest_point_on_triangle(pos, p0, p1, p2)
+                                    diff = pos - closest
+                                    dist = diff.norm(gs.EPS)
+                                    if dist < best_dist:
+                                        normal = (p1 - p0).cross(p2 - p0).normalized(gs.EPS)
+                                        if diff.dot(normal) < 0:
+                                            normal = -normal
+                                        best_dist = dist
+                                        found = 1
+                                        best_v0, best_v1, best_v2 = v0, v1, v2
+                                        best_bary = bary
+                                        best_normal = normal
+
+                    if found:
+                        s0 = self.pbd_solver.particles_ng[best_v0, i_b].reordered_idx
+                        s1 = self.pbd_solver.particles_ng[best_v1, i_b].reordered_idx
+                        s2 = self.pbd_solver.particles_ng[best_v2, i_b].reordered_idx
+                        free0 = self.pbd_solver.particles_reordered[s0, i_b].free
+                        free1 = self.pbd_solver.particles_reordered[s1, i_b].free
+                        free2 = self.pbd_solver.particles_reordered[s2, i_b].free
+                        v0v = self.pbd_solver.particles_reordered[s0, i_b].vel
+                        v1v = self.pbd_solver.particles_reordered[s1, i_b].vel
+                        v2v = self.pbd_solver.particles_reordered[s2, i_b].vel
+                        m0 = self.pbd_solver.particles_info[best_v0].mass
+                        m1 = self.pbd_solver.particles_info[best_v1].mass
+                        m2 = self.pbd_solver.particles_info[best_v2].mass
+                        w0, w1, w2 = best_bary[0], best_bary[1], best_bary[2]
+
+                        # Reduced-mass impulse for a single isolated contact between the node (mass_mpm) and
+                        # the triangle's mass-weighted contact point (effective inverse mass inv_mass_eff,
+                        # summing barycentric weight squared over particle mass -- the usual generalised-
+                        # coordinate contact mass). A grid node (grams) hitting a cloth vertex (tens of
+                        # micrograms) is a very unequal collision: inv_mass_eff dominates, j comes out small,
+                        # and the node barely notices while the light vertex is flung towards the node's own
+                        # relative velocity, exactly as light debris does when struck by something heavy.
+                        # Using the node's full mass alone (an infinite-mass-wall bounce) instead of this
+                        # reduced mass was tried and blew the skin apart on first contact: it demanded the
+                        # cloth absorb the node's entire momentum on one triangle, hundreds of times its own.
+                        inv_mass_eff = gs.qd_float(0.0)
+                        if free0:
+                            inv_mass_eff += w0 * w0 / m0
+                        if free1:
+                            inv_mass_eff += w1 * w1 / m1
+                        if free2:
+                            inv_mass_eff += w2 * w2 / m2
+
+                        tri_vel = w0 * v0v + w1 * v1v + w2 * v2v
+                        rvel_n = (vel_mpm - tri_vel).dot(best_normal)
+                        if rvel_n < 0 and inv_mass_eff > 0:
+                            j = -rvel_n / (1.0 / mass_mpm + inv_mass_eff)
+                            vel_mpm = vel_mpm + (j / mass_mpm) * best_normal
+
+                            # Momentum conservation: the cloth is owed -j * best_normal in total, split by
+                            # barycentric weight. Multiple grid nodes can legitimately owe the same triangle
+                            # at once (real superposition of contact points), so this is summed atomically
+                            # across the whole grid and only turned into a velocity change once, by
+                            # `_kernel_apply_pbd_contact_momentum`, after every node has been resolved --
+                            # applying it here instead, racing another node's read-modify-write on the same
+                            # vertex, is what blew the skin apart during development.
+                            dmv = -j * best_normal
+                            self.pbd_contact_dmv[best_v0, i_b] += w0 * dmv
+                            self.pbd_contact_dmv[best_v1, i_b] += w1 * dmv
+                            self.pbd_contact_dmv[best_v2, i_b] += w2 * dmv
 
                 #################### MPM boundary ####################
                 _, self.mpm_solver.grid[f, I, i_b].vel_out = self.mpm_solver.boundary.impose_pos_vel(pos, vel_mpm)
@@ -894,6 +1059,8 @@ class LegacyCoupler(RBC):
     def couple(self, f):
         # MPM <-> all others
         if self.mpm_solver.is_active:
+            if self._mpm_pbd:
+                self._kernel_zero_pbd_contact_momentum()
             self.mpm_grid_op(
                 f,
                 self.sim.cur_t,
@@ -904,6 +1071,8 @@ class LegacyCoupler(RBC):
                 sdf_info=self.rigid_solver.collider._sdf._sdf_info,
                 collider_static_config=self.rigid_solver.collider._collider_static_config,
             )
+            if self._mpm_pbd:
+                self._kernel_apply_pbd_contact_momentum()
 
         # SPH <-> Rigid
         if self._rigid_sph:

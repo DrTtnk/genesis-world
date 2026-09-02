@@ -140,6 +140,11 @@ class PBDSolver(Solver):
         struct_particle_state_ng = qd.types.struct(
             reordered_idx=gs.qd_int,
             active=gs.qd_bool,
+            # global particle index that landed in this reordered slot (reordered array only; meaningless
+            # on the non-reordered `particles_ng` field). Lets the MPM<->PBD coupler, which finds candidate
+            # cloth particles via the reordered spatial hash, trace a candidate back to the global id its
+            # static triangle adjacency is keyed on.
+            orig_idx=gs.qd_int,
         )
 
         # single frame particle state for rendering
@@ -378,6 +383,7 @@ class PBDSolver(Solver):
                 self.particles_reordered[reordered_idx, i_b] = self.particles[i_p, i_b]
                 self.particles_info_reordered[reordered_idx, i_b] = self.particles_info[i_p]
                 self.particles_ng_reordered[reordered_idx, i_b].active = self.particles_ng[i_p, i_b].active
+                self.particles_ng_reordered[reordered_idx, i_b].orig_idx = i_p
 
     @qd.kernel
     def _kernel_apply_external_force(self, f: qd.i32, t: qd.f32):
