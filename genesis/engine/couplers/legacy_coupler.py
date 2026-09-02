@@ -418,7 +418,15 @@ class LegacyCoupler(RBC):
                     base = self.pbd_solver.sh.pos_to_grid(pos - 0.5 * self.mpm_solver.dx)
 
                     # ---------- PBD -> MPM ----------
-                    pbd_vel = qd.Vector([0.0, 0.0, 0.0])
+                    # Momentum-conserving exchange: the grid node and the cloth particles in its cell
+                    # take their common centre-of-mass velocity, and each side receives the momentum
+                    # change in proportion to its mass. The previous version made the node adopt the
+                    # cloth velocity and pushed the whole momentum change onto the cloth, so a light
+                    # cloth (4 kg/m2, 0.1 g per 5 mm particle) against a grid node carrying grams of
+                    # MPM was kicked hundreds of times too hard and every particle left the domain
+                    # on the first substep.
+                    pbd_mv = qd.Vector([0.0, 0.0, 0.0])
+                    pbd_mass = gs.qd_float(0.0)
                     colliding_particles = 0
                     for offset in qd.grouped(
                         qd.ndrange(self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size)
@@ -432,14 +440,17 @@ class LegacyCoupler(RBC):
                                 qd.abs(pos - self.pbd_solver.particles_reordered.pos[i, i_b]).max()
                                 < self.mpm_solver.dx * 0.5
                             ):
-                                pbd_vel += self.pbd_solver.particles_reordered.vel[i, i_b]
+                                m_i = self.pbd_solver.particles_info_reordered[i, i_b].mass
+                                pbd_mv += m_i * self.pbd_solver.particles_reordered.vel[i, i_b]
+                                pbd_mass += m_i
                                 colliding_particles += 1
                     if colliding_particles > 0:
                         vel_old = vel_mpm
-                        vel_mpm = pbd_vel / colliding_particles
+                        vel_mpm = (mass_mpm * vel_old + pbd_mv) / (mass_mpm + pbd_mass)
 
                         # ---------- MPM -> PBD ----------
-                        delta_mv = mass_mpm * (vel_mpm - vel_old)
+                        # Each cloth particle's velocity becomes the common velocity: its momentum
+                        # change is m_i * (v_common - v_i), which sums to -delta_mv over the cell.
 
                         for offset in qd.grouped(
                             qd.ndrange(self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size)
@@ -455,10 +466,7 @@ class LegacyCoupler(RBC):
                                     < self.mpm_solver.dx * 0.5
                                 ):
                                     if self.pbd_solver.particles_reordered[i, i_b].free:
-                                        self.pbd_solver.particles_reordered[i, i_b].vel = (
-                                            self.pbd_solver.particles_reordered[i, i_b].vel
-                                            - delta_mv / self.pbd_solver.particles_info_reordered[i, i_b].mass
-                                        )
+                                        self.pbd_solver.particles_reordered[i, i_b].vel = vel_mpm
 
                 #################### MPM boundary ####################
                 _, self.mpm_solver.grid[f, I, i_b].vel_out = self.mpm_solver.boundary.impose_pos_vel(pos, vel_mpm)
