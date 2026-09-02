@@ -112,7 +112,7 @@ class MPMSolver(Solver):
 
         # construct fields
         self.particles = struct_particle_state.field(
-            shape=(self._sim.substeps_local + 1, self._n_particles, self._B), needs_grad=True, layout=qd.Layout.SOA
+            shape=(self._sim.substeps_local + 1, self._n_particles, self._B), needs_grad=self._sim.requires_grad, layout=qd.Layout.SOA
         )
         self.particles_ng = struct_particle_state_ng.field(
             shape=(self._sim.substeps_local + 1, self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
@@ -133,7 +133,7 @@ class MPMSolver(Solver):
         # Grid is only ever indexed at [f] (never [f+1]) in p2g/g2p/reset/coupler, so substeps_local frames are enough.
         # Particles still need substeps_local + 1 because g2p writes the next-frame state at [f+1].
         self.grid = grid_cell_state.field(
-            shape=(self._sim.substeps_local, *self._grid_res, self._B), needs_grad=True, layout=qd.Layout.SOA
+            shape=(self._sim.substeps_local, *self._grid_res, self._B), needs_grad=self._sim.requires_grad, layout=qd.Layout.SOA
         )
 
         # Sparse-reset bookkeeping for forward-only mode. p2g sets a per-cell flag (env-shared) the first
@@ -203,6 +203,8 @@ class MPMSolver(Solver):
         self.particle_constraints.link_idx.fill(-1)
 
     def reset_grad(self):
+        if not self._sim.requires_grad:
+            return
         self.particles.grad.fill(0.0)
         self.grid.grad.fill(0.0)
 
