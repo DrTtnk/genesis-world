@@ -12,7 +12,7 @@ from genesis.engine.boundaries import CubeBoundary
 from genesis.engine.entities import MPMEntity
 from genesis.engine.states.solvers import MPMSolverState
 from genesis.options.solvers import MPMOptions
-from genesis.utils.misc import DeprecationError, qd_to_torch
+from genesis.utils.misc import DeprecationError
 
 from .base_solver import Solver
 
@@ -136,20 +136,29 @@ class MPMSolver(Solver):
             shape=(self._sim.substeps_local, *self._grid_res, self._B), needs_grad=True, layout=qd.Layout.SOA
         )
 
-        # Sparse-reset bookkeeping for forward-only mode. A single global dirty list captures unique cells touched by
-        # p2g across all envs in the current substep; reset_dirty_cells zeroes those cells across all envs immediately
-        # after g2p, so the grid is always zero at the start of each substep and no per-substep state has to outlive a
-        # substep. grid_dirty_flag is a per-cell tristate (env-shared) that deduplicates appends: only the first env to
-        # touch a cell records it. List size is bounded by the total grid cell count because dedup ensures no more than
-        # that many unique entries.
+        # Sparse-reset bookkeeping for forward-only mode. p2g sets a per-cell flag (env-shared) the first
+        # time any env writes mass into a cell in the current substep; reset_dirty_cells scans the flag
+        # across all envs immediately after g2p and zeroes exactly the cells that were touched, so the
+        # grid is always zero at the start of each substep and no per-substep state has to outlive a
+        # substep.
+        #
+        # An earlier version of this also packed touched cells into a compacted `grid_dirty_list` via a
+        # global atomic counter (`qd.atomic_add` on a size-1 field), to let reset_dirty_cells iterate only
+        # the actual dirty count instead of every cell. That counter is what caused
+        # `CUDA_ERROR_ILLEGAL_ADDRESS` inside p2g at large n_particles * n_envs (bisected on 2026-09-02,
+        # see useful_knowledge.md): the atomic add on that single-element field only faults when compiled
+        # as part of p2g's full body (SVD + material branches + 27-way stencil unroll) at high thread
+        # counts, not in isolation, and not with `qd.atomic_or` on the (non-degenerate) per-cell flag field
+        # itself -- so it is a quadrants codegen problem specific to a broadcast atomic_add on a
+        # single-element field under heavy register pressure, not a bug in this bookkeeping's logic.
+        # reset_dirty_cells already scans the full `grid_res * B` range regardless of how many cells are
+        # actually dirty (the list only let it skip the zero-write for non-dirty cells), so dropping the
+        # list/counter and reading the flag directly is equivalent work and avoids the bad codegen path.
         # TODO: support sparse reset under requires_grad. Quadrants' differentiable framework needs the grid state at
         # every intermediate substep for the backward pass, so we cannot eagerly wipe cells; revisit if checkpointing
         # or selective grad masking becomes available.
         if not self._sim.requires_grad:
-            self._grid_total = int(np.prod(self._grid_res))
             self.grid_dirty_flag = qd.field(gs.qd_int, shape=self._grid_res)
-            self.grid_dirty_list = qd.field(gs.qd_int, shape=(self._grid_total,))
-            self.grid_dirty_count = qd.field(gs.qd_int, shape=(1,))
 
     def init_vvert_fields(self):
         struct_vvert_info = qd.types.struct(
@@ -461,21 +470,14 @@ class MPMSolver(Solver):
                             self.particles_info[i_p].mass * self.particles[f, i_p, i_b].vel + affine @ dpos
                         )
                         mass_contrib = weight * self.particles_info[i_p].mass
-                        prev_mass = qd.atomic_add(self.grid[f, cell_ijk, i_b].mass, mass_contrib)
+                        qd.atomic_add(self.grid[f, cell_ijk, i_b].mass, mass_contrib)
                         # Sparse-reset bookkeeping runs forward-only: backward mode composes p2g through autodiff where
-                        # these atomics are meaningless. Per-env first-writer (prev_mass == 0) tries to claim the cell
-                        # in the env-shared dirty flag via atomic_or; only the very first env to touch this cell across
-                        # the whole batch then appends to the global list. List size is bounded by grid_total because
-                        # dedup ensures uniqueness.
+                        # this flag is meaningless. Flag the cell as dirty (env-shared: whichever env's particle gets
+                        # here first is enough, reset_dirty_cells zeroes it for every env). A plain write is enough
+                        # since every writer stores the same value 1; no atomic/read-modify-write is needed.
                         if qd.static(not self._sim.requires_grad):
-                            if prev_mass == gs.qd_float(0.0) and mass_contrib > gs.qd_float(0.0):
-                                was_dirty = qd.atomic_or(self.grid_dirty_flag[cell_ijk], gs.qd_int(1))
-                                if was_dirty == gs.qd_int(0):
-                                    slot_idx = qd.atomic_add(self.grid_dirty_count[0], 1)
-                                    flat = (cell_ijk[0] * self._grid_res[1] + cell_ijk[1]) * self._grid_res[2] + (
-                                        cell_ijk[2]
-                                    )
-                                    self.grid_dirty_list[slot_idx] = flat
+                            if mass_contrib > gs.qd_float(0.0):
+                                self.grid_dirty_flag[cell_ijk] = gs.qd_int(1)
 
                     if not self.particles_info[i_p].free:  # non-free particles behave as boundary conditions
                         self.grid[f, base - self._grid_offset + offset, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
@@ -611,16 +613,12 @@ class MPMSolver(Solver):
         if self._constraints_initialized:
             self.apply_particle_constraints(f, self.sim.coupler.rigid_solver.dyn_state.links)
 
-        # Eager sparse reset: zero only the cells p2g touched this substep, across all envs, then clear the global
-        # dirty count so the next substep starts fresh. The grid is no longer read after g2p / constraints, so it is
-        # safe to wipe here. Forward-only; backward composes p2g/g2p through autodiff and uses reset_grid_and_grad.
+        # Eager sparse reset: zero only the cells p2g touched this substep, across all envs, and clear their
+        # dirty flags so the next substep starts fresh. The grid is no longer read after g2p / constraints,
+        # so it is safe to wipe here. Forward-only; backward composes p2g/g2p through autodiff and uses
+        # reset_grid_and_grad.
         if not self._sim.requires_grad:
             self.reset_dirty_cells(f)
-            if gs.use_zerocopy:
-                grid_dirty_count = qd_to_torch(self.grid_dirty_count, copy=False)
-                grid_dirty_count.zero_()
-            else:
-                self.grid_dirty_count[0] = 0
 
         # FIXME: Use existing errno mechanism for this.
         # Rate-limit the NaN check. _is_state_valid triggers a GPU->CPU sync on its return value, so calling it every
@@ -675,16 +673,12 @@ class MPMSolver(Solver):
 
     @qd.kernel
     def reset_dirty_cells(self, f: qd.i32):
-        # Zero the cells p2g touched this substep, across all envs, plus their dirty flags. The dirty list is shared
-        # across envs (deduplicated via grid_dirty_flag), so threads with slot >= grid_dirty_count idle. Only one thread
-        # per slot (i_b == 0) writes the flag back to zero so it can be reused next substep.
-        for slot, i_b in qd.ndrange(self._grid_total, self._B):
-            if slot < self.grid_dirty_count[0]:
-                flat = self.grid_dirty_list[slot]
-                k = flat % self._grid_res[2]
-                rem = flat // self._grid_res[2]
-                j = rem % self._grid_res[1]
-                i = rem // self._grid_res[1]
+        # Zero the cells p2g touched this substep, across all envs, plus their dirty flags. grid_dirty_flag
+        # is env-shared (set by whichever env's particle reached the cell first), so every thread reads the
+        # same flag and threads for clean cells idle. Only one thread per cell (i_b == 0) clears the flag so
+        # it can be reused next substep.
+        for i, j, k, i_b in qd.ndrange(*self._grid_res, self._B):
+            if self.grid_dirty_flag[i, j, k] == gs.qd_int(1):
                 self.grid[f, i, j, k, i_b].mass = gs.qd_float(0.0)
                 self.grid[f, i, j, k, i_b].vel_in = qd.Vector.zero(gs.qd_float, 3)
                 self.grid[f, i, j, k, i_b].vel_out = qd.Vector.zero(gs.qd_float, 3)
