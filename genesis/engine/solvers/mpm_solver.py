@@ -23,6 +23,25 @@ if TYPE_CHECKING:
     from genesis.engine.simulator import Simulator
 
 
+def _soa_field(struct_type, shape, needs_grad):
+    """SOA struct field with one quadrants field tree per member.
+
+    quadrants addresses a field tree with 32-bit offsets, so a tree past 2 GB faults with
+    CUDA_ERROR_ILLEGAL_ADDRESS in the first kernel that touches it. The default `field()`
+    places every member of every field in the single root tree. Here each member, and its
+    adjoint, gets its own tree, so the limit applies per member instead of to the whole solver.
+    """
+    field = struct_type.field(shape=None, needs_grad=needs_grad, layout=qd.Layout.SOA)
+    axes = qd.lang.impl.index_nd(len(shape))
+    for member in field._members:
+        builder = qd.FieldsBuilder()
+        builder.dense(axes, shape).place(member)
+        if needs_grad:
+            builder.dense(axes, shape).place(member.grad)
+        builder.finalize()
+    return field
+
+
 @qd.data_oriented
 class MPMSolver(Solver):
     # ------------------------------------------------------------------------------------
@@ -111,11 +130,11 @@ class MPMSolver(Solver):
         struct_particle_state_render = qd.types.struct(pos=gs.qd_vec3, vel=gs.qd_vec3, active=gs.qd_bool)
 
         # construct fields
-        self.particles = struct_particle_state.field(
-            shape=(self._sim.substeps_local + 1, self._n_particles, self._B), needs_grad=self._sim.requires_grad, layout=qd.Layout.SOA
+        self.particles = _soa_field(
+            struct_particle_state, (self._sim.substeps_local + 1, self._n_particles, self._B), self._sim.requires_grad
         )
-        self.particles_ng = struct_particle_state_ng.field(
-            shape=(self._sim.substeps_local + 1, self._n_particles, self._B), needs_grad=False, layout=qd.Layout.SOA
+        self.particles_ng = _soa_field(
+            struct_particle_state_ng, (self._sim.substeps_local + 1, self._n_particles, self._B), False
         )
         self.particles_info = struct_particle_info.field(
             shape=self._n_particles, needs_grad=False, layout=qd.Layout.SOA
@@ -132,9 +151,7 @@ class MPMSolver(Solver):
         )
         # Grid is only ever indexed at [f] (never [f+1]) in p2g/g2p/reset/coupler, so substeps_local frames are enough.
         # Particles still need substeps_local + 1 because g2p writes the next-frame state at [f+1].
-        self.grid = grid_cell_state.field(
-            shape=(self._sim.substeps_local, *self._grid_res, self._B), needs_grad=self._sim.requires_grad, layout=qd.Layout.SOA
-        )
+        self.grid = _soa_field(grid_cell_state, (self._sim.substeps_local, *self._grid_res, self._B), self._sim.requires_grad)
 
         # Sparse-reset bookkeeping for forward-only mode. p2g sets a per-cell flag (env-shared) the first
         # time any env writes mass into a cell in the current substep; reset_dirty_cells scans the flag
