@@ -63,6 +63,14 @@ class TetGenMixin(Options):
     maxvolume: float = -1.0
     verbose: Literal[0, 1, 2] = 0
 
+    # 'tetgen' keeps the input surface exactly, so thin walls and tiny surface features become degenerate tets.
+    # 'ftetwild' (wildmeshing) rebuilds the surface within an envelope of `ftetwild_epsilon` times the bounding-box
+    # diagonal and targets `ftetwild_edge_length` meters, so it stays well-shaped on inputs tetgen cannot handle;
+    # the tetgen switches above are ignored for it.
+    tetrahedralizer: Literal["tetgen", "ftetwild"] = "tetgen"
+    ftetwild_epsilon: PositiveFloat = 1e-3
+    ftetwild_edge_length: PositiveFloat = 0.03
+
     force_retet: StrictBool = False
 
 

@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import igl
 import numpy as np
 import quadrants as qd
 import trimesh
@@ -213,6 +214,19 @@ class VBDEntity(Entity):
         verts, elems = eu.mesh_to_elements(surface_trimesh, tet_cfg=self.tet_cfg)
         if is_mesh_morph:
             verts = verts + self._morph.pos
+
+        if self._morph.tetrahedralizer == "ftetwild":
+            # fTetWild rebuilds the surface, so the input vertices no longer stand for simulated ones. Render the
+            # boundary of the tetrahedral mesh itself, one visual geom for the whole entity.
+            boundary_faces, *_ = igl.boundary_facets(elems)
+            boundary_verts, faces = np.unique(boundary_faces.reshape(-1), return_inverse=True)
+            vmesh = gs.Mesh.from_trimesh(
+                trimesh.Trimesh(vertices=verts[boundary_verts], faces=faces.reshape(-1, 3), process=False),
+                surface=self._surface,
+            )
+            self._vgeoms = gs.List(
+                [VBDVisGeom(entity=self, vvert_start=self._vvert_start, vface_start=self._vface_start, vmesh=vmesh, sim_verts_idx=boundary_verts)]
+            )
 
         self.instantiate(verts, elems)
 

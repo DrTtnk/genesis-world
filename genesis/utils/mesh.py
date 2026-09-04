@@ -1367,6 +1367,9 @@ def generate_tetgen_config_from_morph(morph):
         quality=morph.quality,
         maxvolume=morph.maxvolume,
         verbose=morph.verbose,
+        tetrahedralizer=morph.tetrahedralizer,
+        ftetwild_epsilon=morph.ftetwild_epsilon,
+        ftetwild_edge_length=morph.ftetwild_edge_length,
     )
 
 
@@ -1439,6 +1442,9 @@ def merge_submeshes(verts_list, faces_list):
 
 
 def tetrahedralize_mesh(mesh, tet_cfg):
+    if tet_cfg.get("tetrahedralizer", "tetgen") == "ftetwild":
+        return tetrahedralize_mesh_ftetwild(mesh, tet_cfg)
+
     tet = tetgen.TetGen(mesh.vertices.astype(np.float64, copy=False), mesh.faces.astype(np.int32, copy=False))
 
     # Build and apply the switches string directly, since
@@ -1447,6 +1453,24 @@ def tetrahedralize_mesh(mesh, tet_cfg):
     verts, elems, *_ = tet.tetrahedralize(switches=make_tetgen_switches(tet_cfg))
 
     return verts, elems
+
+
+def tetrahedralize_mesh_ftetwild(mesh, tet_cfg):
+    """fTetWild (Hu et al. 2020) via `wildmeshing`: robust to self-intersections and thin features because it
+    rebuilds the surface inside an envelope instead of keeping the input triangles."""
+    import wildmeshing
+
+    verts = mesh.vertices.astype(np.float64, copy=False)
+    diag = float(np.linalg.norm(verts.max(axis=0) - verts.min(axis=0)))
+    tetrahedralizer = wildmeshing.Tetrahedralizer(
+        epsilon=tet_cfg["ftetwild_epsilon"],
+        edge_length_r=tet_cfg["ftetwild_edge_length"] / diag,
+        coarsen=True,
+    )
+    tetrahedralizer.set_mesh(verts, mesh.faces.astype(np.int32, copy=False))
+    tetrahedralizer.tetrahedralize()
+    verts, elems, *_ = tetrahedralizer.get_tet_mesh()
+    return np.asarray(verts, dtype=np.float64), np.asarray(elems, dtype=np.int32)
 
 
 def visualize_tet(tet, mesh, show_surface=True, plot_cell_qual=False):
