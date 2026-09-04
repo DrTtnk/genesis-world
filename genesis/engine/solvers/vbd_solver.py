@@ -43,6 +43,8 @@ class VBDSolver(Solver):
         self._friction_eps_v = options.friction_eps_v
         self._residual_tol = options.residual_tol
         self._damping = options.damping
+        self._constraint_tol = options.constraint_tol
+        self._constraint_k_max_ratio = options.constraint_k_max_ratio
         self._max_sweeps = options.max_sweeps
 
     # ------------------------------------------------------------------------------------
@@ -99,6 +101,17 @@ class VBDSolver(Solver):
         self.muscle_actu_adj = qd.field(dtype=qd.f64, shape=(max(self._n_muscle_groups, 1), self._B))
         self.energy = qd.field(dtype=qd.f64, shape=(self._B,))
 
+    def init_constraint_fields(self):
+        # Hard distance constraints |x_a - x_b| = rest between two vertices, augmented Lagrangian (Giles, Diaz,
+        # Yuksel 2025): energy k/2 C^2 + lam C, dual update lam += k C after every sweep, stiffness ramp, and a warm
+        # start once per step. lam and k live per env; the constraint list per vertex is a CSR like the tets.
+        struct_cons_info = qd.types.struct(v=gs.qd_ivec2, rest=gs.qd_float)
+        struct_cons_state = qd.types.struct(lam=gs.qd_float, k=gs.qd_float)
+        n = max(self._n_constraints, 1)
+        self.cons_info = struct_cons_info.field(shape=(n,), layout=qd.Layout.SOA)
+        self.cons = struct_cons_state.field(shape=(n, self._B), layout=qd.Layout.SOA)
+        self.cons_error = qd.field(dtype=qd.f64, shape=())
+
     def init_vvert_fields(self):
         # Same render contract as FEMSolver: several vverts may stand for one simulated vertex.
         struct_vvert_info = qd.types.struct(vert_idx=gs.qd_int)
@@ -112,19 +125,23 @@ class VBDSolver(Solver):
         self.envs_offset = qd.Vector.field(3, dtype=qd.f32, shape=self._B)
         self.envs_offset.from_numpy(self._scene.envs_offset.astype(np.float32))
 
-    def _compute_vertex_coloring_and_incidence(self, elems):
-        """Greedy vertex coloring of the tet adjacency graph plus the vertex -> incident tet CSR list.
+    def _compute_vertex_coloring_and_incidence(self, elems, cons):
+        """Greedy vertex coloring of the graph of tets and constraints plus the vertex -> incident tet CSR list.
 
         Returns (perm, color_offsets, n_colors, ve_offset, ve_elem, ve_role): vertices sorted by color
         (`perm[color_offsets[c]:color_offsets[c+1]]` is color `c`), and for vertex `i` the incident tets
-        `ve_elem[ve_offset[i]:ve_offset[i+1]]` with `ve_role` the local index of `i` in each tet.
+        `ve_elem[ve_offset[i]:ve_offset[i+1]]` with `ve_role` the local index of `i` in each tet. Two vertices
+        that share a tet or a constraint never share a color, so each color is one race-free Gauss-Seidel sweep.
         """
         graph = nx.Graph()
         graph.add_nodes_from(range(self._n_vertices))
         for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
             graph.add_edges_from(zip(elems[:, a].tolist(), elems[:, b].tolist()))
+        graph.add_edges_from(zip(cons[:, 0].tolist(), cons[:, 1].tolist()))
         coloring = nx.greedy_color(graph, strategy="smallest_last")
         color = np.array([coloring[i] for i in range(self._n_vertices)], dtype=np.int64)
+        assert (color[cons[:, 0]] != color[cons[:, 1]]).all(), "a constraint joins two vertices of the same color"
+        assert all((color[elems[:, a]] != color[elems[:, b]]).all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)))
         n_colors = int(color.max()) + 1
         perm = np.argsort(color, kind="stable")
         color_offsets = np.searchsorted(color[perm], np.arange(n_colors + 1)).tolist()
@@ -157,9 +174,15 @@ class VBDSolver(Solver):
                 entity._add_to_solver()
 
             elems = np.concatenate([entity._v_start + entity.elems for entity in self._entities]).astype(np.int64)
+            cons = np.concatenate(
+                [entity._v_start + entity.distance_constraints for entity in self._entities] + [np.zeros((0, 2), dtype=np.int64)]
+            ).astype(np.int64)
+            self._n_constraints = len(cons)
+            self.init_constraint_fields()
             perm, self._color_offsets, self._n_colors, ve_offset, ve_elem, ve_role = (
-                self._compute_vertex_coloring_and_incidence(elems)
+                self._compute_vertex_coloring_and_incidence(elems, cons)
             )
+            self._init_constraints(cons)
             self.color_perm = qd.field(dtype=gs.qd_int, shape=(self._n_vertices,))
             self.color_perm.from_numpy(perm.astype(gs.np_int))
             self.ve_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
@@ -168,6 +191,29 @@ class VBDSolver(Solver):
             self.ve_elem.from_numpy(ve_elem.astype(gs.np_int))
             self.ve_role = qd.field(dtype=gs.qd_int, shape=(len(ve_role),))
             self.ve_role.from_numpy(ve_role.astype(gs.np_int))
+
+    def _init_constraints(self, cons):
+        """Rest lengths from the rest positions, per-vertex CSR of incident constraints, and the stiffness scale
+        k_start = mean vertex mass / h^2 (the inertia the local solve already carries)."""
+        pos = self.verts.pos.to_numpy()[0, :, 0]
+        rest = np.linalg.norm(pos[cons[:, 0]] - pos[cons[:, 1]], axis=1) if len(cons) else np.zeros(0)
+        inc_vert = cons.reshape(-1)
+        inc_cons = np.repeat(np.arange(len(cons)), 2)
+        inc_side = np.tile(np.array([1.0, -1.0]), len(cons))  # sign of dC/dx for this vertex
+        order = np.argsort(inc_vert, kind="stable")
+        vc_offset = np.searchsorted(inc_vert[order], np.arange(self._n_vertices + 1))
+        self.vc_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
+        self.vc_offset.from_numpy(vc_offset.astype(gs.np_int))
+        self.vc_cons = qd.field(dtype=gs.qd_int, shape=(max(len(inc_cons), 1),))
+        self.vc_side = qd.field(dtype=gs.qd_float, shape=(max(len(inc_cons), 1),))
+        if len(cons):
+            self.vc_cons.from_numpy(inc_cons[order].astype(gs.np_int))
+            self.vc_side.from_numpy(inc_side[order].astype(gs.np_float))
+            self.cons_info.v.from_numpy(cons.astype(gs.np_int))
+            self.cons_info.rest.from_numpy(rest.astype(gs.np_float))
+        self._k_start = float(self.verts_info.mass.to_numpy().mean() / self._substep_dt**2)
+        self.cons.lam.fill(0.0)
+        self.cons.k.fill(self._k_start)
 
     def init_ckpt(self):
         self._ckpt = dict()
@@ -451,6 +497,24 @@ class VBDSolver(Solver):
         force -= kd_h * (K @ qd.cast(x - self.verts[f, i_v, i_b].pos, self._acc) + damp)
         H = m_h2 * qd.Matrix.identity(self._acc, 3) + (1.0 + kd_h) * K
 
+        # Hard distance constraints, augmented Lagrangian: force -(k C + lam) dC/dx, Hessian k n n^T plus the
+        # diagonal-norm proxy of the constraint's curvature (|k C + lam| / |e| on the tangent plane), which keeps
+        # the block positive definite in compression (Giles et al. 2025, Sec. 3.5).
+        for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
+            i_c = self.vc_cons[c]
+            side = self.vc_side[c]
+            va = self.cons_info[i_c].v[0]
+            vb = self.cons_info[i_c].v[1]
+            e = self.verts[f + 1, va, i_b].pos - self.verts[f + 1, vb, i_b].pos
+            dist = e.norm()
+            n = e / dist
+            C = dist - self.cons_info[i_c].rest
+            k_c = self.cons[i_c, i_b].k
+            mult = k_c * C + self.cons[i_c, i_b].lam
+            force -= qd.cast(mult * side, self._acc) * qd.cast(n, self._acc)
+            H += qd.cast(k_c, self._acc) * qd.cast(n.outer_product(n), self._acc)
+            H += qd.cast(qd.abs(mult) / dist, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n), self._acc)
+
         # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
         # Coulomb friction (3.6, Hu et al. 2009 coefficients) on the substep's tangential slide, with the IPC
         # transition f1 blending static and dynamic friction below the speed friction_eps_v. The forward/backward
@@ -526,14 +590,47 @@ class VBDSolver(Solver):
         for k, i_b in qd.ndrange((lo, hi), self._B):
             self._func_solve_vertex(f, self.color_perm[k], i_b)
 
+    @qd.func
+    def _func_dual_update(self, f, i_c, i_b):
+        """Giles et al. 2025 Eq. 11 and 12: lam += k C, k += beta |C| with beta = k_start / constraint_tol."""
+        e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+        C = e.norm() - self.cons_info[i_c].rest
+        self.cons[i_c, i_b].lam += self.cons[i_c, i_b].k * C
+        self.cons[i_c, i_b].k = qd.min(
+            self.cons[i_c, i_b].k + self._k_start / self._constraint_tol * qd.abs(C), self._constraint_k_max_ratio * self._k_start
+        )
+
     @qd.kernel
     def _kernel_sweeps(self, f: qd.i32):
-        """`n_iterations` Gauss-Seidel sweeps in one launch. Each top-level loop is a serial task with an implicit
-        barrier after it, so the statically unrolled color loops are race-free without a Python round trip."""
+        """`n_iterations` Gauss-Seidel sweeps in one launch, each followed by the constraints' dual update. Each
+        top-level loop is a serial task with an implicit barrier after it, so the statically unrolled color loops
+        are race-free without a Python round trip."""
         for _ in qd.static(range(self._n_iterations)):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
                     self._func_solve_vertex(f, self.color_perm[k], i_b)
+            if qd.static(self._n_constraints > 0):
+                for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+                    self._func_dual_update(f, i_c, i_b)
+
+    @qd.kernel
+    def _kernel_warm_start(self):
+        """Once per step (the paper runs it per frame): lam <- alpha gamma lam, k <- max(k_start, gamma k)."""
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            self.cons[i_c, i_b].lam *= 0.95 * 0.99
+            self.cons[i_c, i_b].k = qd.max(self._k_start, 0.99 * self.cons[i_c, i_b].k)
+
+    @qd.kernel
+    def _kernel_constraint_error(self, f: qd.i32):
+        self.cons_error[None] = 0.0
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(e.norm() - self.cons_info[i_c].rest), qd.f64))
+
+    def constraint_error(self):
+        """Largest absolute distance-constraint error (m) at the current end-of-substep positions, over all envs."""
+        self._kernel_constraint_error(self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1)
+        return float(self.cons_error[None])
 
     @qd.kernel
     def _kernel_update_velocity(self, f: qd.i32):
@@ -843,9 +940,18 @@ class VBDSolver(Solver):
                 psi += 0.5 * self.elems_info[i_e].k_fiber * (l - 1.0) ** 2
             self.energy[i_b] += qd.cast(self.elems_info[i_e].vol_rest * psi, qd.f64)
 
+    @qd.kernel
+    def _kernel_constraint_energy(self, f: qd.i32):
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            C = e.norm() - self.cons_info[i_c].rest
+            self.energy[i_b] += qd.cast(0.5 * self.cons[i_c, i_b].k * C * C + self.cons[i_c, i_b].lam * C, qd.f64)
+
     def compute_energy(self, f):
         """Incremental potential of substep `f` at the current iterate, shape (B,). Non-increasing across sweeps."""
         self._kernel_compute_energy(f)
+        if self._n_constraints > 0:
+            self._kernel_constraint_energy(f)
         return self.energy.to_numpy()
 
     # ------------------------------------------------------------------------------------
@@ -862,6 +968,11 @@ class VBDSolver(Solver):
 
     def substep_pre_coupling(self, f):
         if self.is_active:
+            if self._n_constraints > 0:
+                if self._sim.requires_grad:
+                    gs.raise_exception("Hard constraints have no adjoint yet; disable requires_grad or the constraints.")
+                if f == 0:
+                    self._kernel_warm_start()
             self._kernel_predict(f)
             self.solve(f)
             self._kernel_update_velocity(f)
@@ -1019,6 +1130,10 @@ class VBDSolver(Solver):
     @property
     def n_colors(self):
         return self._n_colors
+
+    @property
+    def n_constraints(self):
+        return self._n_constraints
 
     @property
     def color_offsets(self):

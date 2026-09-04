@@ -282,3 +282,41 @@ def test_fiber_reinforcement_stops_the_actuated_bar_from_shortening(show_viewer)
         print(f"k_fiber={k_fiber:.0e}: length ratio {lengths[k_fiber]:.3f}", flush=True)
     assert lengths[0.0] < 0.75
     assert lengths[3e6] > 0.97
+
+
+@pytest.mark.required
+def test_hard_distance_constraints_make_a_vertex_chain_inextensible(show_viewer):
+    """A chain of hard distance constraints along the top edge of the actuated bar must keep every segment within
+    constraint_tol where the same bar without them shortens 30 percent; the sum of the segments is the spine
+    length, and it must not drift either."""
+    gain = 0.3
+    results = {}
+    for with_spine in (False, True):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=5e-3, substeps=40, gravity=(0.0, 0.0, 0.0)),
+            vbd_options=gs.options.VBDOptions(n_iterations=2, floor_height=-1.0, constraint_tol=1e-4),
+            show_viewer=show_viewer,
+        )
+        bar = scene.add_entity(material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=1, gain=gain), morph=gs.morphs.Box(**BAR))
+        pos0 = tensor_to_array(bar.init_positions)
+        top = np.where((pos0[:, 1] > 0.019) & (pos0[:, 2] > 0.019))[0]
+        chain = top[np.argsort(pos0[top, 0])]
+        pairs = np.stack([chain[:-1], chain[1:]], axis=1)
+        if with_spine:
+            bar.add_distance_constraints(pairs)
+        scene.build()
+        bar.set_muscle(np.zeros(bar.n_elements, dtype=np.int32), np.tile([1.0, 0.0, 0.0], (bar.n_elements, 1)))
+        p0 = _positions(bar)
+        rest = np.linalg.norm(p0[pairs[:, 0]] - p0[pairs[:, 1]], axis=1)
+        for step in range(300):
+            bar.set_actuation([min(1.0, step / 100)])
+            scene.step()
+        p1 = _positions(bar)
+        assert np.isfinite(p1).all()
+        seg = np.linalg.norm(p1[pairs[:, 0]] - p1[pairs[:, 1]], axis=1)
+        results[with_spine] = (np.abs(seg - rest).max(), seg.sum() / rest.sum(), _extent(p1, 0) / _extent(p0, 0))
+        print(f"spine={with_spine}: max segment error={results[with_spine][0]:.2e} m, chain length ratio={results[with_spine][1]:.4f}, bar length ratio={results[with_spine][2]:.3f}"
+              + (f", solver constraint error={scene.vbd_solver.constraint_error():.2e}, n_colors={scene.vbd_solver.n_colors}" if with_spine else ""), flush=True)
+    assert results[False][2] < 0.75
+    assert results[True][0] < 5e-4
+    assert abs(results[True][1] - 1.0) < 2e-3

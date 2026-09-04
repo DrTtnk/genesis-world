@@ -130,6 +130,7 @@ class VBDEntity(Entity):
         self._vvert_start = vvert_start  # offset for render vertices
         self._vface_start = vface_start  # offset for render faces
         self._step_global_added = None
+        self._distance_constraints = np.zeros((0, 2), dtype=gs.np_int)
         self.sample()
 
         self.init_tgt_vars()
@@ -402,6 +403,28 @@ class VBDEntity(Entity):
         if np.any(np.linalg.norm(tangent[:, :2], axis=-1) < 1e-6):
             gs.raise_exception("`tangent` must have a non-zero projection on the floor plane for every vertex.")
         self._solver.set_friction_frame(self._v_start, tangent)
+
+    def add_distance_constraints(self, pairs):
+        """
+        Declare hard distance constraints between pairs of this entity's vertices, at their rest distance. Must be
+        called before `scene.build()`; the solver enforces them by augmented Lagrangian (a spine, a tendon).
+
+        Parameters
+        ----------
+        pairs : array_like, shape (n, 2)
+            Local vertex indices.
+        """
+        if self._solver._scene.is_built:
+            gs.raise_exception("`add_distance_constraints` must be called before `scene.build()`.")
+        pairs = np.asarray(pairs, dtype=gs.np_int).reshape(-1, 2)
+        if (pairs < 0).any() or (pairs >= self.n_vertices).any() or (pairs[:, 0] == pairs[:, 1]).any():
+            gs.raise_exception("`pairs` must index two distinct vertices of this entity.")
+        self._distance_constraints = np.concatenate([self._distance_constraints, pairs])
+
+    @property
+    def distance_constraints(self):
+        """Declared hard distance constraints, local vertex pairs, shape (n, 2)."""
+        return self._distance_constraints
 
     def set_fiber_stiffness(self, k_fiber):
         """

@@ -934,6 +934,13 @@ class VBDOptions(Options):
     damping : float, optional
         Rayleigh damping time constant (s), VBD paper Eq. 10-11: a damping force -(damping/h) K (x - x^t) with K
         the elastic Hessian, so stiff modes are damped in proportion to their stiffness. 0 disables it. Defaults to 0.
+    constraint_tol : float, optional
+        Target absolute error (m) of hard distance constraints. The augmented Lagrangian stiffness ramp is
+        k += k_start / constraint_tol * |C| per iteration (Giles et al. 2025 Eq. 12 with beta scaled to this rig),
+        so a constraint off by constraint_tol doubles its stiffness each iteration. Defaults to 1e-4.
+    constraint_k_max_ratio : float, optional
+        Upper bound of a constraint's stiffness as a multiple of k_start (the mean vertex mass over h^2). Defaults
+        to 100.
     residual_tol : float, optional
         Under `requires_grad`, each substep sweeps until the largest leftover force component (N) is below this
         tolerance, because the adjoint differentiates the converged stationarity condition. Defaults to 1e-6.
@@ -949,6 +956,8 @@ class VBDOptions(Options):
     contact_stiffness: PositiveFloat = 1e4
     friction_eps_v: PositiveFloat = 1e-3
     damping: NonNegativeFloat = 0.0
+    constraint_tol: PositiveFloat = 1e-4
+    constraint_k_max_ratio: PositiveFloat = 100.0
     residual_tol: PositiveFloat = 1e-6
     max_sweeps: PositiveInt = 400
 
