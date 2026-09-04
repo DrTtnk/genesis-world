@@ -267,18 +267,18 @@ class VBDEntity(Entity):
         pass
 
     @qd.kernel
-    def _kernel_get_frame(self, pos: qd.types.ndarray(), vel: qd.types.ndarray()):
+    def _kernel_get_frame(self, f: qd.i32, pos: qd.types.ndarray(), vel: qd.types.ndarray()):
         for i_v, i_b in qd.ndrange(self.n_vertices, self._sim._B):
             i_global = i_v + self.v_start
             for j in qd.static(range(3)):
-                pos[i_b, i_v, j] = self._solver.verts[i_global, i_b].pos[j]
-                vel[i_b, i_v, j] = self._solver.verts[i_global, i_b].vel[j]
+                pos[i_b, i_v, j] = self._solver.verts[f, i_global, i_b].pos[j]
+                vel[i_b, i_v, j] = self._solver.verts[f, i_global, i_b].vel[j]
 
     def get_state(self):
         """Positions and velocities of the entity's vertices, each of shape (B, n_vertices, 3)."""
         pos = gs.zeros((self._sim._B, self.n_vertices, 3), dtype=gs.tc_float, requires_grad=False, scene=self.scene)
         vel = gs.zeros((self._sim._B, self.n_vertices, 3), dtype=gs.tc_float, requires_grad=False, scene=self.scene)
-        self._kernel_get_frame(pos, vel)
+        self._kernel_get_frame(self._sim.cur_substep_local, pos, vel)
         return pos, vel
 
     def get_positions(self):

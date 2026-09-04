@@ -40,6 +40,8 @@ class VBDSolver(Solver):
         self._floor_height = options.floor_height
         self._contact_stiffness = options.contact_stiffness
         self._friction_eps_v = options.friction_eps_v
+        self._residual_tol = options.residual_tol
+        self._max_sweeps = options.max_sweeps
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
@@ -53,14 +55,14 @@ class VBDSolver(Solver):
             mu_backward=gs.qd_float,
             mu_lateral=gs.qd_float,
         )
-        struct_vert_state = qd.types.struct(
-            pos=gs.qd_vec3,
-            vel=gs.qd_vec3,
-            ipos=gs.qd_vec3,  # position at the start of the substep, x^t
-            ypos=gs.qd_vec3,  # inertial position, y = x^t + h v^t + h^2 g
-        )
+        struct_vert_state = qd.types.struct(pos=gs.qd_vec3, vel=gs.qd_vec3)
         self.verts_info = struct_vert_info.field(shape=(self._n_vertices,), layout=qd.Layout.SOA)
-        self.verts = struct_vert_state.field(shape=(self._n_vertices, self._B), layout=qd.Layout.SOA)
+        # Frames: [f] is the state at the start of substep f, [f+1] the state after it. The buffer holds one step's
+        # worth of substeps when requires_grad (the adjoint walks them backwards), a sliding pair otherwise.
+        self.verts = struct_vert_state.field(
+            shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA
+        )
+        self.residual = qd.field(dtype=qd.f64, shape=())
 
     def init_element_fields(self):
         struct_elem_info = qd.types.struct(
@@ -126,6 +128,7 @@ class VBDSolver(Solver):
             self.init_vertex_fields()
             self.init_element_fields()
             self.init_vvert_fields()
+            self.init_ckpt()
             self.muscle_actu.fill(0.0)
 
             for entity in self._entities:
@@ -143,6 +146,9 @@ class VBDSolver(Solver):
             self.ve_elem.from_numpy(ve_elem.astype(gs.np_int))
             self.ve_role = qd.field(dtype=gs.qd_int, shape=(len(ve_role),))
             self.ve_role.from_numpy(ve_role.astype(gs.np_int))
+
+    def init_ckpt(self):
+        self._ckpt = dict()
 
     @property
     def is_active(self):
@@ -193,17 +199,17 @@ class VBDSolver(Solver):
             self.verts_info[i_v].mu_lateral = mu_lateral
             for i_b in range(self._B):
                 for j in qd.static(range(3)):
-                    self.verts[i_v, i_b].pos[j] = verts[i_v_, j]
-                self.verts[i_v, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
+                    self.verts[0, i_v, i_b].pos[j] = verts[i_v_, j]
+                self.verts[0, i_v, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
 
         for i_e_ in range(elems.shape[0]):
             i_e = i_e_ + el_start
             for j in qd.static(range(4)):
                 self.elems_info[i_e].v[j] = elems[i_e_, j] + v_start
-            p0 = self.verts[self.elems_info[i_e].v[0], 0].pos
-            p1 = self.verts[self.elems_info[i_e].v[1], 0].pos
-            p2 = self.verts[self.elems_info[i_e].v[2], 0].pos
-            p3 = self.verts[self.elems_info[i_e].v[3], 0].pos
+            p0 = self.verts[0, self.elems_info[i_e].v[0], 0].pos
+            p1 = self.verts[0, self.elems_info[i_e].v[1], 0].pos
+            p2 = self.verts[0, self.elems_info[i_e].v[2], 0].pos
+            p3 = self.verts[0, self.elems_info[i_e].v[3], 0].pos
             Dm = qd.Matrix.cols([p1 - p0, p2 - p0, p3 - p0])
             self.elems_info[i_e].vol_rest = Dm.determinant() / 6.0
             self.elems_info[i_e].B_rest = Dm.inverse()
@@ -276,11 +282,13 @@ class VBDSolver(Solver):
         return B
 
     @qd.func
-    def _func_deformation(self, i_e, i_b):
-        """(F, B_eff) of tet `i_e` in env `i_b`."""
+    def _func_deformation(self, fr, i_e, i_b):
+        """(F, B_eff) of tet `i_e` in env `i_b` at frame `fr`."""
         v = self.elems_info[i_e].v
-        p0 = self.verts[v[0], i_b].pos
-        Ds = qd.Matrix.cols([self.verts[v[1], i_b].pos - p0, self.verts[v[2], i_b].pos - p0, self.verts[v[3], i_b].pos - p0])
+        p0 = self.verts[fr, v[0], i_b].pos
+        Ds = qd.Matrix.cols(
+            [self.verts[fr, v[1], i_b].pos - p0, self.verts[fr, v[2], i_b].pos - p0, self.verts[fr, v[3], i_b].pos - p0]
+        )
         B = self._func_rest_inverse(i_e, i_b)
         return Ds @ B, B
 
@@ -299,16 +307,25 @@ class VBDSolver(Solver):
         return w
 
     @qd.func
-    def _func_solve_vertex(self, i_v, i_b, inv_h2):
+    def _func_inertia_target(self, f, i_v, i_b):
+        """y = x^t + h (v^t + h g), the position the vertex would reach with no internal forces."""
+        vel = self.verts[f, i_v, i_b].vel + self._gravity[i_b] * self._substep_dt
+        return self.verts[f, i_v, i_b].pos + vel * self._substep_dt
+
+    @qd.func
+    def _func_vertex_system(self, f, i_v, i_b):
+        """Negative gradient `force` and Hessian `H` of the incremental potential of substep `f` with respect to
+        vertex `i_v`, evaluated at the current iterate `verts[f+1].pos` with every other vertex fixed."""
+        inv_h2 = 1.0 / (self._substep_dt * self._substep_dt)
         m_h2 = qd.cast(self.verts_info[i_v].mass * inv_h2, self._acc)
-        x = self.verts[i_v, i_b].pos
-        force = -m_h2 * qd.cast(x - self.verts[i_v, i_b].ypos, self._acc)
+        x = self.verts[f + 1, i_v, i_b].pos
+        force = -m_h2 * qd.cast(x - self._func_inertia_target(f, i_v, i_b), self._acc)
         H = m_h2 * qd.Matrix.identity(self._acc, 3)
 
         for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
             i_e = self.ve_elem[c]
             role = self.ve_role[c]
-            F, B = self._func_deformation(i_e, i_b)
+            F, B = self._func_deformation(f + 1, i_e, i_b)
             mu = self.elems_info[i_e].mu
             lam = self.elems_info[i_e].lam
             alpha = 1.0 + mu / lam
@@ -324,14 +341,15 @@ class VBDSolver(Solver):
 
         # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
         # Coulomb friction (3.6, Hu et al. 2009 coefficients) on the substep's tangential slide, with the IPC
-        # transition f1 blending static and dynamic friction below the speed friction_eps_v.
+        # transition f1 blending static and dynamic friction below the speed friction_eps_v. The forward/backward
+        # coefficient switch is a tanh blend on the same scale, so the residual stays smooth for the adjoint.
         d = self._floor_height - x[2]
         if d > 0.0:
             k = self._contact_stiffness
             force[2] += qd.cast(k * d, self._acc)
             H[2, 2] += qd.cast(k, self._acc)
 
-            slide = x - self.verts[i_v, i_b].ipos
+            slide = x - self.verts[f, i_v, i_b].pos
             slide[2] = 0.0
             t = self.verts_info[i_v].tangent
             t[2] = 0.0
@@ -344,67 +362,84 @@ class VBDSolver(Solver):
             g = 1.0 / u_norm  # f1(|u|) / |u| of Eq. 15, finite at |u| = 0
             if u_norm < eps:
                 g = 2.0 / eps - u_norm / (eps * eps)
-            mu_ax = self.verts_info[i_v].mu_forward
-            if u_t < 0.0:
-                mu_ax = self.verts_info[i_v].mu_backward
+            mu_f = self.verts_info[i_v].mu_forward
+            mu_bw = self.verts_info[i_v].mu_backward
+            mu_ax = 0.5 * (mu_f + mu_bw) + 0.5 * (mu_f - mu_bw) * qd.tanh(u_t / eps)
             lam_n = k * d
             force -= qd.cast(lam_n * g * (mu_ax * u_t * t + self.verts_info[i_v].mu_lateral * u_b * b), self._acc)
             H += qd.cast(lam_n * g, self._acc) * (
                 qd.cast(mu_ax, self._acc) * qd.cast(t.outer_product(t), self._acc)
                 + qd.cast(self.verts_info[i_v].mu_lateral, self._acc) * qd.cast(b.outer_product(b), self._acc)
             )
+        return force, H
 
-        dx = H.inverse() @ force
-        self.verts[i_v, i_b].pos = x + qd.cast(dx, gs.qd_float)
-
-    @qd.kernel
-    def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
-        """One color of one sweep. Kept for tests that watch the energy sweep by sweep."""
-        inv_h2 = 1.0 / (self._substep_dt * self._substep_dt)
-        for k, i_b in qd.ndrange((lo, hi), self._B):
-            self._func_solve_vertex(self.color_perm[k], i_b, inv_h2)
+    @qd.func
+    def _func_solve_vertex(self, f, i_v, i_b):
+        force, H = self._func_vertex_system(f, i_v, i_b)
+        self.verts[f + 1, i_v, i_b].pos += qd.cast(H.inverse() @ force, gs.qd_float)
 
     @qd.kernel
     def _kernel_predict(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            self.verts[i_v, i_b].ipos = self.verts[i_v, i_b].pos
-            vel = self.verts[i_v, i_b].vel + self._gravity[i_b] * self._substep_dt
-            self.verts[i_v, i_b].ypos = self.verts[i_v, i_b].pos + vel * self._substep_dt
-            self.verts[i_v, i_b].pos = self.verts[i_v, i_b].ypos
+            self.verts[f + 1, i_v, i_b].pos = self._func_inertia_target(f, i_v, i_b)
 
     @qd.kernel
-    def _kernel_substep(self, f: qd.i32):
-        """A whole substep in one launch: predict, every sweep over every color, velocity update.
+    def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
+        """One color of one sweep. Kept for tests that watch the energy sweep by sweep."""
+        for k, i_b in qd.ndrange((lo, hi), self._B):
+            self._func_solve_vertex(f, self.color_perm[k], i_b)
 
-        Each top-level loop is a serial task with an implicit barrier after it, so the statically
-        unrolled color loops are race-free Gauss-Seidel sweeps without any Python round trip.
-        """
-        inv_h2 = 1.0 / (self._substep_dt * self._substep_dt)
-        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            self.verts[i_v, i_b].ipos = self.verts[i_v, i_b].pos
-            vel = self.verts[i_v, i_b].vel + self._gravity[i_b] * self._substep_dt
-            self.verts[i_v, i_b].ypos = self.verts[i_v, i_b].pos + vel * self._substep_dt
-            self.verts[i_v, i_b].pos = self.verts[i_v, i_b].ypos
-
+    @qd.kernel
+    def _kernel_sweeps(self, f: qd.i32):
+        """`n_iterations` Gauss-Seidel sweeps in one launch. Each top-level loop is a serial task with an implicit
+        barrier after it, so the statically unrolled color loops are race-free without a Python round trip."""
         for _ in qd.static(range(self._n_iterations)):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    self._func_solve_vertex(self.color_perm[k], i_b, inv_h2)
-
-        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            self.verts[i_v, i_b].vel = (self.verts[i_v, i_b].pos - self.verts[i_v, i_b].ipos) / self._substep_dt
+                    self._func_solve_vertex(f, self.color_perm[k], i_b)
 
     @qd.kernel
-    def _kernel_compute_energy(self):
-        """Incremental potential per env: inertia term plus the stable neo-Hookean energy of every tet."""
+    def _kernel_update_velocity(self, f: qd.i32):
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.verts[f + 1, i_v, i_b].vel = (self.verts[f + 1, i_v, i_b].pos - self.verts[f, i_v, i_b].pos) / self._substep_dt
+
+    @qd.kernel
+    def _kernel_residual(self, f: qd.i32):
+        """Largest force component left on any vertex of any env: the stationarity residual of substep `f`."""
+        self.residual[None] = 0.0
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            force, _ = self._func_vertex_system(f, i_v, i_b)
+            qd.atomic_max(self.residual[None], qd.cast(qd.abs(force).max(), qd.f64))
+
+    def solve(self, f):
+        """Fixed sweeps normally; under requires_grad, sweep until the residual is below tolerance, since the
+        adjoint differentiates the converged stationarity condition and inherits any leftover residual as bias."""
+        self._kernel_sweeps(f)
+        if self._sim.requires_grad:
+            for _ in range(self._max_sweeps // self._n_iterations):
+                self._kernel_residual(f)
+                if self.residual[None] < self._residual_tol:
+                    return
+                self._kernel_sweeps(f)
+            self._kernel_residual(f)
+            if self.residual[None] >= self._residual_tol:
+                gs.raise_exception(
+                    f"VBD substep did not converge: residual {self.residual[None]:.3e} >= {self._residual_tol:.1e} "
+                    f"after {self._max_sweeps} sweeps."
+                )
+
+    @qd.kernel
+    def _kernel_compute_energy(self, f: qd.i32):
+        """Incremental potential of substep `f` per env: inertia term plus the stable neo-Hookean energy of every tet,
+        evaluated at frame `f+1`."""
         inv_h2 = 1.0 / (self._substep_dt * self._substep_dt)
         for i_b in range(self._B):
             self.energy[i_b] = 0.0
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            d = self.verts[i_v, i_b].pos - self.verts[i_v, i_b].ypos
+            d = self.verts[f + 1, i_v, i_b].pos - self._func_inertia_target(f, i_v, i_b)
             self.energy[i_b] += qd.cast(0.5 * self.verts_info[i_v].mass * inv_h2 * d.norm_sqr(), qd.f64)
         for i_e, i_b in qd.ndrange(self._n_elements, self._B):
-            F, _ = self._func_deformation(i_e, i_b)
+            F, _ = self._func_deformation(f + 1, i_e, i_b)
             mu = self.elems_info[i_e].mu
             lam = self.elems_info[i_e].lam
             alpha = 1.0 + mu / lam
@@ -412,9 +447,9 @@ class VBDSolver(Solver):
             psi = 0.5 * (mu * (F.norm_sqr() - 3.0) + lam * (J - alpha) ** 2)
             self.energy[i_b] += qd.cast(self.elems_info[i_e].vol_rest * psi, qd.f64)
 
-    def compute_energy(self):
-        """Incremental potential of the current positions, shape (B,). Non-increasing across sweeps."""
-        self._kernel_compute_energy()
+    def compute_energy(self, f):
+        """Incremental potential of substep `f` at the current iterate, shape (B,). Non-increasing across sweeps."""
+        self._kernel_compute_energy(f)
         return self.energy.to_numpy()
 
     # ------------------------------------------------------------------------------------
@@ -430,7 +465,9 @@ class VBDSolver(Solver):
 
     def substep_pre_coupling(self, f):
         if self.is_active:
-            self._kernel_substep(f)
+            self._kernel_predict(f)
+            self.solve(f)
+            self._kernel_update_velocity(f)
 
     def substep_pre_coupling_grad(self, f):
         pass
@@ -454,39 +491,45 @@ class VBDSolver(Solver):
     def add_grad_from_state(self, state):
         pass
 
+    @qd.kernel
+    def copy_frame(self, source: qd.i32, target: qd.i32):
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.verts[target, i_v, i_b] = self.verts[source, i_v, i_b]
+
     def save_ckpt(self, ckpt_name):
-        pass
+        # The last frame of this window becomes frame 0 of the next.
+        self.copy_frame(self._sim.substeps_local, 0)
 
     def load_ckpt(self, ckpt_name):
-        pass
+        self.copy_frame(0, self._sim.substeps_local)
 
     # ------------------------------------------------------------------------------------
     # --------------------------------------- io -----------------------------------------
     # ------------------------------------------------------------------------------------
 
     @qd.kernel
-    def _kernel_set_state(self, pos: qd.types.ndarray(), vel: qd.types.ndarray()):
+    def _kernel_set_state(self, f: qd.i32, pos: qd.types.ndarray(), vel: qd.types.ndarray()):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             for j in qd.static(range(3)):
-                self.verts[i_v, i_b].pos[j] = pos[i_b, i_v, j]
-                self.verts[i_v, i_b].vel[j] = vel[i_b, i_v, j]
+                self.verts[f, i_v, i_b].pos[j] = pos[i_b, i_v, j]
+                self.verts[f, i_v, i_b].vel[j] = vel[i_b, i_v, j]
 
     @qd.kernel
-    def _kernel_get_state(self, pos: qd.types.ndarray(), vel: qd.types.ndarray()):
+    def _kernel_get_state(self, f: qd.i32, pos: qd.types.ndarray(), vel: qd.types.ndarray()):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             for j in qd.static(range(3)):
-                pos[i_b, i_v, j] = self.verts[i_v, i_b].pos[j]
-                vel[i_b, i_v, j] = self.verts[i_v, i_b].vel[j]
+                pos[i_b, i_v, j] = self.verts[f, i_v, i_b].pos[j]
+                vel[i_b, i_v, j] = self.verts[f, i_v, i_b].vel[j]
 
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
-            self._kernel_set_state(state.pos, state.vel)
+            self._kernel_set_state(f, state.pos, state.vel)
 
     def get_state(self, f):
         if not self.is_active:
             return None
         state = VBDSolverState(self._scene)
-        self._kernel_get_state(state.pos, state.vel)
+        self._kernel_get_state(f, state.pos, state.vel)
         return state
 
     @qd.kernel
@@ -494,7 +537,7 @@ class VBDSolver(Solver):
         for i_vv, i_b in qd.ndrange(self._n_vverts, self._B):
             i_v = self.vverts_info[i_vv].vert_idx
             for j in qd.static(range(3)):
-                pos_j = qd.cast(self.verts[i_v, i_b].pos[j], qd.f32)
+                pos_j = qd.cast(self.verts[f, i_v, i_b].pos[j], qd.f32)
                 self.vverts_render[i_vv, i_b].pos[j] = pos_j + self.envs_offset[i_b][j]
 
     def get_state_render(self, f):

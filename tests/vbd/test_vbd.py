@@ -59,7 +59,7 @@ def test_rest_state_stays_put_and_has_the_analytic_rest_energy(show_viewer):
 
     lam_p = mat.lam + mat.mu
     vol_rest = scene.vbd_solver.elems_info.vol_rest.to_numpy().sum()
-    assert scene.vbd_solver.compute_energy()[0] == pytest.approx(vol_rest * mat.mu**2 / (2 * lam_p), rel=1e-4)
+    assert scene.vbd_solver.compute_energy(0)[0] == pytest.approx(vol_rest * mat.mu**2 / (2 * lam_p), rel=1e-4)
 
 
 @pytest.mark.required
@@ -70,9 +70,9 @@ def test_incremental_potential_never_increases_across_sweeps(show_viewer):
     rng = np.random.default_rng(0)
     pos, vel = bar.get_state()
     noise = torch.as_tensor(rng.normal(0.0, 2e-3, size=pos.shape), dtype=pos.dtype, device=pos.device)
-    solver._kernel_set_state((pos + noise).contiguous(), torch.zeros_like(vel))
+    solver._kernel_set_state(0, (pos + noise).contiguous(), torch.zeros_like(vel))
     solver._kernel_predict(0)
-    e_prev = solver.compute_energy()[0]
+    e_prev = solver.compute_energy(0)[0]
     e_start = e_prev
 
     def sweeps(n):
@@ -80,7 +80,7 @@ def test_incremental_potential_never_increases_across_sweeps(show_viewer):
         for _ in range(n):
             for c in range(solver.n_colors):
                 solver._kernel_solve_color(0, solver.color_offsets[c], solver.color_offsets[c + 1])
-            e = solver.compute_energy()[0]
+            e = solver.compute_energy(0)[0]
             assert e <= e_prev * (1 + 1e-6)
             e_prev = e
         return e_prev
@@ -188,7 +188,7 @@ def test_anisotropic_friction_stops_a_sliding_block_at_the_coulomb_distance(show
             scene.step()
         pos, vel = box.get_state()
         vel[:] = torch.as_tensor(np.array(direction) * v0, dtype=vel.dtype, device=vel.device)
-        scene.vbd_solver._kernel_set_state(pos.contiguous(), vel.contiguous())
+        scene.vbd_solver._kernel_set_state(scene.sim.cur_substep_local, pos.contiguous(), vel.contiguous())
         com0 = _positions(box).mean(axis=0)
         for _ in range(400):
             scene.step()

@@ -931,6 +931,11 @@ class VBDOptions(Options):
     friction_eps_v : float, optional
         Sliding speed (m/s) below which friction blends smoothly from dynamic to static (IPC transition, VBD
         paper Eq. 15). Defaults to 1e-3.
+    residual_tol : float, optional
+        Under `requires_grad`, each substep sweeps until the largest leftover force component (N) is below this
+        tolerance, because the adjoint differentiates the converged stationarity condition. Defaults to 1e-6.
+    max_sweeps : int, optional
+        Under `requires_grad`, the sweep budget per substep before failing. Defaults to 400.
     """
 
     dt: PositiveFloat | None = None
@@ -940,6 +945,8 @@ class VBDOptions(Options):
     floor_height: float | None = None
     contact_stiffness: PositiveFloat = 1e4
     friction_eps_v: PositiveFloat = 1e-3
+    residual_tol: PositiveFloat = 1e-6
+    max_sweeps: PositiveInt = 400
 
 
 class SFOptions(Options):
