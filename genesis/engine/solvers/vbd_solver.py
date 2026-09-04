@@ -150,11 +150,14 @@ class VBDSolver(Solver):
             graph.add_edges_from(zip(elems[:, a].tolist(), elems[:, b].tolist()))
         graph.add_edges_from(zip(cons[:, 0].tolist(), cons[:, 1].tolist()))
         for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
-            graph.add_edges_from(zip(acons[:, a].tolist(), acons[:, b].tolist()))
+            keep = acons[:, a] != acons[:, b]  # a vertex may serve both vectors of an angle constraint
+            graph.add_edges_from(zip(acons[keep, a].tolist(), acons[keep, b].tolist()))
         coloring = nx.greedy_color(graph, strategy="smallest_last")
         color = np.array([coloring[i] for i in range(self._n_vertices)], dtype=np.int64)
         assert (color[cons[:, 0]] != color[cons[:, 1]]).all(), "a constraint joins two vertices of the same color"
-        assert all((color[acons[:, a]] != color[acons[:, b]]).all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)))
+        assert all(
+            (color[acons[:, a]] != color[acons[:, b]])[acons[:, a] != acons[:, b]].all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+        )
         assert all((color[elems[:, a]] != color[elems[:, b]]).all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)))
         n_colors = int(color.max()) + 1
         perm = np.argsort(color, kind="stable")
