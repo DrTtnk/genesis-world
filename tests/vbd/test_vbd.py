@@ -198,3 +198,27 @@ def test_anisotropic_friction_stops_a_sliding_block_at_the_coulomb_distance(show
         expected = v0**2 / (2 * mu[key] * g)
         print(f"{key}: travelled={travelled:.4f} expected={expected:.4f}", flush=True)
         assert travelled == pytest.approx(expected, rel=0.15)
+
+
+@pytest.mark.required
+def test_rayleigh_damping_kills_the_ringing_of_a_dropped_block(show_viewer):
+    """Without damping a dropped block keeps bouncing on its own elasticity; with Rayleigh damping the peak
+    speed after the first impact decays to a small fraction within a second."""
+    peaks = {}
+    for damping in (0.0, 0.02):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=5e-3, substeps=20, gravity=(0.0, 0.0, -9.81)),
+            vbd_options=gs.options.VBDOptions(n_iterations=2, damping=damping),
+            show_viewer=show_viewer,
+        )
+        box = scene.add_entity(material=gs.materials.VBD.Muscle(E=1e5, nu=0.3), morph=gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.08), nobisect=False, maxvolume=5e-5))
+        scene.build()
+        speeds = []
+        for _ in range(200):
+            scene.step()
+            speeds.append(float(np.abs(tensor_to_array(box.get_state().vel)).max()))
+        speeds = np.array(speeds)
+        peaks[damping] = (speeds[20:60].max(), speeds[160:].max())
+        print(f"damping={damping}: peak speed early={peaks[damping][0]:.3f} late={peaks[damping][1]:.3f}", flush=True)
+    assert peaks[0.02][1] < 0.1 * peaks[0.02][0]
+    assert peaks[0.02][1] < 0.3 * peaks[0.0][1]

@@ -42,6 +42,7 @@ class VBDSolver(Solver):
         self._contact_stiffness = options.contact_stiffness
         self._friction_eps_v = options.friction_eps_v
         self._residual_tol = options.residual_tol
+        self._damping = options.damping
         self._max_sweeps = options.max_sweeps
 
     # ------------------------------------------------------------------------------------
@@ -339,7 +340,11 @@ class VBDSolver(Solver):
         m_h2 = qd.cast(self.verts_info[i_v].mass * inv_h2, self._acc)
         x = self.verts[f + 1, i_v, i_b].pos
         force = -m_h2 * qd.cast(x - self._func_inertia_target(f, i_v, i_b), self._acc)
-        H = m_h2 * qd.Matrix.identity(self._acc, 3)
+        K = qd.Matrix.zero(self._acc, 3, 3)  # elastic Hessian block, also the Rayleigh damping matrix
+        # Rayleigh damping acts on the strain rate: force -(k_d/h) sum_j K_ij (x_j - x_j^t) over the vertex itself and
+        # its neighbours, so a rigid motion is not damped. (The VBD paper's Eq. 11 keeps only the diagonal block,
+        # which drags every vertex against the floor frame and freezes a body that has to travel.)
+        damp = qd.Vector.zero(self._acc, 3)
 
         for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
             i_e = self.ve_elem[c]
@@ -355,8 +360,22 @@ class VBDSolver(Solver):
             V = self.elems_info[i_e].vol_rest
             q = qd.cast(cof @ w, self._acc)
             force -= qd.cast(V * (P @ w), self._acc)
-            H += qd.cast(V * mu * w.norm_sqr(), self._acc) * qd.Matrix.identity(self._acc, 3)
-            H += qd.cast(V * lam, self._acc) * q.outer_product(q)
+            K += qd.cast(V * mu * w.norm_sqr(), self._acc) * qd.Matrix.identity(self._acc, 3)
+            K += qd.cast(V * lam, self._acc) * q.outer_product(q)
+            if qd.static(self._damping > 0.0):
+                for r in qd.static(range(4)):
+                    if r != role:
+                        j = self.elems_info[i_e].v[r]
+                        w_j = self._func_vertex_weight_static(B, r)
+                        q_j = cof @ w_j
+                        d_j = self.verts[f + 1, j, i_b].pos - self.verts[f, j, i_b].pos
+                        # only the positive semidefinite part of the elastic Hessian (the (J - alpha) K_ij cross term is
+                        # indefinite under deformation and would let damping inject energy)
+                        damp += qd.cast(V * (mu * w.dot(w_j) * d_j + lam * q_j.dot(d_j) * (cof @ w)), self._acc)
+
+        kd_h = qd.cast(self._damping / self._substep_dt, self._acc)
+        force -= kd_h * (K @ qd.cast(x - self.verts[f, i_v, i_b].pos, self._acc) + damp)
+        H = m_h2 * qd.Matrix.identity(self._acc, 3) + (1.0 + kd_h) * K
 
         # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
         # Coulomb friction (3.6, Hu et al. 2009 coefficients) on the substep's tangential slide, with the IPC
@@ -536,9 +555,17 @@ class VBDSolver(Solver):
 
     @qd.func
     def _func_offdiag_apply(self, f, i_v, i_b, vec):
-        """sum over neighbours j of J_ij vec_j, with J_ij = V [mu (w_i.w_j) I + lam' q_i q_j^T + lam' (J-alpha) K_ij]
-        and K_ij = -[F (w_i x w_j)]_x (skew). Reads `vec` from the given vector field."""
-        out = qd.Vector.zero(qd.f64, 3)
+        """sum over neighbours j of J_ij vec_j for the full stationarity Jacobian: elastic
+        J_ij = V [mu (w_i.w_j) I + lam' q_i q_j^T + lam' (J-alpha) K_ij], K_ij = -[F (w_i x w_j)]_x (skew), plus
+        (k_d/h) times its positive semidefinite part from Rayleigh damping."""
+        sym, cross = self._func_offdiag_parts(f, i_v, i_b, vec)
+        return (1.0 + self._damping / self._substep_dt) * sym + cross
+
+    @qd.func
+    def _func_offdiag_parts(self, f, i_v, i_b, vec):
+        """(sym, cross): the PSD part and the skew cross-term part of sum_j J_ij vec_j over the neighbours."""
+        sym = qd.Vector.zero(qd.f64, 3)
+        cross = qd.Vector.zero(qd.f64, 3)
         for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
             i_e = self.ve_elem[c]
             role = self.ve_role[c]
@@ -558,8 +585,9 @@ class VBDSolver(Solver):
                     q_j = cof @ w_j
                     vj = qd.cast(vec[j, i_b], gs.qd_float)
                     Kv = -(F @ w_i.cross(w_j)).cross(vj)
-                    out += qd.cast(V * (mu * w_i.dot(w_j) * vj + lam * q_j.dot(vj) * q_i + lam * (J - alpha) * Kv), qd.f64)
-        return out
+                    sym += qd.cast(V * (mu * w_i.dot(w_j) * vj + lam * q_j.dot(vj) * q_i), qd.f64)
+                    cross += qd.cast(V * lam * (J - alpha) * Kv, qd.f64)
+        return sym, cross
 
     @qd.kernel
     def _kernel_apply_jacobian(self, f: qd.i32, p: qd.types.ndarray(), out: qd.types.ndarray()):
@@ -608,6 +636,14 @@ class VBDSolver(Solver):
             lam_n, A_f, _ = self._func_friction_terms(f, i_v, i_b)
             if lam_n > 0.0:
                 self.adj[f, i_v, i_b].pos += A_f.transpose() @ z  # dr/dx^t = -A_f
+            if qd.static(self._damping > 0.0):
+                # dr/dx^t of the damping force -(k_d/h) sum_j K_ij (x_j - x_j^t) is +(k_d/h) K (symmetric), so the
+                # adjoint gets -(k_d/h) (K z)_i over the diagonal block and the neighbours
+                _, H = self._func_vertex_system(f, i_v, i_b)
+                kd_h = self._damping * inv_h
+                K_ii = (qd.cast(H, qd.f64) - qd.cast(self.verts_info[i_v].mass * inv_h * inv_h, qd.f64) * qd.Matrix.identity(qd.f64, 3)) / (1.0 + kd_h)
+                sym, _ = self._func_offdiag_parts(f, i_v, i_b, self.z)
+                self.adj[f, i_v, i_b].pos -= kd_h * (K_ii @ z + sym)
         for i_e, i_b in qd.ndrange(self._n_elements, self._B):
             group = self.elems_info[i_e].group
             if group >= 0:
