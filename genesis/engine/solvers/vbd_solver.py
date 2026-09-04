@@ -86,7 +86,14 @@ class VBDSolver(Solver):
         self.elems_info = struct_elem_info.field(shape=(self._n_elements,), layout=qd.Layout.SOA)
         self.muscle_actu = qd.field(dtype=gs.qd_float, shape=(max(self._n_muscle_groups, 1), self._B))
         # Analytic bolus: a sphere with prescribed centre, radius and velocity per env, radius <= 0 disables it.
-        struct_bolus = qd.types.struct(center=gs.qd_vec3, radius=gs.qd_float, vel=gs.qd_vec3, friction=gs.qd_float)
+        struct_bolus = qd.types.struct(
+            center=gs.qd_vec3,
+            radius=gs.qd_float,
+            vel=gs.qd_vec3,
+            friction=gs.qd_float,
+            axis=gs.qd_vec3,  # unit axis of the capsule segment
+            half_length=gs.qd_float,  # 0 makes it a sphere
+        )
         self.bolus = struct_bolus.field(shape=(self._B,))
         self.muscle_actu_adj = qd.field(dtype=qd.f64, shape=(max(self._n_muscle_groups, 1), self._B))
         self.energy = qd.field(dtype=qd.f64, shape=(self._B,))
@@ -259,21 +266,33 @@ class VBDSolver(Solver):
             for j in qd.static(range(3)):
                 self.verts_info[i_v_ + v_start].tangent[j] = tangent[i_v_, j]
 
-    def set_bolus(self, center, radius, vel, friction):
-        """Place the analytic sphere bolus: `center` (B, 3), `radius` (B,), `vel` (B, 3) prescribed velocity used
-        for the friction slide, `friction` isotropic coefficient. A radius <= 0 disables it in that env."""
+    def set_bolus(self, center, radius, vel, friction, axis=(0.0, 0.0, 1.0), half_length=0.0):
+        """Place the analytic bolus, a capsule: segment of `half_length` along the unit `axis` through `center`
+        (B, 3), swept by `radius` (B,); `half_length` 0 is a sphere. `vel` (B, 3) is its prescribed velocity, used
+        for the friction slide, `friction` the isotropic coefficient. A radius <= 0 disables it in that env."""
         if self._sim.requires_grad:
             gs.raise_exception("The bolus contact has no adjoint yet; disable requires_grad or the bolus.")
-        self._kernel_set_bolus(center, radius, vel, friction)
+        axis = np.asarray(axis, dtype=gs.np_float)
+        self._kernel_set_bolus(center, radius, vel, friction, axis / np.linalg.norm(axis), half_length)
 
     @qd.kernel
-    def _kernel_set_bolus(self, center: qd.types.ndarray(), radius: qd.types.ndarray(), vel: qd.types.ndarray(), friction: qd.f32):
+    def _kernel_set_bolus(
+        self,
+        center: qd.types.ndarray(),
+        radius: qd.types.ndarray(),
+        vel: qd.types.ndarray(),
+        friction: qd.f32,
+        axis: qd.types.ndarray(),
+        half_length: qd.f32,
+    ):
         for i_b in range(self._B):
             for j in qd.static(range(3)):
                 self.bolus[i_b].center[j] = center[i_b, j]
                 self.bolus[i_b].vel[j] = vel[i_b, j]
+                self.bolus[i_b].axis[j] = axis[j]
             self.bolus[i_b].radius = radius[i_b]
             self.bolus[i_b].friction = friction
+            self.bolus[i_b].half_length = half_length
 
     def set_muscle(self, el_start, group, fiber):
         self._kernel_set_muscle(el_start, group, fiber)
@@ -430,10 +449,13 @@ class VBDSolver(Solver):
                 + qd.cast(self.verts_info[i_v].mu_lateral, self._acc) * qd.cast(b.outer_product(b), self._acc)
             )
 
-        # Analytic sphere bolus: the same penalty and IPC-smoothed isotropic Coulomb friction against a moving sphere.
+        # Analytic capsule bolus: the same penalty and IPC-smoothed isotropic Coulomb friction against a moving
+        # capsule (sphere when half_length is 0). `rel` is the vector from the closest point of the segment.
         r_b = self.bolus[i_b].radius
         if r_b > 0.0:
             rel = x - self.bolus[i_b].center
+            along = qd.min(qd.max(rel.dot(self.bolus[i_b].axis), -self.bolus[i_b].half_length), self.bolus[i_b].half_length)
+            rel = rel - along * self.bolus[i_b].axis
             dist = rel.norm()
             pen = r_b - dist  # penetration depth into the sphere
             if pen > 0.0:
