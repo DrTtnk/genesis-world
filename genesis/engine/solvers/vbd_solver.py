@@ -45,6 +45,7 @@ class VBDSolver(Solver):
         self._damping = options.damping
         self._constraint_tol = options.constraint_tol
         self._constraint_k_max_ratio = options.constraint_k_max_ratio
+        self._constraint_dual_relaxation = options.constraint_dual_relaxation
         self._max_sweeps = options.max_sweeps
 
     # ------------------------------------------------------------------------------------
@@ -619,11 +620,12 @@ class VBDSolver(Solver):
         e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
         dist = e.norm()
         k = self.cons[i_c, i_b].k
+        w = self._constraint_dual_relaxation
         if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
-            self.cons[i_c, i_b].lam_hi = qd.max(self.cons[i_c, i_b].lam_hi + k * (dist - self.cons_info[i_c].hi), 0.0)
-            self.cons[i_c, i_b].lam_lo = qd.min(self.cons[i_c, i_b].lam_lo + k * (dist - self.cons_info[i_c].lo), 0.0)
+            self.cons[i_c, i_b].lam_hi = qd.max(self.cons[i_c, i_b].lam_hi + w * k * (dist - self.cons_info[i_c].hi), 0.0)
+            self.cons[i_c, i_b].lam_lo = qd.min(self.cons[i_c, i_b].lam_lo + w * k * (dist - self.cons_info[i_c].lo), 0.0)
         else:
-            self.cons[i_c, i_b].lam_hi += k * (dist - self.cons_info[i_c].hi)
+            self.cons[i_c, i_b].lam_hi += w * k * (dist - self.cons_info[i_c].hi)
         _, violation = self._func_constraint_mult(i_c, i_b, dist)
         self.cons[i_c, i_b].k = qd.min(k + self._k_start / self._constraint_tol * qd.abs(violation), self._constraint_k_max_ratio * self._k_start)
 
