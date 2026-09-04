@@ -111,3 +111,37 @@ def test_actuation_contracts_along_the_fiber_at_constant_volume(show_viewer):
     s = 1.0 - gain
     np.testing.assert_allclose(F.mean(axis=0), np.diag([s, 1 / np.sqrt(s), 1 / np.sqrt(s)]), atol=1e-2)
     np.testing.assert_allclose(np.linalg.det(Ds) / np.linalg.det(Dm), 1.0, atol=1e-3)
+
+
+@pytest.mark.required
+def test_opposed_fiber_groups_bend_the_bar_both_ways(show_viewer):
+    """Contracting the top-side fibers puts the top on the inside of the curve, so the middle drops relative to the
+    ends (negative sag); bottom-side fibers do the opposite; null control stays straight."""
+    dev = {}
+    for actu_top, actu_bottom in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)):
+        scene, bar = _bar_scene(gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=2, gain=0.3), n_iterations=60, show_viewer=show_viewer)
+        pos0 = _positions(bar)
+        mid_y = pos0[bar.elems].mean(axis=1)[:, 1]
+        group = np.full(bar.n_elements, -1, dtype=np.int32)
+        group[mid_y > 0.008] = 0
+        group[mid_y < -0.008] = 1
+        assert (group == 0).sum() > 50 and (group == 1).sum() > 50
+        bar.set_muscle(group, np.tile([1.0, 0.0, 0.0], (bar.n_elements, 1)))
+
+        for step in range(300):
+            r = min(1.0, step / 100)
+            bar.set_actuation([actu_top * r, actu_bottom * r])
+            scene.step()
+        pos1 = _positions(bar)
+        assert np.isfinite(pos1).all()
+
+        ends = np.abs(pos0[:, 0]) > 0.14
+        middle = np.abs(pos0[:, 0]) < 0.02
+        sag = (pos1[middle, 1].mean() - pos1[ends, 1].mean()) - (pos0[middle, 1].mean() - pos0[ends, 1].mean())
+        dev[(actu_top, actu_bottom)] = sag
+        print(f"actu=({actu_top}, {actu_bottom}) sag={sag:.5f}", flush=True)
+
+    assert abs(dev[(0.0, 0.0)]) < 1e-4
+    assert dev[(1.0, 0.0)] < -0.01
+    assert dev[(0.0, 1.0)] > 0.01
+    assert abs(dev[(1.0, 0.0)] + dev[(0.0, 1.0)]) < 0.2 * abs(dev[(1.0, 0.0)])
