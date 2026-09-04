@@ -131,6 +131,7 @@ class VBDEntity(Entity):
         self._vface_start = vface_start  # offset for render faces
         self._step_global_added = None
         self._distance_constraints = np.zeros((0, 2), dtype=gs.np_int)
+        self._distance_bounds = np.zeros((0, 2), dtype=gs.np_float)
         self.sample()
 
         self.init_tgt_vars()
@@ -404,27 +405,43 @@ class VBDEntity(Entity):
             gs.raise_exception("`tangent` must have a non-zero projection on the floor plane for every vertex.")
         self._solver.set_friction_frame(self._v_start, tangent)
 
-    def add_distance_constraints(self, pairs):
+    def add_distance_constraints(self, pairs, lo=None, hi=None):
         """
-        Declare hard distance constraints between pairs of this entity's vertices, at their rest distance. Must be
-        called before `scene.build()`; the solver enforces them by augmented Lagrangian (a spine, a tendon).
+        Declare hard distance constraints between pairs of this entity's vertices. Without bounds the rest distance
+        is kept (an equality: a spine segment, a tendon); with `lo` and/or `hi` (m, per pair or scalar) the distance
+        is kept inside [lo, hi] (a joint limit), the missing side defaulting to the rest distance. Must be called
+        before `scene.build()`; the solver enforces them by augmented Lagrangian.
 
         Parameters
         ----------
         pairs : array_like, shape (n, 2)
             Local vertex indices.
+        lo, hi : float or array_like of shape (n,), optional
         """
         if self._solver._scene.is_built:
             gs.raise_exception("`add_distance_constraints` must be called before `scene.build()`.")
         pairs = np.asarray(pairs, dtype=gs.np_int).reshape(-1, 2)
         if (pairs < 0).any() or (pairs >= self.n_vertices).any() or (pairs[:, 0] == pairs[:, 1]).any():
             gs.raise_exception("`pairs` must index two distinct vertices of this entity.")
+        bounds = np.full((len(pairs), 2), np.nan, dtype=gs.np_float)  # nan: the solver fills in the rest distance
+        if lo is not None:
+            bounds[:, 0] = lo
+        if hi is not None:
+            bounds[:, 1] = hi
+        if lo is not None and hi is not None and (bounds[:, 0] > bounds[:, 1]).any():
+            gs.raise_exception("`lo` must not exceed `hi`.")
         self._distance_constraints = np.concatenate([self._distance_constraints, pairs])
+        self._distance_bounds = np.concatenate([self._distance_bounds, bounds])
 
     @property
     def distance_constraints(self):
         """Declared hard distance constraints, local vertex pairs, shape (n, 2)."""
         return self._distance_constraints
+
+    @property
+    def distance_bounds(self):
+        """[lo, hi] per declared constraint, nan where the rest distance applies, shape (n, 2)."""
+        return self._distance_bounds
 
     def set_fiber_stiffness(self, k_fiber):
         """

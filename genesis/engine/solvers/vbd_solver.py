@@ -105,8 +105,10 @@ class VBDSolver(Solver):
         # Hard distance constraints |x_a - x_b| = rest between two vertices, augmented Lagrangian (Giles, Diaz,
         # Yuksel 2025): energy k/2 C^2 + lam C, dual update lam += k C after every sweep, stiffness ramp, and a warm
         # start once per step. lam and k live per env; the constraint list per vertex is a CSR like the tets.
-        struct_cons_info = qd.types.struct(v=gs.qd_ivec2, rest=gs.qd_float)
-        struct_cons_state = qd.types.struct(lam=gs.qd_float, k=gs.qd_float)
+        # lo == hi is an equality; otherwise the distance is bounded to [lo, hi] with one clamped multiplier per side
+        # (Giles et al. 2025 Eq. 13: lam_hi >= 0 pushes the distance down, lam_lo <= 0 pushes it up)
+        struct_cons_info = qd.types.struct(v=gs.qd_ivec2, lo=gs.qd_float, hi=gs.qd_float)
+        struct_cons_state = qd.types.struct(lam_hi=gs.qd_float, lam_lo=gs.qd_float, k=gs.qd_float)
         n = max(self._n_constraints, 1)
         self.cons_info = struct_cons_info.field(shape=(n,), layout=qd.Layout.SOA)
         self.cons = struct_cons_state.field(shape=(n, self._B), layout=qd.Layout.SOA)
@@ -177,12 +179,14 @@ class VBDSolver(Solver):
             cons = np.concatenate(
                 [entity._v_start + entity.distance_constraints for entity in self._entities] + [np.zeros((0, 2), dtype=np.int64)]
             ).astype(np.int64)
+            lo = np.concatenate([entity.distance_bounds[:, 0] for entity in self._entities] + [np.zeros(0)])
+            hi = np.concatenate([entity.distance_bounds[:, 1] for entity in self._entities] + [np.zeros(0)])
             self._n_constraints = len(cons)
             self.init_constraint_fields()
             perm, self._color_offsets, self._n_colors, ve_offset, ve_elem, ve_role = (
                 self._compute_vertex_coloring_and_incidence(elems, cons)
             )
-            self._init_constraints(cons)
+            self._init_constraints(cons, lo, hi)
             self.color_perm = qd.field(dtype=gs.qd_int, shape=(self._n_vertices,))
             self.color_perm.from_numpy(perm.astype(gs.np_int))
             self.ve_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
@@ -192,11 +196,14 @@ class VBDSolver(Solver):
             self.ve_role = qd.field(dtype=gs.qd_int, shape=(len(ve_role),))
             self.ve_role.from_numpy(ve_role.astype(gs.np_int))
 
-    def _init_constraints(self, cons):
-        """Rest lengths from the rest positions, per-vertex CSR of incident constraints, and the stiffness scale
-        k_start = mean vertex mass / h^2 (the inertia the local solve already carries)."""
+    def _init_constraints(self, cons, lo, hi):
+        """Bounds (rest length when the entity gave none), per-vertex CSR of incident constraints, and the stiffness
+        scale k_start = mean vertex mass / h^2 (the inertia the local solve already carries)."""
         pos = self.verts.pos.to_numpy()[0, :, 0]
         rest = np.linalg.norm(pos[cons[:, 0]] - pos[cons[:, 1]], axis=1) if len(cons) else np.zeros(0)
+        lo = np.where(np.isnan(lo), rest, lo)
+        hi = np.where(np.isnan(hi), rest, hi)
+        assert (lo <= hi).all() and (lo >= 0.0).all(), "distance bounds must satisfy 0 <= lo <= hi"
         inc_vert = cons.reshape(-1)
         inc_cons = np.repeat(np.arange(len(cons)), 2)
         inc_side = np.tile(np.array([1.0, -1.0]), len(cons))  # sign of dC/dx for this vertex
@@ -210,9 +217,11 @@ class VBDSolver(Solver):
             self.vc_cons.from_numpy(inc_cons[order].astype(gs.np_int))
             self.vc_side.from_numpy(inc_side[order].astype(gs.np_float))
             self.cons_info.v.from_numpy(cons.astype(gs.np_int))
-            self.cons_info.rest.from_numpy(rest.astype(gs.np_float))
+            self.cons_info.lo.from_numpy(lo.astype(gs.np_float))
+            self.cons_info.hi.from_numpy(hi.astype(gs.np_float))
         self._k_start = float(self.verts_info.mass.to_numpy().mean() / self._substep_dt**2)
-        self.cons.lam.fill(0.0)
+        self.cons.lam_hi.fill(0.0)
+        self.cons.lam_lo.fill(0.0)
         self.cons.k.fill(self._k_start)
 
     def init_ckpt(self):
@@ -508,11 +517,10 @@ class VBDSolver(Solver):
             e = self.verts[f + 1, va, i_b].pos - self.verts[f + 1, vb, i_b].pos
             dist = e.norm()
             n = e / dist
-            C = dist - self.cons_info[i_c].rest
-            k_c = self.cons[i_c, i_b].k
-            mult = k_c * C + self.cons[i_c, i_b].lam
+            mult, violation = self._func_constraint_mult(i_c, i_b, dist)
             force -= qd.cast(mult * side, self._acc) * qd.cast(n, self._acc)
-            H += qd.cast(k_c, self._acc) * qd.cast(n.outer_product(n), self._acc)
+            if mult != 0.0:  # an active side: its stiffness enters the block (Eq. 14 without rescaling)
+                H += qd.cast(self.cons[i_c, i_b].k, self._acc) * qd.cast(n.outer_product(n), self._acc)
             H += qd.cast(qd.abs(mult) / dist, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n), self._acc)
 
         # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
@@ -591,14 +599,33 @@ class VBDSolver(Solver):
             self._func_solve_vertex(f, self.color_perm[k], i_b)
 
     @qd.func
+    def _func_constraint_mult(self, i_c, i_b, dist):
+        """Clamped total multiplier of a bounded distance (Giles et al. 2025 Eq. 13): the upper bound can only pull the
+        distance down (>= 0), the lower bound only push it up (<= 0); inside the bounds both vanish as their
+        multipliers decay. Returns (mult, violation) with violation the signed distance error used for the ramp."""
+        k = self.cons[i_c, i_b].k
+        c_hi = dist - self.cons_info[i_c].hi
+        c_lo = dist - self.cons_info[i_c].lo
+        mult = k * c_hi + self.cons[i_c, i_b].lam_hi  # equality: one unclamped multiplier, kept in lam_hi
+        violation = c_hi
+        if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
+            mult = qd.max(k * c_hi + self.cons[i_c, i_b].lam_hi, 0.0) + qd.min(k * c_lo + self.cons[i_c, i_b].lam_lo, 0.0)
+            violation = qd.max(c_hi, 0.0) + qd.min(c_lo, 0.0)
+        return mult, violation
+
+    @qd.func
     def _func_dual_update(self, f, i_c, i_b):
-        """Giles et al. 2025 Eq. 11 and 12: lam += k C, k += beta |C| with beta = k_start / constraint_tol."""
+        """Giles et al. 2025 Eq. 11 to 13: clamped lam += k C per side, k += beta |C| with beta = k_start / constraint_tol."""
         e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
-        C = e.norm() - self.cons_info[i_c].rest
-        self.cons[i_c, i_b].lam += self.cons[i_c, i_b].k * C
-        self.cons[i_c, i_b].k = qd.min(
-            self.cons[i_c, i_b].k + self._k_start / self._constraint_tol * qd.abs(C), self._constraint_k_max_ratio * self._k_start
-        )
+        dist = e.norm()
+        k = self.cons[i_c, i_b].k
+        if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
+            self.cons[i_c, i_b].lam_hi = qd.max(self.cons[i_c, i_b].lam_hi + k * (dist - self.cons_info[i_c].hi), 0.0)
+            self.cons[i_c, i_b].lam_lo = qd.min(self.cons[i_c, i_b].lam_lo + k * (dist - self.cons_info[i_c].lo), 0.0)
+        else:
+            self.cons[i_c, i_b].lam_hi += k * (dist - self.cons_info[i_c].hi)
+        _, violation = self._func_constraint_mult(i_c, i_b, dist)
+        self.cons[i_c, i_b].k = qd.min(k + self._k_start / self._constraint_tol * qd.abs(violation), self._constraint_k_max_ratio * self._k_start)
 
     @qd.kernel
     def _kernel_sweeps(self, f: qd.i32):
@@ -617,7 +644,8 @@ class VBDSolver(Solver):
     def _kernel_warm_start(self):
         """Once per step (the paper runs it per frame): lam <- alpha gamma lam, k <- max(k_start, gamma k)."""
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-            self.cons[i_c, i_b].lam *= 0.95 * 0.99
+            self.cons[i_c, i_b].lam_hi *= 0.95 * 0.99
+            self.cons[i_c, i_b].lam_lo *= 0.95 * 0.99
             self.cons[i_c, i_b].k = qd.max(self._k_start, 0.99 * self.cons[i_c, i_b].k)
 
     @qd.kernel
@@ -625,7 +653,8 @@ class VBDSolver(Solver):
         self.cons_error[None] = 0.0
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
             e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
-            qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(e.norm() - self.cons_info[i_c].rest), qd.f64))
+            _, violation = self._func_constraint_mult(i_c, i_b, e.norm())
+            qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(violation), qd.f64))
 
     def constraint_error(self):
         """Largest absolute distance-constraint error (m) at the current end-of-substep positions, over all envs."""
@@ -944,8 +973,15 @@ class VBDSolver(Solver):
     def _kernel_constraint_energy(self, f: qd.i32):
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
             e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
-            C = e.norm() - self.cons_info[i_c].rest
-            self.energy[i_b] += qd.cast(0.5 * self.cons[i_c, i_b].k * C * C + self.cons[i_c, i_b].lam * C, qd.f64)
+            dist = e.norm()
+            k = self.cons[i_c, i_b].k
+            if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
+                c_hi = qd.max(dist - self.cons_info[i_c].hi, 0.0)
+                c_lo = qd.min(dist - self.cons_info[i_c].lo, 0.0)
+                self.energy[i_b] += qd.cast(0.5 * k * (c_hi * c_hi + c_lo * c_lo) + self.cons[i_c, i_b].lam_hi * c_hi + self.cons[i_c, i_b].lam_lo * c_lo, qd.f64)
+            else:
+                C = dist - self.cons_info[i_c].hi
+                self.energy[i_b] += qd.cast(0.5 * k * C * C + self.cons[i_c, i_b].lam_hi * C, qd.f64)
 
     def compute_energy(self, f):
         """Incremental potential of substep `f` at the current iterate, shape (B,). Non-increasing across sweeps."""

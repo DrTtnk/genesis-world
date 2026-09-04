@@ -320,3 +320,35 @@ def test_hard_distance_constraints_make_a_vertex_chain_inextensible(show_viewer)
     assert results[False][2] < 0.75
     assert results[True][0] < 5e-4
     assert abs(results[True][1] - 1.0) < 2e-3
+
+
+@pytest.mark.required
+def test_bounded_distance_constraints_stop_at_the_bound_and_are_slack_inside(show_viewer):
+    """The top-edge chain of the actuated bar with a lower bound at 90 percent of rest: the bar contracts freely
+    until the segments reach the bound, then stops there. Segments must end within tolerance below 0.9 rest and the
+    bar must be shorter than 0.95 (the bound did not act as an equality)."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=5e-3, substeps=40, gravity=(0.0, 0.0, 0.0)),
+        vbd_options=gs.options.VBDOptions(n_iterations=2, floor_height=-1.0, constraint_tol=1e-4),
+        show_viewer=show_viewer,
+    )
+    bar = scene.add_entity(material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=1, gain=0.3), morph=gs.morphs.Box(**BAR))
+    pos0 = tensor_to_array(bar.init_positions)
+    top = np.where((pos0[:, 1] > 0.019) & (pos0[:, 2] > 0.019))[0]
+    chain = top[np.argsort(pos0[top, 0])]
+    pairs = np.stack([chain[:-1], chain[1:]], axis=1)
+    rest = np.linalg.norm(pos0[pairs[:, 0]] - pos0[pairs[:, 1]], axis=1)
+    bar.add_distance_constraints(pairs, lo=0.9 * rest, hi=1.5 * rest)
+    scene.build()
+    bar.set_muscle(np.zeros(bar.n_elements, dtype=np.int32), np.tile([1.0, 0.0, 0.0], (bar.n_elements, 1)))
+    p0 = _positions(bar)
+    for step in range(300):
+        bar.set_actuation([min(1.0, step / 100)])
+        scene.step()
+    p1 = _positions(bar)
+    seg = np.linalg.norm(p1[pairs[:, 0]] - p1[pairs[:, 1]], axis=1)
+    print(f"segment / rest: min={(seg / rest).min():.4f} median={np.median(seg / rest):.4f}; bar length ratio={_extent(p1, 0) / _extent(p0, 0):.3f}; constraint error={scene.vbd_solver.constraint_error():.2e}", flush=True)
+    assert np.isfinite(p1).all()
+    assert (seg >= 0.9 * rest - 5e-4).all()
+    assert np.median(seg / rest) < 0.93
+    assert _extent(p1, 0) / _extent(p0, 0) < 0.95
