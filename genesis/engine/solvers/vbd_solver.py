@@ -85,6 +85,9 @@ class VBDSolver(Solver):
         )
         self.elems_info = struct_elem_info.field(shape=(self._n_elements,), layout=qd.Layout.SOA)
         self.muscle_actu = qd.field(dtype=gs.qd_float, shape=(max(self._n_muscle_groups, 1), self._B))
+        # Analytic bolus: a sphere with prescribed centre, radius and velocity per env, radius <= 0 disables it.
+        struct_bolus = qd.types.struct(center=gs.qd_vec3, radius=gs.qd_float, vel=gs.qd_vec3, friction=gs.qd_float)
+        self.bolus = struct_bolus.field(shape=(self._B,))
         self.muscle_actu_adj = qd.field(dtype=qd.f64, shape=(max(self._n_muscle_groups, 1), self._B))
         self.energy = qd.field(dtype=qd.f64, shape=(self._B,))
 
@@ -139,6 +142,7 @@ class VBDSolver(Solver):
             self.init_vvert_fields()
             self.init_ckpt()
             self.muscle_actu.fill(0.0)
+            self.bolus.radius.fill(0.0)
             self.reset_grad()
 
             for entity in self._entities:
@@ -254,6 +258,22 @@ class VBDSolver(Solver):
         for i_v_ in range(tangent.shape[0]):
             for j in qd.static(range(3)):
                 self.verts_info[i_v_ + v_start].tangent[j] = tangent[i_v_, j]
+
+    def set_bolus(self, center, radius, vel, friction):
+        """Place the analytic sphere bolus: `center` (B, 3), `radius` (B,), `vel` (B, 3) prescribed velocity used
+        for the friction slide, `friction` isotropic coefficient. A radius <= 0 disables it in that env."""
+        if self._sim.requires_grad:
+            gs.raise_exception("The bolus contact has no adjoint yet; disable requires_grad or the bolus.")
+        self._kernel_set_bolus(center, radius, vel, friction)
+
+    @qd.kernel
+    def _kernel_set_bolus(self, center: qd.types.ndarray(), radius: qd.types.ndarray(), vel: qd.types.ndarray(), friction: qd.f32):
+        for i_b in range(self._B):
+            for j in qd.static(range(3)):
+                self.bolus[i_b].center[j] = center[i_b, j]
+                self.bolus[i_b].vel[j] = vel[i_b, j]
+            self.bolus[i_b].radius = radius[i_b]
+            self.bolus[i_b].friction = friction
 
     def set_muscle(self, el_start, group, fiber):
         self._kernel_set_muscle(el_start, group, fiber)
@@ -409,6 +429,28 @@ class VBDSolver(Solver):
                 qd.cast(mu_ax, self._acc) * qd.cast(t.outer_product(t), self._acc)
                 + qd.cast(self.verts_info[i_v].mu_lateral, self._acc) * qd.cast(b.outer_product(b), self._acc)
             )
+
+        # Analytic sphere bolus: the same penalty and IPC-smoothed isotropic Coulomb friction against a moving sphere.
+        r_b = self.bolus[i_b].radius
+        if r_b > 0.0:
+            rel = x - self.bolus[i_b].center
+            dist = rel.norm()
+            pen = r_b - dist  # penetration depth into the sphere
+            if pen > 0.0:
+                k = self._contact_stiffness
+                n_b = rel / dist
+                force += qd.cast(k * pen, self._acc) * qd.cast(n_b, self._acc)
+                H += qd.cast(k, self._acc) * qd.cast(n_b.outer_product(n_b), self._acc)
+                slide = x - self.verts[f, i_v, i_b].pos - self.bolus[i_b].vel * self._substep_dt
+                slide -= slide.dot(n_b) * n_b
+                u_norm = slide.norm()
+                eps = self._friction_eps_v * self._substep_dt
+                g = 1.0 / u_norm
+                if u_norm < eps:
+                    g = 2.0 / eps - u_norm / (eps * eps)
+                lam_b = k * pen * self.bolus[i_b].friction
+                force -= qd.cast(lam_b * g, self._acc) * qd.cast(slide, self._acc)
+                H += qd.cast(lam_b * g, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n_b.outer_product(n_b), self._acc)
         return force, H
 
     @qd.func

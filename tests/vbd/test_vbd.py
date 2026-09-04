@@ -222,3 +222,40 @@ def test_rayleigh_damping_kills_the_ringing_of_a_dropped_block(show_viewer):
         print(f"damping={damping}: peak speed early={peaks[damping][0]:.3f} late={peaks[damping][1]:.3f}", flush=True)
     assert peaks[0.02][1] < 0.1 * peaks[0.02][0]
     assert peaks[0.02][1] < 0.3 * peaks[0.0][1]
+
+
+@pytest.mark.required
+def test_sphere_bolus_inflating_inside_a_ring_stretches_it_to_the_sphere(show_viewer, asset_tmp_path):
+    """A sphere grown inside a thick tube must carry the inner wall out to its own radius (minus the penalty
+    penetration) without inverting a tet, and the ring keeps its volume within the material's compressibility."""
+    import trimesh
+
+    ring = str(asset_tmp_path / "vbd_ring.obj")
+    trimesh.creation.annulus(r_min=0.05, r_max=0.08, height=0.3, sections=48).export(ring)  # long, so it cannot slide off the sphere
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=5e-3, substeps=20, gravity=(0.0, 0.0, 0.0)),
+        vbd_options=gs.options.VBDOptions(n_iterations=2, damping=0.005, floor_height=-1.0, contact_stiffness=1e5),
+        show_viewer=show_viewer,
+    )
+    body = scene.add_entity(material=gs.materials.VBD.Muscle(E=1e5, nu=0.45), morph=gs.morphs.Mesh(file=ring, pos=(0.0, 0.0, 0.0), nobisect=False, maxvolume=1e-5))
+    scene.build()
+    pos0 = _positions(body)
+    el = body.elems
+    shape = lambda q: np.stack([q[el[:, 1]] - q[el[:, 0]], q[el[:, 2]] - q[el[:, 0]], q[el[:, 3]] - q[el[:, 0]]], axis=-1)
+    vol0 = np.linalg.det(shape(pos0))
+    inner = (np.linalg.norm(pos0[:, :2], axis=1) < 0.052) & (np.abs(pos0[:, 2]) < 0.03)
+
+    center = np.zeros((1, 3)); vel = np.zeros((1, 3))
+    for step in range(400):
+        radius = 0.03 + 0.045 * min(1.0, step / 300)  # ends at 0.075: hoop stretch 1.5
+        scene.vbd_solver.set_bolus(center, np.array([radius]), vel, 0.0)
+        scene.step()
+    pos1 = _positions(body)
+    d_inner = np.linalg.norm(pos1[inner], axis=1)  # 3D distance: the sphere surface is not a cylinder
+    vol1 = np.linalg.det(shape(pos1))
+    print(f"inner-wall distance from centre min={d_inner.min():.4f} mean={d_inner.mean():.4f} (sphere 0.075), volume ratio={vol1.sum() / vol0.sum():.4f}, inverted={(vol1 < 0).sum()}", flush=True)
+    assert np.isfinite(pos1).all()
+    assert d_inner.min() > 0.075 - 1e-3
+    assert abs(d_inner.mean() - 0.075) < 3e-3
+    assert (vol1 > 0).all()
+    assert abs(vol1.sum() / vol0.sum() - 1.0) < 0.1
