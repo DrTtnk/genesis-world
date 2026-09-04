@@ -105,6 +105,50 @@ class MPMEntityState(RBC):
         return self._active
 
 
+class VBDEntityState(RBC):
+    """
+    Dynamic state queried from a genesis VBDEntity.
+    """
+
+    def __init__(self, entity, s_global):
+        self._entity = entity
+        self._s_global = s_global
+        base_shape = (self.entity.sim._B, self._entity.n_vertices, 3)
+        args = {
+            "dtype": gs.tc_float,
+            "requires_grad": self._entity.scene.requires_grad,
+            "scene": self._entity.scene,
+        }
+        self._pos = gs.zeros(base_shape, **args)
+        self._vel = gs.zeros(base_shape, **args)
+
+    def serializable(self):
+        self._entity = None
+
+        self._pos = self._pos.detach()
+        self._vel = self._vel.detach()
+
+    @property
+    def entity(self):
+        return self._entity
+
+    @property
+    def s_global(self):
+        return self._s_global
+
+    @property
+    def pos(self):
+        return self._pos
+
+    @property
+    def vel(self):
+        return self._vel
+
+    def __iter__(self):
+        """Preserves the pre-existing `pos, vel = entity.get_state()` call sites."""
+        return iter((self._pos, self._vel))
+
+
 class SPHEntityState(RBC):
     """
     Dynamic state queried from a genesis SPHEntity.

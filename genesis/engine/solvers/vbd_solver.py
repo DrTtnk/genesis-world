@@ -23,6 +23,7 @@ uses `B_a = B A`, `A = (1/s) m m^T + sqrt(s) (I - m m^T)`, `s = 1 - a gain`, `de
 import numpy as np
 import networkx as nx
 import quadrants as qd
+import torch
 
 import genesis as gs
 from genesis.engine.entities.vbd_entity import VBDEntity
@@ -63,6 +64,12 @@ class VBDSolver(Solver):
             shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA
         )
         self.residual = qd.field(dtype=qd.f64, shape=())
+        # Adjoint state, one frame per position frame: dL/dx and dL/dv accumulated by the backward pass.
+        struct_adj = qd.types.struct(pos=qd.types.vector(3, qd.f64), vel=qd.types.vector(3, qd.f64))
+        self.adj = struct_adj.field(shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA)
+        self.z = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # adjoint of the stationarity condition
+        self.gbar = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # its right-hand side
+        self.adj_residual = qd.field(dtype=qd.f64, shape=())
 
     def init_element_fields(self):
         struct_elem_info = qd.types.struct(
@@ -77,6 +84,7 @@ class VBDSolver(Solver):
         )
         self.elems_info = struct_elem_info.field(shape=(self._n_elements,), layout=qd.Layout.SOA)
         self.muscle_actu = qd.field(dtype=gs.qd_float, shape=(max(self._n_muscle_groups, 1), self._B))
+        self.muscle_actu_adj = qd.field(dtype=qd.f64, shape=(max(self._n_muscle_groups, 1), self._B))
         self.energy = qd.field(dtype=qd.f64, shape=(self._B,))
 
     def init_vvert_fields(self):
@@ -130,6 +138,7 @@ class VBDSolver(Solver):
             self.init_vvert_fields()
             self.init_ckpt()
             self.muscle_actu.fill(0.0)
+            self.reset_grad()
 
             for entity in self._entities:
                 entity._add_to_solver()
@@ -307,6 +316,16 @@ class VBDSolver(Solver):
         return w
 
     @qd.func
+    def _func_vertex_weight_static(self, B, role: qd.template()):
+        """`_func_vertex_weight` for a compile-time `role`: a runtime `if` would compile `B[-1, :]` for role 0."""
+        w = qd.Vector.zero(gs.qd_float, 3)
+        if qd.static(role == 0):
+            w = -(B[0, :] + B[1, :] + B[2, :])
+        else:
+            w = B[role - 1, :]
+        return w
+
+    @qd.func
     def _func_inertia_target(self, f, i_v, i_b):
         """y = x^t + h (v^t + h g), the position the vertex would reach with no internal forces."""
         vel = self.verts[f, i_v, i_b].vel + self._gravity[i_b] * self._substep_dt
@@ -411,6 +430,14 @@ class VBDSolver(Solver):
             force, _ = self._func_vertex_system(f, i_v, i_b)
             qd.atomic_max(self.residual[None], qd.cast(qd.abs(force).max(), qd.f64))
 
+    @qd.kernel
+    def _kernel_residual_vector(self, f: qd.i32, out: qd.types.ndarray()):
+        """r_i = -force_i of substep `f` at the current iterate, shape (B, n_vertices, 3). Test hook."""
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            force, _ = self._func_vertex_system(f, i_v, i_b)
+            for j in qd.static(range(3)):
+                out[i_b, i_v, j] = -force[j]
+
     def solve(self, f):
         """Fixed sweeps normally; under requires_grad, sweep until the residual is below tolerance, since the
         adjoint differentiates the converged stationarity condition and inherits any leftover residual as bias."""
@@ -427,6 +454,211 @@ class VBDSolver(Solver):
                     f"VBD substep did not converge: residual {self.residual[None]:.3e} >= {self._residual_tol:.1e} "
                     f"after {self._max_sweeps} sweeps."
                 )
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------------------- adjoint --------------------------------------
+    # ------------------------------------------------------------------------------------
+    # The substep ends at r(x) = 0 with r = -force of `_func_vertex_system`. With J = dr/dx, the adjoint z solves
+    # J^T z = gbar, gbar = dL/dx^{t+1} + dL/dv^{t+1} / h, and then
+    #   dL/dx^t += (M/h^2) z - dL/dv^{t+1} / h - (dr/dx^t)^T z,   dL/dv^t += (M/h) z,   dL/da -= z . dr/da.
+    # The elastic Jacobian is symmetric, so the off-diagonal action of J^T is the off-diagonal action of J;
+    # only the per-vertex contact/friction block is nonsymmetric and gets transposed explicitly.
+
+    @qd.func
+    def _func_friction_terms(self, f, i_v, i_b):
+        """(lam_n, A_f, coupling) of vertex `i_v` at frame f+1: the normal force, the exact tangential Jacobian
+        d(lam_n g P u)/du (3x3, nonsymmetric) and the normal coupling -k (g P u) e_z^T. All zero out of contact."""
+        x = self.verts[f + 1, i_v, i_b].pos
+        d = self._floor_height - x[2]
+        lam_n = 0.0
+        A_f = qd.Matrix.zero(qd.f64, 3, 3)
+        coupling = qd.Matrix.zero(qd.f64, 3, 3)
+        if d > 0.0:
+            k = self._contact_stiffness
+            lam_n = k * d
+            slide = x - self.verts[f, i_v, i_b].pos
+            slide[2] = 0.0
+            t = self.verts_info[i_v].tangent
+            t[2] = 0.0
+            t = t.normalized()
+            b = qd.Vector([-t[1], t[0], 0.0], dt=gs.qd_float)
+            u_t = slide.dot(t)
+            u_b = slide.dot(b)
+            u_norm = slide.norm()
+            eps = self._friction_eps_v * self._substep_dt
+            g = 1.0 / u_norm
+            dg = -1.0 / (u_norm * u_norm)  # g'(|u|)
+            if u_norm < eps:
+                g = 2.0 / eps - u_norm / (eps * eps)
+                dg = -1.0 / (eps * eps)
+            mu_f = self.verts_info[i_v].mu_forward
+            mu_bw = self.verts_info[i_v].mu_backward
+            th = qd.tanh(u_t / eps)
+            mu_ax = 0.5 * (mu_f + mu_bw) + 0.5 * (mu_f - mu_bw) * th
+            dmu_ax = 0.5 * (mu_f - mu_bw) * (1.0 - th * th) / eps
+            mu_l = self.verts_info[i_v].mu_lateral
+            Pu = mu_ax * u_t * t + mu_l * u_b * b
+            P = mu_ax * t.outer_product(t) + mu_l * b.outer_product(b)
+            # the rank-one term is (g'/|u|) (P u) u^T; at |u| = 0 it vanishes with u, so the guarded divisor is exact
+            A = g * P + g * dmu_ax * u_t * t.outer_product(t) + (dg / qd.max(u_norm, 1e-300)) * Pu.outer_product(slide)
+            A_f = qd.cast(lam_n, qd.f64) * qd.cast(A, qd.f64)
+            e_z = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
+            coupling = -qd.cast(k, qd.f64) * qd.cast((g * Pu).outer_product(e_z), qd.f64)
+        return lam_n, A_f, coupling
+
+    @qd.func
+    def _func_diag_block(self, f, i_v, i_b):
+        """Exact J_ii = dr_i/dx_i: the forward Hessian with the friction block replaced by its exact derivative."""
+        _, H = self._func_vertex_system(f, i_v, i_b)
+        lam_n, A_f, coupling = self._func_friction_terms(f, i_v, i_b)
+        if lam_n > 0.0:
+            # remove the forward's symmetric friction approximation (lam_n g P) and add the exact terms
+            x = self.verts[f + 1, i_v, i_b].pos
+            slide = x - self.verts[f, i_v, i_b].pos
+            slide[2] = 0.0
+            t = self.verts_info[i_v].tangent
+            t[2] = 0.0
+            t = t.normalized()
+            b = qd.Vector([-t[1], t[0], 0.0], dt=gs.qd_float)
+            u_norm = slide.norm()
+            eps = self._friction_eps_v * self._substep_dt
+            g = 1.0 / u_norm
+            if u_norm < eps:
+                g = 2.0 / eps - u_norm / (eps * eps)
+            th = qd.tanh(slide.dot(t) / eps)
+            mu_ax = 0.5 * (self.verts_info[i_v].mu_forward + self.verts_info[i_v].mu_backward) + 0.5 * (
+                self.verts_info[i_v].mu_forward - self.verts_info[i_v].mu_backward
+            ) * th
+            P = mu_ax * t.outer_product(t) + self.verts_info[i_v].mu_lateral * b.outer_product(b)
+            H -= qd.cast(lam_n * g, qd.f64) * qd.cast(P, qd.f64)
+            H += A_f + coupling
+        return qd.cast(H, qd.f64)
+
+    @qd.func
+    def _func_offdiag_apply(self, f, i_v, i_b, vec):
+        """sum over neighbours j of J_ij vec_j, with J_ij = V [mu (w_i.w_j) I + lam' q_i q_j^T + lam' (J-alpha) K_ij]
+        and K_ij = -[F (w_i x w_j)]_x (skew). Reads `vec` from the given vector field."""
+        out = qd.Vector.zero(qd.f64, 3)
+        for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
+            i_e = self.ve_elem[c]
+            role = self.ve_role[c]
+            F, B = self._func_deformation(f + 1, i_e, i_b)
+            mu = self.elems_info[i_e].mu
+            lam = self.elems_info[i_e].lam
+            alpha = 1.0 + mu / lam
+            cof = self._func_cofactor(F)
+            J = F.determinant()
+            V = self.elems_info[i_e].vol_rest
+            w_i = self._func_vertex_weight(B, role)
+            q_i = cof @ w_i
+            for r in qd.static(range(4)):
+                if r != role:
+                    j = self.elems_info[i_e].v[r]
+                    w_j = self._func_vertex_weight_static(B, r)
+                    q_j = cof @ w_j
+                    vj = qd.cast(vec[j, i_b], gs.qd_float)
+                    Kv = -(F @ w_i.cross(w_j)).cross(vj)
+                    out += qd.cast(V * (mu * w_i.dot(w_j) * vj + lam * q_j.dot(vj) * q_i + lam * (J - alpha) * Kv), qd.f64)
+        return out
+
+    @qd.kernel
+    def _kernel_apply_jacobian(self, f: qd.i32, p: qd.types.ndarray(), out: qd.types.ndarray()):
+        """out = J p for the stationarity Jacobian of substep `f`; p and out have shape (B, n_vertices, 3)."""
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            for j in qd.static(range(3)):
+                self.z[i_v, i_b][j] = p[i_b, i_v, j]
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            r = self._func_diag_block(f, i_v, i_b) @ self.z[i_v, i_b] + self._func_offdiag_apply(f, i_v, i_b, self.z)
+            for j in qd.static(range(3)):
+                out[i_b, i_v, j] = r[j]
+
+    @qd.kernel
+    def _kernel_adjoint_rhs(self, f: qd.i32):
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.gbar[i_v, i_b] = self.adj[f + 1, i_v, i_b].pos + self.adj[f + 1, i_v, i_b].vel / self._substep_dt
+            self.z[i_v, i_b] = qd.Vector.zero(qd.f64, 3)
+
+    @qd.kernel
+    def _kernel_adjoint_sweeps(self, f: qd.i32):
+        """Colored Gauss-Seidel on J^T z = gbar: z_i = (J_ii^T)^-1 (gbar_i - sum_j J_ij z_j)."""
+        for _ in qd.static(range(self._n_iterations)):
+            for c in qd.static(range(self._n_colors)):
+                for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
+                    i_v = self.color_perm[k]
+                    rhs = self.gbar[i_v, i_b] - self._func_offdiag_apply(f, i_v, i_b, self.z)
+                    self.z[i_v, i_b] = self._func_diag_block(f, i_v, i_b).transpose().inverse() @ rhs
+
+    @qd.kernel
+    def _kernel_adjoint_residual(self, f: qd.i32):
+        self.adj_residual[None] = 0.0
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            r = self.gbar[i_v, i_b] - self._func_diag_block(f, i_v, i_b).transpose() @ self.z[i_v, i_b]
+            r -= self._func_offdiag_apply(f, i_v, i_b, self.z)
+            qd.atomic_max(self.adj_residual[None], qd.abs(r).max())
+            qd.atomic_max(self.residual[None], qd.abs(self.gbar[i_v, i_b]).max())
+
+    @qd.kernel
+    def _kernel_adjoint_accumulate(self, f: qd.i32):
+        inv_h = 1.0 / self._substep_dt
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            z = self.z[i_v, i_b]
+            m_h = qd.cast(self.verts_info[i_v].mass * inv_h, qd.f64)
+            self.adj[f, i_v, i_b].pos += m_h * inv_h * z - self.adj[f + 1, i_v, i_b].vel * inv_h
+            self.adj[f, i_v, i_b].vel += m_h * z
+            lam_n, A_f, _ = self._func_friction_terms(f, i_v, i_b)
+            if lam_n > 0.0:
+                self.adj[f, i_v, i_b].pos += A_f.transpose() @ z  # dr/dx^t = -A_f
+        for i_e, i_b in qd.ndrange(self._n_elements, self._B):
+            group = self.elems_info[i_e].group
+            if group >= 0:
+                s_ = 1.0 - self.muscle_actu[group, i_b] * self.elems_info[i_e].gain
+                m = self.elems_info[i_e].fiber
+                mmT = m.outer_product(m)
+                I3 = qd.Matrix.identity(gs.qd_float, 3)
+                A_dot = self.elems_info[i_e].gain * ((1.0 / (s_ * s_)) * mmT - (0.5 / qd.sqrt(s_)) * (I3 - mmT))
+                F, B = self._func_deformation(f + 1, i_e, i_b)
+                B0 = self.elems_info[i_e].B_rest
+                A = (1.0 / s_) * mmT + qd.sqrt(s_) * (I3 - mmT)
+                F0 = F @ A.inverse()
+                F_dot = F0 @ A_dot
+                mu = self.elems_info[i_e].mu
+                lam = self.elems_info[i_e].lam
+                alpha = 1.0 + mu / lam
+                cof = self._func_cofactor(F)
+                J = F.determinant()
+                P = mu * F + lam * (J - alpha) * cof
+                dcof = qd.Matrix.cols(
+                    [
+                        F_dot[:, 1].cross(F[:, 2]) + F[:, 1].cross(F_dot[:, 2]),
+                        F_dot[:, 2].cross(F[:, 0]) + F[:, 2].cross(F_dot[:, 0]),
+                        F_dot[:, 0].cross(F[:, 1]) + F[:, 0].cross(F_dot[:, 1]),
+                    ]
+                )
+                P_dot = mu * F_dot + lam * (cof * F_dot).sum() * cof + lam * (J - alpha) * dcof
+                V = self.elems_info[i_e].vol_rest
+                da = 0.0
+                for r in qd.static(range(4)):
+                    w0 = self._func_vertex_weight_static(B0, r)
+                    w = self._func_vertex_weight_static(B, r)
+                    dr = V * (P_dot @ w + P @ (A_dot @ w0))
+                    da -= qd.cast(self.z[self.elems_info[i_e].v[r], i_b], gs.qd_float).dot(dr)
+                self.muscle_actu_adj[group, i_b] += qd.cast(da, qd.f64)
+
+    def substep_pre_coupling_grad(self, f):
+        if not self.is_active:
+            return
+        self._kernel_adjoint_rhs(f)
+        self.residual[None] = 0.0
+        for _ in range(self._max_sweeps // self._n_iterations):
+            self._kernel_adjoint_sweeps(f)
+            self._kernel_adjoint_residual(f)
+            if self.adj_residual[None] <= self._residual_tol * max(self.residual[None], 1.0):
+                break
+        else:
+            gs.raise_exception(
+                f"VBD adjoint did not converge: residual {self.adj_residual[None]:.3e} after {self._max_sweeps} sweeps."
+            )
+        self._kernel_adjoint_accumulate(f)
 
     @qd.kernel
     def _kernel_compute_energy(self, f: qd.i32):
@@ -461,16 +693,14 @@ class VBDSolver(Solver):
             entity.process_input(in_backward=in_backward)
 
     def process_input_grad(self):
-        pass
+        for entity in self._entities[::-1]:
+            entity.process_input_grad()
 
     def substep_pre_coupling(self, f):
         if self.is_active:
             self._kernel_predict(f)
             self.solve(f)
             self._kernel_update_velocity(f)
-
-    def substep_pre_coupling_grad(self, f):
-        pass
 
     def substep_post_coupling(self, f):
         pass
@@ -483,25 +713,80 @@ class VBDSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def reset_grad(self):
-        pass
+        self.adj.fill(0.0)
+        self.muscle_actu_adj.fill(0.0)
+        for entity in self._entities:
+            entity.reset_grad()
 
     def collect_output_grads(self):
-        pass
+        for entity in self._entities:
+            entity.collect_output_grads()
 
     def add_grad_from_state(self, state):
-        pass
+        if self.is_active:
+            if state.pos.grad is not None:
+                state.pos.assert_contiguous()
+                self._kernel_add_state_pos_grad(self._sim.cur_substep_local, state.pos.grad)
+
+            if state.vel.grad is not None:
+                state.vel.assert_contiguous()
+                self._kernel_add_state_vel_grad(self._sim.cur_substep_local, state.vel.grad)
+
+    @qd.kernel
+    def _kernel_add_state_pos_grad(self, f: qd.i32, pos_grad: qd.types.ndarray()):
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            for j in qd.static(range(3)):
+                self.adj[f, i_v, i_b].pos[j] += qd.cast(pos_grad[i_b, i_v, j], qd.f64)
+
+    @qd.kernel
+    def _kernel_add_state_vel_grad(self, f: qd.i32, vel_grad: qd.types.ndarray()):
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            for j in qd.static(range(3)):
+                self.adj[f, i_v, i_b].vel[j] += qd.cast(vel_grad[i_b, i_v, j], qd.f64)
 
     @qd.kernel
     def copy_frame(self, source: qd.i32, target: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             self.verts[target, i_v, i_b] = self.verts[source, i_v, i_b]
 
+    @qd.kernel
+    def copy_adj(self, source: qd.i32, target: qd.i32):
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.adj[target, i_v, i_b] = self.adj[source, i_v, i_b]
+
+    @qd.kernel
+    def reset_adj_till_frame(self, f: qd.i32):
+        # Zero out the vertex adjoint in frames [0, f-1], for all vertices, all batch indices.
+        for i_f, i_v, i_b in qd.ndrange(f, self._n_vertices, self._B):
+            self.adj[i_f, i_v, i_b].pos = qd.Vector.zero(qd.f64, 3)
+            self.adj[i_f, i_v, i_b].vel = qd.Vector.zero(qd.f64, 3)
+
     def save_ckpt(self, ckpt_name):
+        if self._sim.requires_grad:
+            if ckpt_name not in self._ckpt:
+                self._ckpt[ckpt_name] = dict()
+                self._ckpt[ckpt_name]["pos"] = torch.zeros((self._B, self._n_vertices, 3), dtype=gs.tc_float)
+                self._ckpt[ckpt_name]["vel"] = torch.zeros((self._B, self._n_vertices, 3), dtype=gs.tc_float)
+
+            self._kernel_get_state(0, self._ckpt[ckpt_name]["pos"], self._ckpt[ckpt_name]["vel"])
+
+            for entity in self._entities:
+                entity.save_ckpt(ckpt_name)
+
         # The last frame of this window becomes frame 0 of the next.
         self.copy_frame(self._sim.substeps_local, 0)
 
     def load_ckpt(self, ckpt_name):
         self.copy_frame(0, self._sim.substeps_local)
+        self.copy_adj(0, self._sim.substeps_local)
+
+        if self._sim.requires_grad:
+            self.reset_adj_till_frame(self._sim.substeps_local)
+
+            self._kernel_set_state(0, self._ckpt[ckpt_name]["pos"], self._ckpt[ckpt_name]["vel"])
+
+            for entity in self._entities:
+                entity.load_ckpt(ckpt_name)
 
     # ------------------------------------------------------------------------------------
     # --------------------------------------- io -----------------------------------------

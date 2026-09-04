@@ -8,8 +8,10 @@ import genesis as gs
 import genesis.utils.element as eu
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
+from genesis.engine.states.cache import QueriedStates
+from genesis.engine.states.entities import VBDEntityState
 from genesis.repr_base import RBC
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import tensor_to_array, to_gs_tensor
 
 from .base_entity import Entity
 
@@ -128,6 +130,10 @@ class VBDEntity(Entity):
         self._vface_start = vface_start  # offset for render faces
         self._step_global_added = None
         self.sample()
+
+        self.init_tgt_vars()
+        self._ckpt = dict()
+        self._queried_states = QueriedStates()
 
         self.active = False  # This attribute is only used in forward pass.
 
@@ -263,8 +269,88 @@ class VBDEntity(Entity):
     # ----------------------------------- basic entity ops -------------------------------
     # ------------------------------------------------------------------------------------
 
+    def init_tgt_vars(self):
+        """Initialize the target buffers used to replay the actuation input during the backward pass."""
+        self._tgt_keys = ("actu",)
+        self._tgt = dict()
+        self._tgt_buffer = dict()
+        for key in self._tgt_keys:
+            self._tgt[key] = None
+            self._tgt_buffer[key] = list()
+
     def process_input(self, in_backward=False):
-        pass
+        if in_backward:
+            # use negative index because buffer length might not be full
+            index = self._sim.cur_step_local - self._sim._steps_local
+            self._tgt["actu"] = self._tgt_buffer["actu"][index]
+        elif self._sim.requires_grad:
+            self._tgt_buffer["actu"].append(self._tgt["actu"])
+
+        if self._tgt["actu"] is not None:
+            self._tgt["actu"].assert_contiguous()
+            self._tgt["actu"].assert_sceneless()
+            actus = tensor_to_array(self._tgt["actu"], dtype=gs.np_float)
+            self._solver._kernel_set_actuation(actus)
+
+        self._tgt["actu"] = None
+
+    def process_input_grad(self):
+        """Backpropagate the gradient of the actuation set through `set_actuation` for this step."""
+        _tgt_actu = self._tgt_buffer["actu"].pop()
+        if _tgt_actu is not None and _tgt_actu.requires_grad:
+            _tgt_actu._backward_from_qd(self._kernel_get_actuation_grad)
+
+    @qd.kernel
+    def _kernel_get_actuation_grad(self, grad: qd.types.ndarray()):
+        for i_g, i_b in qd.ndrange(self.material.n_groups, self._sim._B):
+            grad[i_g, i_b] = qd.cast(self._solver.muscle_actu_adj[i_g, i_b], gs.qd_float)
+            self._solver.muscle_actu_adj[i_g, i_b] = 0.0
+
+    def collect_output_grads(self):
+        """Push the gradient of every state queried this step back into the solver's adjoint."""
+        if self._sim.cur_step_global in self._queried_states:
+            for state in self._queried_states[self._sim.cur_step_global]:
+                self.add_grad_from_state(state)
+
+    def add_grad_from_state(self, state):
+        if state.pos.grad is not None:
+            state.pos.assert_contiguous()
+            self._kernel_add_pos_grad(self._sim.cur_substep_local, state.pos.grad)
+
+        if state.vel.grad is not None:
+            state.vel.assert_contiguous()
+            self._kernel_add_vel_grad(self._sim.cur_substep_local, state.vel.grad)
+
+    @qd.kernel
+    def _kernel_add_pos_grad(self, f: qd.i32, pos_grad: qd.types.ndarray()):
+        for i_v, i_b in qd.ndrange(self.n_vertices, self._sim._B):
+            i_global = i_v + self.v_start
+            for j in qd.static(range(3)):
+                self._solver.adj[f, i_global, i_b].pos[j] += qd.cast(pos_grad[i_b, i_v, j], qd.f64)
+
+    @qd.kernel
+    def _kernel_add_vel_grad(self, f: qd.i32, vel_grad: qd.types.ndarray()):
+        for i_v, i_b in qd.ndrange(self.n_vertices, self._sim._B):
+            i_global = i_v + self.v_start
+            for j in qd.static(range(3)):
+                self._solver.adj[f, i_global, i_b].vel[j] += qd.cast(vel_grad[i_b, i_v, j], qd.f64)
+
+    def reset_grad(self):
+        for key in self._tgt_keys:
+            self._tgt_buffer[key].clear()
+        self._queried_states.clear()
+
+    def save_ckpt(self, ckpt_name):
+        if ckpt_name not in self._ckpt:
+            self._ckpt[ckpt_name] = {"_tgt_buffer": dict()}
+
+        for key in self._tgt_keys:
+            self._ckpt[ckpt_name]["_tgt_buffer"][key] = list(self._tgt_buffer[key])
+            self._tgt_buffer[key].clear()
+
+    def load_ckpt(self, ckpt_name):
+        for key in self._tgt_keys:
+            self._tgt_buffer[key] = list(self._ckpt[ckpt_name]["_tgt_buffer"][key])
 
     @qd.kernel
     def _kernel_get_frame(self, f: qd.i32, pos: qd.types.ndarray(), vel: qd.types.ndarray()):
@@ -276,15 +362,14 @@ class VBDEntity(Entity):
 
     def get_state(self):
         """Positions and velocities of the entity's vertices, each of shape (B, n_vertices, 3)."""
-        pos = gs.zeros((self._sim._B, self.n_vertices, 3), dtype=gs.tc_float, requires_grad=False, scene=self.scene)
-        vel = gs.zeros((self._sim._B, self.n_vertices, 3), dtype=gs.tc_float, requires_grad=False, scene=self.scene)
-        self._kernel_get_frame(self._sim.cur_substep_local, pos, vel)
-        return pos, vel
+        state = VBDEntityState(self, self._sim.cur_step_global)
+        self._kernel_get_frame(self._sim.cur_substep_local, state.pos, state.vel)
+        self._queried_states.append(state)
+        return state
 
     def get_positions(self):
         """Positions of the entity's vertices, shape (B, n_vertices, 3)."""
-        pos, _ = self.get_state()
-        return pos
+        return self.get_state().pos
 
     def set_friction_frame(self, tangent):
         """
@@ -342,26 +427,26 @@ class VBDEntity(Entity):
         Parameters
         ----------
         actus : array_like, shape (n_groups,) or (n_groups, B)
-            Actuation of each muscle group, in [0, 1]. A 1D array is tiled across environments.
+            Actuation of each muscle group, in [0, 1]. A 1D array is tiled across environments. Accepts a
+            `torch.Tensor` requiring grad: its gradient is populated by `scene.backward`.
         """
         if not isinstance(self.material, gs.materials.VBD.Muscle):
             gs.raise_exception("`set_actuation` is only supported by entities with `VBD.Muscle` material.")
 
-        actus = np.asarray(actus)
+        actus = to_gs_tensor(actus, dtype=gs.tc_float)
         n_groups = self.material.n_groups
+        B = self._sim._B
         if actus.ndim == 1:
             if actus.shape != (n_groups,):
-                gs.raise_exception(f"`actus` should have shape ({n_groups},), got {actus.shape}.")
-            actus = np.tile(actus[:, None], (1, self._sim._B))
-        elif actus.shape != (n_groups, self._sim._B):
-            gs.raise_exception(
-                f"`actus` should have shape ({n_groups},) or ({n_groups}, {self._sim._B}), got {actus.shape}."
-            )
+                gs.raise_exception(f"`actus` should have shape ({n_groups},), got {tuple(actus.shape)}.")
+            actus = actus[:, None].expand(n_groups, B).contiguous()
+        elif actus.shape != (n_groups, B):
+            gs.raise_exception(f"`actus` should have shape ({n_groups},) or ({n_groups}, {B}), got {tuple(actus.shape)}.")
 
-        if not ((actus >= 0.0) & (actus <= 1.0)).all():
+        if bool(((actus < 0.0) | (actus > 1.0)).any()):
             gs.raise_exception("`actus` must be in [0, 1].")
 
-        self._solver.set_actuation(actus.astype(gs.np_float))
+        self._tgt["actu"] = actus
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- naming methods -----------------------------------

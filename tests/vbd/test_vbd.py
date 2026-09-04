@@ -68,7 +68,8 @@ def test_incremental_potential_never_increases_across_sweeps(show_viewer):
     solver = scene.vbd_solver
 
     rng = np.random.default_rng(0)
-    pos, vel = bar.get_state()
+    state = bar.get_state()
+    pos, vel = state.pos, state.vel
     noise = torch.as_tensor(rng.normal(0.0, 2e-3, size=pos.shape), dtype=pos.dtype, device=pos.device)
     solver._kernel_set_state(0, (pos + noise).contiguous(), torch.zeros_like(vel))
     solver._kernel_predict(0)
@@ -167,7 +168,7 @@ def test_block_rests_on_the_floor_without_sinking_or_creeping(show_viewer):
     for _ in range(200):
         scene.step()
     pos = _positions(box)
-    _, vel = box.get_state()
+    vel = box.get_state().vel
     assert pos[:, 2].min() > -2e-3
     assert np.abs(pos.mean(axis=0)[:2] - com0[:2]).max() < 1e-4
     assert np.abs(tensor_to_array(vel)).max() < 1e-2
@@ -186,7 +187,8 @@ def test_anisotropic_friction_stops_a_sliding_block_at_the_coulomb_distance(show
         )
         for _ in range(40):  # settle on the floor first
             scene.step()
-        pos, vel = box.get_state()
+        state = box.get_state()
+        pos, vel = state.pos, state.vel
         vel[:] = torch.as_tensor(np.array(direction) * v0, dtype=vel.dtype, device=vel.device)
         scene.vbd_solver._kernel_set_state(scene.sim.cur_substep_local, pos.contiguous(), vel.contiguous())
         com0 = _positions(box).mean(axis=0)
