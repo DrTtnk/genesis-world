@@ -79,6 +79,9 @@ def test_vbd_actuation_grad_matches_finite_differences(show_viewer):
         numeric.append((loss_plus.item() - loss_minus.item()) / (2 * eps))
 
     for i in range(N_STEPS):
+        print(f"step {i}: analytic={analytic[i]:.6e} fd={numeric[i]:.6e}", flush=True)
+
+    for i in range(N_STEPS):
         assert abs(analytic[i]) > 1e-9, f"actuation gradient at step {i} is zero, so it is not reaching the input"
         assert analytic[i] == pytest.approx(numeric[i], rel=1e-5), (
             f"step {i}: analytic gradient {analytic[i]:.6e} disagrees with finite differences {numeric[i]:.6e}"
