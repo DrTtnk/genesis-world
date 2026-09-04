@@ -13,7 +13,7 @@ BAR = dict(size=(0.3, 0.04, 0.04), pos=(0.0, 0.0, 0.0), nobisect=False, maxvolum
 def _bar_scene(material, n_iterations=10, substeps=10, gravity=(0.0, 0.0, 0.0), show_viewer=False):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=5e-3, substeps=substeps, gravity=gravity),
-        vbd_options=gs.options.VBDOptions(n_iterations=n_iterations),
+        vbd_options=gs.options.VBDOptions(n_iterations=n_iterations, floor_height=-1.0),  # the bar floats free
         show_viewer=show_viewer,
     )
     bar = scene.add_entity(material=material, morph=gs.morphs.Box(**BAR))
@@ -147,3 +147,52 @@ def test_opposed_fiber_groups_bend_the_bar_both_ways(show_viewer):
     assert dev[(1.0, 0.0)] < -0.01
     assert dev[(0.0, 1.0)] > 0.01
     assert abs(dev[(1.0, 0.0)] + dev[(0.0, 1.0)]) < 0.2 * abs(dev[(1.0, 0.0)])
+
+
+def _box_on_floor(material, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=5e-3, substeps=20, gravity=(0.0, 0.0, -9.81)),
+        vbd_options=gs.options.VBDOptions(n_iterations=2),
+        show_viewer=show_viewer,
+    )
+    box = scene.add_entity(material=material, morph=gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.05), nobisect=False, maxvolume=5e-5))
+    scene.build()
+    return scene, box
+
+
+@pytest.mark.required
+def test_block_rests_on_the_floor_without_sinking_or_creeping(show_viewer):
+    scene, box = _box_on_floor(gs.materials.VBD.Muscle(E=1e6, nu=0.3), show_viewer)
+    com0 = _positions(box).mean(axis=0)
+    for _ in range(200):
+        scene.step()
+    pos = _positions(box)
+    _, vel = box.get_state()
+    assert pos[:, 2].min() > -2e-3
+    assert np.abs(pos.mean(axis=0)[:2] - com0[:2]).max() < 1e-4
+    assert np.abs(tensor_to_array(vel)).max() < 1e-2
+
+
+@pytest.mark.required
+def test_anisotropic_friction_stops_a_sliding_block_at_the_coulomb_distance(show_viewer):
+    """A block kicked at v0 on a floor with coefficient mu stops after v0^2 / (2 mu g). Forward, backward and
+    sideways see three different coefficients."""
+    mu = dict(forward=0.1, backward=0.4, lateral=0.8)
+    v0, g = 1.0, 9.81
+    for direction, key in (((1.0, 0.0, 0.0), "forward"), ((-1.0, 0.0, 0.0), "backward"), ((0.0, 1.0, 0.0), "lateral")):
+        scene, box = _box_on_floor(
+            gs.materials.VBD.Muscle(E=1e6, nu=0.3, mu_forward=mu["forward"], mu_backward=mu["backward"], mu_lateral=mu["lateral"]),
+            show_viewer,
+        )
+        for _ in range(40):  # settle on the floor first
+            scene.step()
+        pos, vel = box.get_state()
+        vel[:] = torch.as_tensor(np.array(direction) * v0, dtype=vel.dtype, device=vel.device)
+        scene.vbd_solver._kernel_set_state(pos.contiguous(), vel.contiguous())
+        com0 = _positions(box).mean(axis=0)
+        for _ in range(400):
+            scene.step()
+        travelled = float(np.dot(_positions(box).mean(axis=0) - com0, direction))
+        expected = v0**2 / (2 * mu[key] * g)
+        print(f"{key}: travelled={travelled:.4f} expected={expected:.4f}", flush=True)
+        assert travelled == pytest.approx(expected, rel=0.15)

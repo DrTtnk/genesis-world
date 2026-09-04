@@ -238,6 +238,9 @@ class VBDEntity(Entity):
             mu=self.material.mu,
             lam=self.material.lam,
             gain=gain,
+            mu_forward=self.material.mu_forward,
+            mu_backward=self.material.mu_backward,
+            mu_lateral=self.material.mu_lateral,
         )
 
         for vgeom in self._vgeoms:
@@ -282,6 +285,24 @@ class VBDEntity(Entity):
         """Positions of the entity's vertices, shape (B, n_vertices, 3)."""
         pos, _ = self.get_state()
         return pos
+
+    def set_friction_frame(self, tangent):
+        """
+        Set the forward direction of every vertex for anisotropic floor friction.
+
+        Parameters
+        ----------
+        tangent : array_like, shape (n_vertices, 3)
+            Forward direction of each vertex. Its projection on the floor plane must be non-zero; it is
+            normalized there. Sliding along it uses `material.mu_forward`, against it `mu_backward`,
+            sideways `mu_lateral`. Default is +x for every vertex.
+        """
+        tangent = np.asarray(tangent, dtype=gs.np_float)
+        if tangent.shape != (self.n_vertices, 3):
+            gs.raise_exception(f"`tangent` should have shape ({self.n_vertices}, 3), got {tangent.shape}.")
+        if np.any(np.linalg.norm(tangent[:, :2], axis=-1) < 1e-6):
+            gs.raise_exception("`tangent` must have a non-zero projection on the floor plane for every vertex.")
+        self._solver.set_friction_frame(self._v_start, tangent)
 
     def set_muscle(self, group, fiber):
         """

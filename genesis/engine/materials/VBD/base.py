@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
-from genesis.typing import PositiveFloat, ValidFloat
+from genesis.typing import NonNegativeFloat, PositiveFloat, ValidFloat
 
 from ..base import Material
 
@@ -26,11 +26,21 @@ class Base(Material["VBDEntity"]):
         Poisson ratio. Default is 0.2.
     rho : float, optional
         Material density (kg/m³). Default is 1000.
+    mu_forward : float, optional
+        Floor friction coefficient when sliding along a vertex's friction tangent (see
+        ``VBDEntity.set_friction_frame``). Default is 0.3.
+    mu_backward : float, optional
+        Floor friction coefficient when sliding against the tangent. Default is 0.3.
+    mu_lateral : float, optional
+        Floor friction coefficient when sliding sideways to the tangent. Default is 0.3.
     """
 
     E: PositiveFloat = 1e6
     nu: Annotated[ValidFloat, Field(gt=-1.0, lt=0.5)] = 0.2
     rho: PositiveFloat = 1000.0
+    mu_forward: NonNegativeFloat = 0.3
+    mu_backward: NonNegativeFloat = 0.3
+    mu_lateral: NonNegativeFloat = 0.3
 
     # Lamé parameters, computed in model_post_init, not user-specified.
     mu: ValidFloat = Field(default=0.0, exclude=True)

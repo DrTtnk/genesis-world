@@ -924,12 +924,22 @@ class VBDOptions(Options):
     accumulate_f64 : bool, optional
         Assemble each vertex's 3x3 system in float64. Float32 is faster on consumer GPUs but loses digits for
         near-incompressible materials and sliver tets. Defaults to True.
+    floor_height : float, optional
+        Height of the horizontal floor plane in meters. If none, it will inherit from `SimOptions`. Defaults to None.
+    contact_stiffness : float, optional
+        Penalty stiffness of the floor contact per vertex (N/m). Defaults to 1e4.
+    friction_eps_v : float, optional
+        Sliding speed (m/s) below which friction blends smoothly from dynamic to static (IPC transition, VBD
+        paper Eq. 15). Defaults to 1e-3.
     """
 
     dt: PositiveFloat | None = None
     gravity: Vec3FType | None = None
     n_iterations: PositiveInt = 10
     accumulate_f64: StrictBool = True
+    floor_height: float | None = None
+    contact_stiffness: PositiveFloat = 1e4
+    friction_eps_v: PositiveFloat = 1e-3
 
 
 class SFOptions(Options):

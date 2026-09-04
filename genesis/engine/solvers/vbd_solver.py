@@ -37,13 +37,22 @@ class VBDSolver(Solver):
         super().__init__(scene, sim, options)
         self._n_iterations = options.n_iterations
         self._acc = qd.f64 if options.accumulate_f64 else gs.qd_float
+        self._floor_height = options.floor_height
+        self._contact_stiffness = options.contact_stiffness
+        self._friction_eps_v = options.friction_eps_v
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
     def init_vertex_fields(self):
-        struct_vert_info = qd.types.struct(mass=gs.qd_float)
+        struct_vert_info = qd.types.struct(
+            mass=gs.qd_float,
+            tangent=gs.qd_vec3,  # friction frame: forward direction on the floor plane
+            mu_forward=gs.qd_float,
+            mu_backward=gs.qd_float,
+            mu_lateral=gs.qd_float,
+        )
         struct_vert_state = qd.types.struct(
             pos=gs.qd_vec3,
             vel=gs.qd_vec3,
@@ -171,10 +180,17 @@ class VBDSolver(Solver):
         mu: qd.f32,
         lam: qd.f32,
         gain: qd.f32,
+        mu_forward: qd.f32,
+        mu_backward: qd.f32,
+        mu_lateral: qd.f32,
     ):
         for i_v_ in range(verts.shape[0]):
             i_v = i_v_ + v_start
             self.verts_info[i_v].mass = mass
+            self.verts_info[i_v].tangent = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
+            self.verts_info[i_v].mu_forward = mu_forward
+            self.verts_info[i_v].mu_backward = mu_backward
+            self.verts_info[i_v].mu_lateral = mu_lateral
             for i_b in range(self._B):
                 for j in qd.static(range(3)):
                     self.verts[i_v, i_b].pos[j] = verts[i_v_, j]
@@ -213,6 +229,15 @@ class VBDSolver(Solver):
             self.vverts_uvs[i_vv_ + vvert_start] = uvs[i_vv_]
         for i_vf_ in range(vfaces.shape[0]):
             self.vfaces_indices[i_vf_ + vface_start] = vfaces[i_vf_] + vvert_start
+
+    def set_friction_frame(self, v_start, tangent):
+        self._kernel_set_friction_frame(v_start, tangent)
+
+    @qd.kernel
+    def _kernel_set_friction_frame(self, v_start: qd.i32, tangent: qd.types.ndarray()):
+        for i_v_ in range(tangent.shape[0]):
+            for j in qd.static(range(3)):
+                self.verts_info[i_v_ + v_start].tangent[j] = tangent[i_v_, j]
 
     def set_muscle(self, el_start, group, fiber):
         self._kernel_set_muscle(el_start, group, fiber)
@@ -296,6 +321,38 @@ class VBDSolver(Solver):
             force -= qd.cast(V * (P @ w), self._acc)
             H += qd.cast(V * mu * w.norm_sqr(), self._acc) * qd.Matrix.identity(self._acc, 3)
             H += qd.cast(V * lam, self._acc) * q.outer_product(q)
+
+        # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
+        # Coulomb friction (3.6, Hu et al. 2009 coefficients) on the substep's tangential slide, with the IPC
+        # transition f1 blending static and dynamic friction below the speed friction_eps_v.
+        d = self._floor_height - x[2]
+        if d > 0.0:
+            k = self._contact_stiffness
+            force[2] += qd.cast(k * d, self._acc)
+            H[2, 2] += qd.cast(k, self._acc)
+
+            slide = x - self.verts[i_v, i_b].ipos
+            slide[2] = 0.0
+            t = self.verts_info[i_v].tangent
+            t[2] = 0.0
+            t = t.normalized()
+            b = qd.Vector([-t[1], t[0], 0.0], dt=gs.qd_float)
+            u_t = slide.dot(t)
+            u_b = slide.dot(b)
+            u_norm = slide.norm()
+            eps = self._friction_eps_v * self._substep_dt
+            g = 1.0 / u_norm  # f1(|u|) / |u| of Eq. 15, finite at |u| = 0
+            if u_norm < eps:
+                g = 2.0 / eps - u_norm / (eps * eps)
+            mu_ax = self.verts_info[i_v].mu_forward
+            if u_t < 0.0:
+                mu_ax = self.verts_info[i_v].mu_backward
+            lam_n = k * d
+            force -= qd.cast(lam_n * g * (mu_ax * u_t * t + self.verts_info[i_v].mu_lateral * u_b * b), self._acc)
+            H += qd.cast(lam_n * g, self._acc) * (
+                qd.cast(mu_ax, self._acc) * qd.cast(t.outer_product(t), self._acc)
+                + qd.cast(self.verts_info[i_v].mu_lateral, self._acc) * qd.cast(b.outer_product(b), self._acc)
+            )
 
         dx = H.inverse() @ force
         self.verts[i_v, i_b].pos = x + qd.cast(dx, gs.qd_float)
