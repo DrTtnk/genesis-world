@@ -14,16 +14,36 @@ FIBER = np.array([0.6, 0.0, 0.8])
 W_DIR = np.array([0.8, 0.6, 0.0])  # tangent, oblique to the kick
 
 
-def _rig(show_viewer, substeps, k_fiber=0.0):
+def _constrain(box):
+    """Every hard-constraint case at once, all under load: an equality shorter than rest, a bounded distance active
+    at its lower bound, a bounded distance inside its bounds (inactive), and an angle active at its lower bound."""
+    p = tensor_to_array(box.init_positions)
+    q = p - p.mean(axis=0)
+    # six distinct corners of the box: each axis with a tie-break that lands on a different corner
+    v = [int(np.argmax(q @ d)) for d in ([1, 0.3, 0.2], [-1, -0.3, -0.2], [-0.3, 1, -0.2], [0.3, -1, 0.2], [-0.3, -0.2, 1], [0.3, 0.2, -1])]
+    assert len(set(v)) == 6, v
+    d = lambda i, j: float(np.linalg.norm(p[v[i]] - p[v[j]]))
+    box.add_distance_constraints(np.array([[v[0], v[1]]]), lo=np.array([0.98 * d(0, 1)]), hi=np.array([0.98 * d(0, 1)]))
+    # the active bound is the lower one: the rig's squash shortens every distance and keeps it pressed against it
+    box.add_distance_constraints(np.array([[v[2], v[3]], [v[4], v[5]]]), lo=np.array([1.05 * d(2, 3), 0.5 * d(4, 5)]), hi=np.array([1.5 * d(2, 3), 1.5 * d(4, 5)]))
+    u, w = p[v[0]] - p[v[1]], p[v[2]] - p[v[3]]  # two body diagonals, about 109 degrees apart
+    a0 = np.degrees(np.arccos(u.dot(w) / np.linalg.norm(u) / np.linalg.norm(w)))
+    box.add_angle_constraints(np.array([[v[0], v[1], v[2], v[3]]]), np.array([a0 + 2.0]), np.array([a0 + 40.0]))
+
+
+def _rig(show_viewer, substeps, k_fiber=0.0, constrained=False):
+    # damping: the constrained rig must settle against its bounds instead of ringing off them
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=3e-3, substeps=substeps, gravity=(0.0, 0.0, -9.81), requires_grad=True),
-        vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-9, max_sweeps=4000, contact_stiffness=2e3),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-9, max_sweeps=4000, contact_stiffness=2e3, damping=0.01 if constrained else 0.0),
         show_viewer=show_viewer,
     )
     box = scene.add_entity(
         material=gs.materials.VBD.Muscle(E=2e4, nu=0.3, gain=0.4, mu_forward=0.2, mu_backward=0.6, mu_lateral=0.9),
         morph=gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.048), nobisect=False, maxvolume=3e-4),
     )
+    if constrained:
+        _constrain(box)
     scene.build()
     box.set_muscle(np.zeros(box.n_elements, dtype=np.int32), np.tile(FIBER / np.linalg.norm(FIBER), (box.n_elements, 1)))
     box.set_friction_frame(np.tile(W_DIR, (box.n_vertices, 1)))
@@ -44,13 +64,18 @@ def _kick(scene, box, f):
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["64"])
 @pytest.mark.parametrize("k_fiber", [0.0, 3e5])
-def test_jacobian_matches_finite_differences_of_the_residual(show_viewer, k_fiber):
-    scene, box = _rig(show_viewer, substeps=1, k_fiber=k_fiber)
+@pytest.mark.parametrize("constrained", [False, True])
+def test_jacobian_matches_finite_differences_of_the_residual(show_viewer, k_fiber, constrained):
+    scene, box = _rig(show_viewer, substeps=1, k_fiber=k_fiber, constrained=constrained)
     solver = scene.vbd_solver
     scene.step()  # settle into contact
     _kick(scene, box, 0)
     solver._kernel_predict(0)
     solver._kernel_sweeps(0)  # a generic, unconverged iterate: J is the Jacobian of r at any x
+    if constrained:
+        mult = solver.cons_hist.mult.to_numpy()[1, :, 0]
+        assert mult[0] != 0.0 and mult[1] != 0.0 and mult[2] == 0.0, f"active set is not as designed: {mult}"
+        assert solver.acons_hist.mult.to_numpy()[1, 0, 0] != 0.0
 
     n = solver.n_vertices
     pos = torch.zeros((1, n, 3), dtype=torch.float64, device=gs.device)
@@ -91,11 +116,13 @@ def test_jacobian_matches_finite_differences_of_the_residual(show_viewer, k_fibe
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["64"])
 @pytest.mark.parametrize("k_fiber", [0.0, 3e5])
-def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_viewer, k_fiber):
+@pytest.mark.parametrize("constrained", [False, True])
+def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_viewer, k_fiber, constrained):
     substeps = 3
-    scene, box = _rig(show_viewer, substeps=substeps, k_fiber=k_fiber)
+    scene, box = _rig(show_viewer, substeps=substeps, k_fiber=k_fiber, constrained=constrained)
     solver = scene.vbd_solver
-    scene.step()  # settle into contact; frame 0 is now the start state of the next step
+    for _ in range(20 if constrained else 1):
+        scene.step()  # settle into contact (and against the bounds); frame 0 is now the start state of the next step
     _kick(scene, box, 0)
     n = solver.n_vertices
     rng = np.random.default_rng(3)
@@ -118,6 +145,11 @@ def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_vie
         return float((w * x).sum() + 0.5 * (v * v).sum()), x, v
 
     L0, x_end, v_end = rollout(x0, v0, 0.5)
+    if constrained:
+        assert solver.constraint_error() < 1e-9 and solver.angle_constraint_error() < 1e-9
+        mult = solver.cons_hist.mult.to_numpy()[1:, :, 0]  # the squash presses the bounded pair into its bound in substep 0
+        assert (mult[:, 0] != 0.0).all() and mult[0, 1] != 0.0 and (mult[:, 2] == 0.0).all(), f"active set is not as designed: {mult}"
+        assert solver.acons_hist.mult.to_numpy()[1, 0, 0] != 0.0
 
     solver.reset_grad()
     solver.adj.pos.from_numpy(np.zeros((substeps + 1, n, 1, 3)))

@@ -122,6 +122,16 @@ class VBDSolver(Solver):
         na = max(self._n_angle_constraints, 1)
         self.acons_info = struct_acons_info.field(shape=(na,), layout=qd.Layout.SOA)
         self.acons = struct_acons_state.field(shape=(na, self._B), layout=qd.Layout.SOA)
+        # Per-substep record of each constraint's total multiplier and stiffness at the end of the solve (frame f+1):
+        # the adjoint differentiates the KKT system of substep f and needs the active set and multipliers of that
+        # substep, not the live ones. zeta is the dual adjoint (one per constraint), solved with the same augmented
+        # Lagrangian machinery as the forward.
+        struct_cons_hist = qd.types.struct(mult=qd.f64, k=qd.f64)
+        frames = self._sim.substeps_local + 1
+        self.cons_hist = struct_cons_hist.field(shape=(frames, n, self._B), layout=qd.Layout.SOA)
+        self.acons_hist = struct_cons_hist.field(shape=(frames, na, self._B), layout=qd.Layout.SOA)
+        self.cons_zeta = qd.field(dtype=qd.f64, shape=(n, self._B))
+        self.acons_zeta = qd.field(dtype=qd.f64, shape=(na, self._B))
 
     def init_vvert_fields(self):
         # Same render contract as FEMSolver: several vverts may stand for one simulated vertex.
@@ -512,16 +522,19 @@ class VBDSolver(Solver):
 
     @qd.func
     def _func_vertex_system(self, f, i_v, i_b):
-        """Negative gradient `force` and Hessian `H` of the incremental potential of substep `f` with respect to
-        vertex `i_v`, evaluated at the current iterate `verts[f+1].pos` with every other vertex fixed."""
+        """Negative gradient `force`, Hessian `H` of the incremental potential of substep `f` with respect to vertex
+        `i_v`, evaluated at the current iterate `verts[f+1].pos` with every other vertex fixed, and `K0`, the vertex's
+        diagonal block of the rest Hessian that the Rayleigh damping uses."""
         inv_h2 = 1.0 / (self._substep_dt * self._substep_dt)
         m_h2 = qd.cast(self.verts_info[i_v].mass * inv_h2, self._acc)
         x = self.verts[f + 1, i_v, i_b].pos
         force = -m_h2 * qd.cast(x - self._func_inertia_target(f, i_v, i_b), self._acc)
-        K = qd.Matrix.zero(self._acc, 3, 3)  # elastic Hessian block, also the Rayleigh damping matrix
-        # Rayleigh damping acts on the strain rate: force -(k_d/h) sum_j K_ij (x_j - x_j^t) over the vertex itself and
-        # its neighbours, so a rigid motion is not damped. (The VBD paper's Eq. 11 keeps only the diagonal block,
-        # which drags every vertex against the floor frame and freezes a body that has to travel.)
+        K = qd.Matrix.zero(self._acc, 3, 3)  # elastic Hessian block (positive semidefinite part)
+        # Rayleigh damping C = k_d K0 with K0 the exact Hessian at rest: constant, positive semidefinite, and it
+        # annihilates rigid motions, so a coiling body is not dragged. Force -(k_d/h) sum_j K0_ij (x_j - x_j^t) over
+        # the vertex and its neighbours; K0 constant makes the damping's Jacobian exact and cheap for the adjoint.
+        # (The VBD paper's Eq. 11 keeps only the diagonal block, which drags every vertex against the floor frame.)
+        K0 = qd.Matrix.zero(self._acc, 3, 3)
         damp = qd.Vector.zero(self._acc, 3)
 
         for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
@@ -546,19 +559,18 @@ class VBDSolver(Solver):
                 force += qd.cast(f_fib, self._acc)
                 K += qd.cast(H_fib, self._acc)
             if qd.static(self._damping > 0.0):
+                B0 = self.elems_info[i_e].B_rest
+                w0 = self._func_vertex_weight(B0, role)
+                K0 += qd.cast(self._func_rest_block(i_e, w0, w0, False), self._acc)
                 for r in qd.static(range(4)):
                     if r != role:
                         j = self.elems_info[i_e].v[r]
-                        w_j = self._func_vertex_weight_static(B, r)
-                        q_j = cof @ w_j
                         d_j = self.verts[f + 1, j, i_b].pos - self.verts[f, j, i_b].pos
-                        # only the positive semidefinite part of the elastic Hessian (the (J - alpha) K_ij cross term is
-                        # indefinite under deformation and would let damping inject energy)
-                        damp += qd.cast(V * (mu * w.dot(w_j) * d_j + lam * q_j.dot(d_j) * (cof @ w)), self._acc)
+                        damp += qd.cast(self._func_rest_block(i_e, w0, self._func_vertex_weight_static(B0, r), True) @ d_j, self._acc)
 
         kd_h = qd.cast(self._damping / self._substep_dt, self._acc)
-        force -= kd_h * (K @ qd.cast(x - self.verts[f, i_v, i_b].pos, self._acc) + damp)
-        H = m_h2 * qd.Matrix.identity(self._acc, 3) + (1.0 + kd_h) * K
+        force -= kd_h * (K0 @ qd.cast(x - self.verts[f, i_v, i_b].pos, self._acc) + damp)
+        H = m_h2 * qd.Matrix.identity(self._acc, 3) + K + kd_h * K0
 
         # Hard distance constraints, augmented Lagrangian: force -(k C + lam) dC/dx, Hessian k n n^T plus the
         # diagonal-norm proxy of the constraint's curvature (|k C + lam| / |e| on the tangent plane), which keeps
@@ -664,11 +676,30 @@ class VBDSolver(Solver):
                 lam_b = k * pen * self.bolus[i_b].friction
                 force -= qd.cast(lam_b * g, self._acc) * qd.cast(slide, self._acc)
                 H += qd.cast(lam_b * g, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n_b.outer_product(n_b), self._acc)
-        return force, H
+        return force, H, K0
+
+    @qd.func
+    def _func_rest_block(self, i_e, w_i, w_j, offdiag):
+        """Block of tet i_e's exact energy Hessian at rest (F = I) between the vertices with unactuated weights w_i and
+        w_j: the stable neo-Hookean part V [mu (w_i.w_j) I + lam' w_i w_j^T + mu [w_i x w_j]_x] (the cross term at
+        J - alpha = -mu/lam', off-diagonal only) plus the fibre part k (w_i.a)(w_j.a) a a^T. Symmetric as a whole,
+        positive semidefinite, zero on rigid motions. (Weights come from the callers: the static-index weight function
+        must see a compile-time role, the runtime one a runtime role.)"""
+        V = self.elems_info[i_e].vol_rest
+        mu = self.elems_info[i_e].mu
+        lam = self.elems_info[i_e].lam
+        blk = V * (mu * w_i.dot(w_j) * qd.Matrix.identity(gs.qd_float, 3) + lam * w_i.outer_product(w_j))
+        if offdiag:
+            c = w_i.cross(w_j)
+            blk += V * mu * qd.Matrix([[0.0, -c[2], c[1]], [c[2], 0.0, -c[0]], [-c[1], c[0], 0.0]])
+        if self.elems_info[i_e].k_fiber > 0.0:
+            a = self.elems_info[i_e].fiber
+            blk += V * self.elems_info[i_e].k_fiber * w_i.dot(a) * w_j.dot(a) * a.outer_product(a)
+        return blk
 
     @qd.func
     def _func_solve_vertex(self, f, i_v, i_b):
-        force, H = self._func_vertex_system(f, i_v, i_b)
+        force, H, K_unused = self._func_vertex_system(f, i_v, i_b)
         self.verts[f + 1, i_v, i_b].pos += qd.cast(H.inverse() @ force, gs.qd_float)
 
     @qd.kernel
@@ -710,13 +741,12 @@ class VBDSolver(Solver):
         return mult, violation
 
     @qd.func
-    def _func_angle_dual_update(self, f, i_c, i_b):
+    def _func_angle_dual_update(self, f, i_c, i_b, w, ramp):
         vq = self.acons_info[i_c].v
         u = self.verts[f + 1, vq[0], i_b].pos - self.verts[f + 1, vq[1], i_b].pos
         vv = self.verts[f + 1, vq[2], i_b].pos - self.verts[f + 1, vq[3], i_b].pos
         cosv = u.dot(vv) / (u.norm() * vv.norm())
         k = self.acons[i_c, i_b].k
-        w = self._constraint_dual_relaxation
         if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
             self.acons[i_c, i_b].lam_hi = qd.max(self.acons[i_c, i_b].lam_hi + w * k * (cosv - self.acons_info[i_c].hi), 0.0)
             self.acons[i_c, i_b].lam_lo = qd.min(self.acons[i_c, i_b].lam_lo + w * k * (cosv - self.acons_info[i_c].lo), 0.0)
@@ -724,22 +754,23 @@ class VBDSolver(Solver):
             self.acons[i_c, i_b].lam_hi += w * k * (cosv - self.acons_info[i_c].hi)
         _, violation = self._func_angle_mult(i_c, i_b, cosv)
         k0 = self.acons_info[i_c].k0
-        self.acons[i_c, i_b].k = qd.min(k + k0 / self._angle_tol * qd.abs(violation), self._constraint_k_max_ratio * k0)
+        self.acons[i_c, i_b].k = qd.min(k + ramp * k0 / self._angle_tol * qd.abs(violation), self._constraint_k_max_ratio * k0)
 
     @qd.func
-    def _func_dual_update(self, f, i_c, i_b):
-        """Giles et al. 2025 Eq. 11 to 13: clamped lam += k C per side, k += beta |C| with beta = k_start / constraint_tol."""
+    def _func_dual_update(self, f, i_c, i_b, w, ramp):
+        """Giles et al. 2025 Eq. 11 to 13: clamped lam += w k C per side, k += ramp beta |C| with beta = k_start /
+        constraint_tol. The per-sweep forward uses w = constraint_dual_relaxation and ramp = 1; the exact Uzawa
+        iteration under requires_grad uses w = 1 and ramp = 0 (a stiff k only slows the primal Gauss-Seidel)."""
         e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
         dist = e.norm()
         k = self.cons[i_c, i_b].k
-        w = self._constraint_dual_relaxation
         if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
             self.cons[i_c, i_b].lam_hi = qd.max(self.cons[i_c, i_b].lam_hi + w * k * (dist - self.cons_info[i_c].hi), 0.0)
             self.cons[i_c, i_b].lam_lo = qd.min(self.cons[i_c, i_b].lam_lo + w * k * (dist - self.cons_info[i_c].lo), 0.0)
         else:
             self.cons[i_c, i_b].lam_hi += w * k * (dist - self.cons_info[i_c].hi)
         _, violation = self._func_constraint_mult(i_c, i_b, dist)
-        self.cons[i_c, i_b].k = qd.min(k + self._k_start / self._constraint_tol * qd.abs(violation), self._constraint_k_max_ratio * self._k_start)
+        self.cons[i_c, i_b].k = qd.min(k + ramp * self._k_start / self._constraint_tol * qd.abs(violation), self._constraint_k_max_ratio * self._k_start)
 
     @qd.kernel
     def _kernel_sweeps(self, f: qd.i32):
@@ -752,10 +783,55 @@ class VBDSolver(Solver):
                     self._func_solve_vertex(f, self.color_perm[k], i_b)
             if qd.static(self._n_constraints > 0):
                 for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-                    self._func_dual_update(f, i_c, i_b)
+                    self._func_dual_update(f, i_c, i_b, self._constraint_dual_relaxation, 1.0)
             if qd.static(self._n_angle_constraints > 0):
                 for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
-                    self._func_angle_dual_update(f, i_c, i_b)
+                    self._func_angle_dual_update(f, i_c, i_b, self._constraint_dual_relaxation, 1.0)
+        if qd.static(self._n_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+                self._func_record_constraint(f, i_c, i_b)
+        if qd.static(self._n_angle_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+                self._func_record_angle(f, i_c, i_b)
+
+    @qd.func
+    def _func_record_constraint(self, f, i_c, i_b):
+        e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+        mult, _ = self._func_constraint_mult(i_c, i_b, e.norm())
+        self.cons_hist[f + 1, i_c, i_b].mult = mult
+        self.cons_hist[f + 1, i_c, i_b].k = self.cons[i_c, i_b].k
+
+    @qd.func
+    def _func_record_angle(self, f, i_c, i_b):
+        vq = self.acons_info[i_c].v
+        u = self.verts[f + 1, vq[0], i_b].pos - self.verts[f + 1, vq[1], i_b].pos
+        vv = self.verts[f + 1, vq[2], i_b].pos - self.verts[f + 1, vq[3], i_b].pos
+        mult, _ = self._func_angle_mult(i_c, i_b, u.dot(vv) / (u.norm() * vv.norm()))
+        self.acons_hist[f + 1, i_c, i_b].mult = mult
+        self.acons_hist[f + 1, i_c, i_b].k = self.acons[i_c, i_b].k
+
+    @qd.kernel
+    def _kernel_primal_sweeps(self, f: qd.i32):
+        """`n_iterations` sweeps with the multipliers held fixed, then the constraint record: the inner solve of the
+        exact Uzawa iteration used under requires_grad."""
+        for _ in qd.static(range(self._n_iterations)):
+            for c in qd.static(range(self._n_colors)):
+                for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
+                    self._func_solve_vertex(f, self.color_perm[k], i_b)
+        if qd.static(self._n_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+                self._func_record_constraint(f, i_c, i_b)
+        if qd.static(self._n_angle_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+                self._func_record_angle(f, i_c, i_b)
+
+    @qd.kernel
+    def _kernel_dual_update(self, f: qd.i32):
+        """One exact Uzawa step: full multiplier update, stiffness held (k_start, or the warm-started value)."""
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            self._func_dual_update(f, i_c, i_b, 1.0, 0.0)
+        for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+            self._func_angle_dual_update(f, i_c, i_b, 1.0, 0.0)
 
     @qd.kernel
     def _kernel_warm_start(self):
@@ -807,33 +883,58 @@ class VBDSolver(Solver):
         """Largest force component left on any vertex of any env: the stationarity residual of substep `f`."""
         self.residual[None] = 0.0
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            force, _ = self._func_vertex_system(f, i_v, i_b)
+            force, H_unused, K_unused = self._func_vertex_system(f, i_v, i_b)
             qd.atomic_max(self.residual[None], qd.cast(qd.abs(force).max(), qd.f64))
 
     @qd.kernel
     def _kernel_residual_vector(self, f: qd.i32, out: qd.types.ndarray()):
         """r_i = -force_i of substep `f` at the current iterate, shape (B, n_vertices, 3). Test hook."""
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            force, _ = self._func_vertex_system(f, i_v, i_b)
+            force, H_unused, K_unused = self._func_vertex_system(f, i_v, i_b)
             for j in qd.static(range(3)):
                 out[i_b, i_v, j] = -force[j]
 
-    def solve(self, f):
-        """Fixed sweeps normally; under requires_grad, sweep until the residual is below tolerance, since the
-        adjoint differentiates the converged stationarity condition and inherits any leftover residual as bias."""
-        self._kernel_sweeps(f)
-        if self._sim.requires_grad:
-            for _ in range(self._max_sweeps // self._n_iterations):
-                self._kernel_residual(f)
-                if self.residual[None] < self._residual_tol:
-                    return
-                self._kernel_sweeps(f)
+    def _violation(self, f):
+        """Largest constraint violation (m for distances, cosine for angles) at the current iterate of substep f."""
+        worst = 0.0
+        if self._n_constraints > 0:
+            self._kernel_constraint_error(f)
+            worst = float(self.cons_error[None])
+        if self._n_angle_constraints > 0:
+            self._kernel_angle_error(f)
+            worst = max(worst, float(self.cons_error[None]))
+        return worst
+
+    def _solve_primal(self, f):
+        """Sweeps with fixed multipliers until the stationarity residual is below tolerance."""
+        for _ in range(self._max_sweeps // self._n_iterations):
             self._kernel_residual(f)
-            if self.residual[None] >= self._residual_tol:
-                gs.raise_exception(
-                    f"VBD substep did not converge: residual {self.residual[None]:.3e} >= {self._residual_tol:.1e} "
-                    f"after {self._max_sweeps} sweeps."
-                )
+            if self.residual[None] < self._residual_tol:
+                return
+            self._kernel_primal_sweeps(f)
+        self._kernel_residual(f)
+        gs.raise_exception(
+            f"VBD substep did not converge: residual {self.residual[None]:.3e} >= {self._residual_tol:.1e} "
+            f"after {self._max_sweeps} sweeps."
+        )
+
+    def solve(self, f):
+        """Fixed sweeps with a dual update per sweep normally. Under requires_grad the adjoint differentiates the
+        converged KKT system and inherits any leftover as bias, so the step is an exact Uzawa iteration: primal
+        sweeps to tolerance, one dual update, until the constraint violation is below tolerance too. (A dual update
+        on an unconverged iterate overshoots at the stiffness cap and limit-cycles instead of converging.)"""
+        if not self._sim.requires_grad:
+            self._kernel_sweeps(f)
+            return
+        for _ in range(self._max_sweeps):
+            self._solve_primal(f)
+            if self._violation(f) < self._residual_tol:
+                return
+            self._kernel_dual_update(f)
+        gs.raise_exception(
+            f"VBD substep did not converge: constraint violation {self._violation(f):.3e} >= {self._residual_tol:.1e} "
+            f"after {self._max_sweeps} dual updates."
+        )
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- adjoint --------------------------------------
@@ -887,16 +988,118 @@ class VBDSolver(Solver):
         return lam_n, A_f, coupling
 
     @qd.func
+    def _func_distance_block(self, f, i_c, i_b, s, t):
+        """Exact d r_s / d x_t of distance constraint i_c at frame f+1 between its slots s and t (f64), from the
+        recorded multiplier and stiffness: sigma_s sigma_t (k n n^T + mult / |e| (I - n n^T)), k only when active."""
+        e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+        dist = qd.cast(e.norm(), qd.f64)
+        n = qd.cast(e, qd.f64) / dist
+        nn = n.outer_product(n)
+        m = self.cons_hist[f + 1, i_c, i_b].mult
+        blk = (m / dist) * (qd.Matrix.identity(qd.f64, 3) - nn)
+        if m != 0.0:
+            blk += self.cons_hist[f + 1, i_c, i_b].k * nn
+        sign = 1.0
+        if s != t:
+            sign = -1.0
+        return sign * blk
+
+    @qd.func
+    def _func_angle_geometry(self, f, i_c, i_b):
+        """(u_hat, v_hat, |u|, |v|, cos) of angle constraint i_c at frame f+1, in f64."""
+        vq = self.acons_info[i_c].v
+        u = qd.cast(self.verts[f + 1, vq[0], i_b].pos - self.verts[f + 1, vq[1], i_b].pos, qd.f64)
+        vv = qd.cast(self.verts[f + 1, vq[2], i_b].pos - self.verts[f + 1, vq[3], i_b].pos, qd.f64)
+        lu = u.norm()
+        lv = vv.norm()
+        u_hat = u / lu
+        v_hat = vv / lv
+        return u_hat, v_hat, lu, lv, u_hat.dot(v_hat)
+
+    @qd.func
+    def _func_angle_slot_grad(self, slot, u_hat, v_hat, lu, lv, cosv):
+        """Signed gradient of the cosine with respect to the vertex in `slot` (0: +u, 1: -u, 2: +v, 3: -v)."""
+        g = (v_hat - cosv * u_hat) / lu
+        if slot >= 2:
+            g = (u_hat - cosv * v_hat) / lv
+        if slot == 1 or slot == 3:
+            g = -g
+        return g
+
+    @qd.func
+    def _func_angle_block(self, f, i_c, i_b, s, t):
+        """Exact d r_s / d x_t of angle constraint i_c at frame f+1: k G_s G_t^T (active only) + mult d^2 cos / dx_s dx_t.
+        The cosine's Hessian blocks: d g_u/du = -[u n_u^T + n_u u^T + cos (I - u u^T)] / |u|^2 with n_u = v - cos u,
+        d g_u/dv = [(I - v v^T) - u n_v^T] / (|u||v|), and the mirror images; slot signs multiply."""
+        u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+        I3 = qd.Matrix.identity(qd.f64, 3)
+        nu = v_hat - cosv * u_hat
+        nv = u_hat - cosv * v_hat
+        H = qd.Matrix.zero(qd.f64, 3, 3)
+        if s < 2 and t < 2:
+            H = -(u_hat.outer_product(nu) + nu.outer_product(u_hat) + cosv * (I3 - u_hat.outer_product(u_hat))) / (lu * lu)
+        elif s >= 2 and t >= 2:
+            H = -(v_hat.outer_product(nv) + nv.outer_product(v_hat) + cosv * (I3 - v_hat.outer_product(v_hat))) / (lv * lv)
+        elif s < 2:
+            H = ((I3 - v_hat.outer_product(v_hat)) - u_hat.outer_product(nv)) / (lu * lv)
+        else:
+            H = ((I3 - u_hat.outer_product(u_hat)) - v_hat.outer_product(nu)) / (lu * lv)
+        sign = 1.0
+        if (s % 2) != (t % 2):
+            sign = -1.0
+        m = self.acons_hist[f + 1, i_c, i_b].mult
+        blk = (sign * m) * H
+        if m != 0.0:
+            g_s = self._func_angle_slot_grad(s, u_hat, v_hat, lu, lv, cosv)
+            g_t = self._func_angle_slot_grad(t, u_hat, v_hat, lu, lv, cosv)
+            blk += self.acons_hist[f + 1, i_c, i_b].k * g_s.outer_product(g_t)
+        return blk
+
+    @qd.func
     def _func_diag_block(self, f, i_v, i_b):
-        """Exact J_ii = dr_i/dx_i: the forward Hessian with the friction block replaced by its exact derivative."""
-        _, H = self._func_vertex_system(f, i_v, i_b)
-        kd_h = 1.0 + self._damping / self._substep_dt
+        """Exact J_ii = dr_i/dx_i: the forward Hessian with the friction block replaced by its exact derivative and
+        the constraints' positive semidefinite proxies replaced by their exact curvature at the recorded multipliers."""
+        force_unused, H, K_unused = self._func_vertex_system(f, i_v, i_b)
         for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
             i_e = self.ve_elem[c]
             if self.elems_info[i_e].k_fiber > 0.0:
                 w0 = self._func_vertex_weight(self.elems_info[i_e].B_rest, self.ve_role[c])
                 _, H_exact, H_psd = self._func_fiber_terms(f + 1, i_e, i_b, w0)
-                H += qd.cast(kd_h, qd.f64) * qd.cast(H_exact - H_psd, qd.f64)  # the forward kept only the PSD part
+                H += qd.cast(H_exact - H_psd, qd.f64)  # the forward kept only the PSD part
+        for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
+            i_c = self.vc_cons[c]
+            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            dist = e.norm()
+            n = qd.cast(e / dist, qd.f64)
+            nn = n.outer_product(n)
+            mult, _ = self._func_constraint_mult(i_c, i_b, dist)
+            if mult != 0.0:
+                H -= qd.cast(self.cons[i_c, i_b].k, qd.f64) * nn
+            H -= qd.cast(qd.abs(mult) / dist, qd.f64) * (qd.Matrix.identity(qd.f64, 3) - nn)
+            s = 0
+            if self.vc_side[c] < 0.0:
+                s = 1
+            for t in qd.static(range(2)):
+                if self.cons_info[i_c].v[t] == i_v:
+                    H += self._func_distance_block(f, i_c, i_b, s, t)
+        for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
+            i_c = self.va_cons[c]
+            slot = self.va_slot[c]
+            u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+            mult, _ = self._func_angle_mult(i_c, i_b, qd.cast(cosv, gs.qd_float))
+            g = self._func_angle_slot_grad(slot, u_hat, v_hat, lu, lv, cosv)
+            if mult != 0.0:
+                H -= qd.cast(self.acons[i_c, i_b].k, qd.f64) * g.outer_product(g)
+            own = u_hat
+            scale = lu
+            if slot >= 2:
+                own = v_hat
+                scale = lv
+            H -= (qd.abs(qd.cast(mult, qd.f64)) / (scale * scale)) * (qd.Matrix.identity(qd.f64, 3) - own.outer_product(own))
+            vq = self.acons_info[i_c].v
+            for t in qd.static(range(4)):
+                if vq[t] == i_v:
+                    H += self._func_angle_block(f, i_c, i_b, slot, t)
         lam_n, A_f, coupling = self._func_friction_terms(f, i_v, i_b)
         if lam_n > 0.0:
             # remove the forward's symmetric friction approximation (lam_n g P) and add the exact terms
@@ -925,9 +1128,42 @@ class VBDSolver(Solver):
     def _func_offdiag_apply(self, f, i_v, i_b, vec):
         """sum over neighbours j of J_ij vec_j for the full stationarity Jacobian: elastic
         J_ij = V [mu (w_i.w_j) I + lam' q_i q_j^T + lam' (J-alpha) K_ij], K_ij = -[F (w_i x w_j)]_x (skew), plus
-        (k_d/h) times its positive semidefinite part from Rayleigh damping."""
+        (k_d/h) K0_ij from Rayleigh damping and the hard constraints' coupling."""
         sym, cross = self._func_offdiag_parts(f, i_v, i_b, vec)
-        return (1.0 + self._damping / self._substep_dt) * sym + cross
+        out = sym + cross
+        if qd.static(self._damping > 0.0):
+            out += (self._damping / self._substep_dt) * self._func_offdiag_rest(i_v, i_b, vec)
+        for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
+            i_c = self.vc_cons[c]
+            s = 0
+            if self.vc_side[c] < 0.0:
+                s = 1
+            for t in qd.static(range(2)):
+                j = self.cons_info[i_c].v[t]
+                if j != i_v:
+                    out += self._func_distance_block(f, i_c, i_b, s, t) @ vec[j, i_b]
+        for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
+            i_c = self.va_cons[c]
+            slot = self.va_slot[c]
+            vq = self.acons_info[i_c].v
+            for t in qd.static(range(4)):
+                if vq[t] != i_v:
+                    out += self._func_angle_block(f, i_c, i_b, slot, t) @ vec[vq[t], i_b]
+        return out
+
+    @qd.func
+    def _func_offdiag_rest(self, i_v, i_b, vec):
+        """sum over neighbours j of K0_ij vec_j with K0 the rest Hessian: the damping's off-diagonal action."""
+        out = qd.Vector.zero(qd.f64, 3)
+        for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
+            i_e = self.ve_elem[c]
+            role = self.ve_role[c]
+            B0 = self.elems_info[i_e].B_rest
+            w0 = self._func_vertex_weight(B0, role)
+            for r in qd.static(range(4)):
+                if r != role:
+                    out += qd.cast(self._func_rest_block(i_e, w0, self._func_vertex_weight_static(B0, r), True), qd.f64) @ vec[self.elems_info[i_e].v[r], i_b]
+        return out
 
     @qd.func
     def _func_offdiag_parts(self, f, i_v, i_b, vec):
@@ -984,30 +1220,83 @@ class VBDSolver(Solver):
             for j in qd.static(range(3)):
                 out[i_b, i_v, j] = r[j]
 
+    # With active hard constraints the substep is the KKT point r(x) + G^T mu = 0, C(x) = 0 (G = dC/dx, mu the
+    # recorded multipliers). The adjoint is the saddle system J^T z + G^T zeta = gbar, G z = 0, solved like the
+    # forward: the k G^T G part of J is the augmentation, zeta += w k (G z) after every sweep drives G z to zero.
+    @qd.func
+    def _func_constraint_dot_z(self, f, i_c, i_b):
+        va = self.cons_info[i_c].v[0]
+        vb = self.cons_info[i_c].v[1]
+        e = self.verts[f + 1, va, i_b].pos - self.verts[f + 1, vb, i_b].pos
+        n = qd.cast(e / e.norm(), qd.f64)
+        return n.dot(self.z[va, i_b] - self.z[vb, i_b])
+
+    @qd.func
+    def _func_angle_dot_z(self, f, i_c, i_b):
+        u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+        vq = self.acons_info[i_c].v
+        out = 0.0
+        for slot in qd.static(range(4)):
+            out += self._func_angle_slot_grad(slot, u_hat, v_hat, lu, lv, cosv).dot(self.z[vq[slot], i_b])
+        return out
+
+    @qd.func
+    def _func_zeta_force(self, f, i_v, i_b):
+        """sum over the active constraints of vertex i_v of zeta_c G_c,i: the dual adjoint's term of the saddle system."""
+        out = qd.Vector.zero(qd.f64, 3)
+        for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
+            i_c = self.vc_cons[c]
+            if self.cons_hist[f + 1, i_c, i_b].mult != 0.0:
+                e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+                out += (self.cons_zeta[i_c, i_b] * qd.cast(self.vc_side[c], qd.f64)) * qd.cast(e / e.norm(), qd.f64)
+        for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
+            i_c = self.va_cons[c]
+            if self.acons_hist[f + 1, i_c, i_b].mult != 0.0:
+                u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+                out += self.acons_zeta[i_c, i_b] * self._func_angle_slot_grad(self.va_slot[c], u_hat, v_hat, lu, lv, cosv)
+        return out
+
     @qd.kernel
     def _kernel_adjoint_rhs(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             self.gbar[i_v, i_b] = self.adj[f + 1, i_v, i_b].pos + self.adj[f + 1, i_v, i_b].vel / self._substep_dt
             self.z[i_v, i_b] = qd.Vector.zero(qd.f64, 3)
+        self.cons_zeta.fill(0.0)
+        self.acons_zeta.fill(0.0)
 
     @qd.kernel
     def _kernel_adjoint_sweeps(self, f: qd.i32):
-        """Colored Gauss-Seidel on J^T z = gbar: z_i = (J_ii^T)^-1 (gbar_i - sum_j J_ij z_j)."""
+        """Colored Gauss-Seidel on J^T z + G^T zeta = gbar: z_i = (J_ii^T)^-1 (gbar_i - sum_j J_ij z_j - (G^T zeta)_i),
+        then the dual update zeta += w k (G z) per active constraint."""
         for _ in qd.static(range(self._n_iterations)):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
                     i_v = self.color_perm[k]
-                    rhs = self.gbar[i_v, i_b] - self._func_offdiag_apply(f, i_v, i_b, self.z)
+                    rhs = self.gbar[i_v, i_b] - self._func_offdiag_apply(f, i_v, i_b, self.z) - self._func_zeta_force(f, i_v, i_b)
                     self.z[i_v, i_b] = self._func_diag_block(f, i_v, i_b).transpose().inverse() @ rhs
+            if qd.static(self._n_constraints > 0):
+                for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+                    if self.cons_hist[f + 1, i_c, i_b].mult != 0.0:
+                        self.cons_zeta[i_c, i_b] += self._constraint_dual_relaxation * self.cons_hist[f + 1, i_c, i_b].k * self._func_constraint_dot_z(f, i_c, i_b)
+            if qd.static(self._n_angle_constraints > 0):
+                for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+                    if self.acons_hist[f + 1, i_c, i_b].mult != 0.0:
+                        self.acons_zeta[i_c, i_b] += self._constraint_dual_relaxation * self.acons_hist[f + 1, i_c, i_b].k * self._func_angle_dot_z(f, i_c, i_b)
 
     @qd.kernel
     def _kernel_adjoint_residual(self, f: qd.i32):
         self.adj_residual[None] = 0.0
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             r = self.gbar[i_v, i_b] - self._func_diag_block(f, i_v, i_b).transpose() @ self.z[i_v, i_b]
-            r -= self._func_offdiag_apply(f, i_v, i_b, self.z)
+            r -= self._func_offdiag_apply(f, i_v, i_b, self.z) + self._func_zeta_force(f, i_v, i_b)
             qd.atomic_max(self.adj_residual[None], qd.abs(r).max())
             qd.atomic_max(self.residual[None], qd.abs(self.gbar[i_v, i_b]).max())
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            if self.cons_hist[f + 1, i_c, i_b].mult != 0.0:
+                qd.atomic_max(self.adj_residual[None], self.cons_hist[f + 1, i_c, i_b].k * qd.abs(self._func_constraint_dot_z(f, i_c, i_b)))
+        for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+            if self.acons_hist[f + 1, i_c, i_b].mult != 0.0:
+                qd.atomic_max(self.adj_residual[None], self.acons_hist[f + 1, i_c, i_b].k * qd.abs(self._func_angle_dot_z(f, i_c, i_b)))
 
     @qd.kernel
     def _kernel_adjoint_accumulate(self, f: qd.i32):
@@ -1021,13 +1310,11 @@ class VBDSolver(Solver):
             if lam_n > 0.0:
                 self.adj[f, i_v, i_b].pos += A_f.transpose() @ z  # dr/dx^t = -A_f
             if qd.static(self._damping > 0.0):
-                # dr/dx^t of the damping force -(k_d/h) sum_j K_ij (x_j - x_j^t) is +(k_d/h) K (symmetric), so the
-                # adjoint gets -(k_d/h) (K z)_i over the diagonal block and the neighbours
-                _, H = self._func_vertex_system(f, i_v, i_b)
+                # the damping residual +(k_d/h) sum_j K0_ij (x_j - x_j^t) has dr/dx^t = -(k_d/h) K0 (constant, symmetric),
+                # so dL/dx^t -= (dr/dx^t)^T z gives +(k_d/h) (K0 z)_i over the diagonal block and the neighbours
+                force_unused, H_unused, K0_ii = self._func_vertex_system(f, i_v, i_b)
                 kd_h = self._damping * inv_h
-                K_ii = (qd.cast(H, qd.f64) - qd.cast(self.verts_info[i_v].mass * inv_h * inv_h, qd.f64) * qd.Matrix.identity(qd.f64, 3)) / (1.0 + kd_h)
-                sym, _ = self._func_offdiag_parts(f, i_v, i_b, self.z)
-                self.adj[f, i_v, i_b].pos -= kd_h * (K_ii @ z + sym)
+                self.adj[f, i_v, i_b].pos += kd_h * (qd.cast(K0_ii, qd.f64) @ z + self._func_offdiag_rest(i_v, i_b, self.z))
         for i_e, i_b in qd.ndrange(self._n_elements, self._B):
             group = self.elems_info[i_e].group
             if group >= 0:
@@ -1140,11 +1427,8 @@ class VBDSolver(Solver):
 
     def substep_pre_coupling(self, f):
         if self.is_active:
-            if self._n_constraints > 0 or self._n_angle_constraints > 0:
-                if self._sim.requires_grad:
-                    gs.raise_exception("Hard constraints have no adjoint yet; disable requires_grad or the constraints.")
-                if f == 0:
-                    self._kernel_warm_start()
+            if (self._n_constraints > 0 or self._n_angle_constraints > 0) and f == 0:
+                self._kernel_warm_start()
             self._kernel_predict(f)
             self.solve(f)
             self._kernel_update_velocity(f)
@@ -1216,6 +1500,9 @@ class VBDSolver(Solver):
                 self._ckpt[ckpt_name]["vel"] = torch.zeros((self._B, self._n_vertices, 3), dtype=gs.tc_float)
 
             self._kernel_get_state(0, self._ckpt[ckpt_name]["pos"], self._ckpt[ckpt_name]["vel"])
+            # the multipliers and stiffnesses the next step starts from, so the backward re-run is the same forward
+            self._ckpt[ckpt_name]["cons"] = [fld.to_numpy() for fld in (self.cons.lam_hi, self.cons.lam_lo, self.cons.k)]
+            self._ckpt[ckpt_name]["acons"] = [fld.to_numpy() for fld in (self.acons.lam_hi, self.acons.lam_lo, self.acons.k)]
 
             for entity in self._entities:
                 entity.save_ckpt(ckpt_name)
@@ -1231,6 +1518,10 @@ class VBDSolver(Solver):
             self.reset_adj_till_frame(self._sim.substeps_local)
 
             self._kernel_set_state(0, self._ckpt[ckpt_name]["pos"], self._ckpt[ckpt_name]["vel"])
+            for fld, arr in zip((self.cons.lam_hi, self.cons.lam_lo, self.cons.k), self._ckpt[ckpt_name]["cons"]):
+                fld.from_numpy(arr)
+            for fld, arr in zip((self.acons.lam_hi, self.acons.lam_lo, self.acons.k), self._ckpt[ckpt_name]["acons"]):
+                fld.from_numpy(arr)
 
             for entity in self._entities:
                 entity.load_ckpt(ckpt_name)
