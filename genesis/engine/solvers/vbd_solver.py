@@ -82,6 +82,7 @@ class VBDSolver(Solver):
             gain=gs.qd_float,
             fiber=gs.qd_vec3,
             group=gs.qd_int,  # muscle group, -1 for passive
+            k_fiber=gs.qd_float,  # fibre reinforcement stiffness (Pa) along `fiber` on the unactuated F; 0 disables
         )
         self.elems_info = struct_elem_info.field(shape=(self._n_elements,), layout=qd.Layout.SOA)
         self.muscle_actu = qd.field(dtype=gs.qd_float, shape=(max(self._n_muscle_groups, 1), self._B))
@@ -239,6 +240,7 @@ class VBDSolver(Solver):
             self.elems_info[i_e].gain = gain
             self.elems_info[i_e].fiber = qd.Vector.zero(gs.qd_float, 3)
             self.elems_info[i_e].group = -1
+            self.elems_info[i_e].k_fiber = 0.0
 
     @qd.kernel
     def _kernel_add_vverts(
@@ -293,6 +295,14 @@ class VBDSolver(Solver):
             self.bolus[i_b].radius = radius[i_b]
             self.bolus[i_b].friction = friction
             self.bolus[i_b].half_length = half_length
+
+    def set_fiber_stiffness(self, el_start, k_fiber):
+        self._kernel_set_fiber_stiffness(el_start, k_fiber)
+
+    @qd.kernel
+    def _kernel_set_fiber_stiffness(self, el_start: qd.i32, k_fiber: qd.types.ndarray()):
+        for i_e_ in range(k_fiber.shape[0]):
+            self.elems_info[i_e_ + el_start].k_fiber = k_fiber[i_e_]
 
     def set_muscle(self, el_start, group, fiber):
         self._kernel_set_muscle(el_start, group, fiber)
@@ -366,6 +376,26 @@ class VBDSolver(Solver):
         return w
 
     @qd.func
+    def _func_fiber_terms(self, fr, i_e, i_b, w_i):
+        """Fibre reinforcement E = V k/2 (|F0 a| - 1)^2 on the unactuated F0 = Ds B_rest (a spine or tendon: it
+        resists length change along `a` whatever the muscle does). Returns (force on the vertex with row
+        weight `w_i`, exact 3x3 Hessian block, PSD part of that block). The (l - 1)/l (I - u u^T) part is
+        negative in compression, so the forward step uses the PSD part like the contact terms do."""
+        v = self.elems_info[i_e].v
+        p0 = self.verts[fr, v[0], i_b].pos
+        Ds = qd.Matrix.cols([self.verts[fr, v[1], i_b].pos - p0, self.verts[fr, v[2], i_b].pos - p0, self.verts[fr, v[3], i_b].pos - p0])
+        F0 = Ds @ self.elems_info[i_e].B_rest
+        a = self.elems_info[i_e].fiber
+        u = F0 @ a
+        l = u.norm()
+        u_hat = u / l
+        c = self.elems_info[i_e].vol_rest * self.elems_info[i_e].k_fiber * (w_i.dot(a)) ** 2
+        force = -self.elems_info[i_e].vol_rest * self.elems_info[i_e].k_fiber * (l - 1.0) * w_i.dot(a) * u_hat
+        H_psd = c * u_hat.outer_product(u_hat)
+        H_exact = H_psd + c * ((l - 1.0) / l) * (qd.Matrix.identity(gs.qd_float, 3) - u_hat.outer_product(u_hat))
+        return force, H_exact, H_psd
+
+    @qd.func
     def _func_inertia_target(self, f, i_v, i_b):
         """y = x^t + h (v^t + h g), the position the vertex would reach with no internal forces."""
         vel = self.verts[f, i_v, i_b].vel + self._gravity[i_b] * self._substep_dt
@@ -401,6 +431,11 @@ class VBDSolver(Solver):
             force -= qd.cast(V * (P @ w), self._acc)
             K += qd.cast(V * mu * w.norm_sqr(), self._acc) * qd.Matrix.identity(self._acc, 3)
             K += qd.cast(V * lam, self._acc) * q.outer_product(q)
+            if self.elems_info[i_e].k_fiber > 0.0:
+                w0 = self._func_vertex_weight(self.elems_info[i_e].B_rest, role)
+                f_fib, _, H_fib = self._func_fiber_terms(f + 1, i_e, i_b, w0)
+                force += qd.cast(f_fib, self._acc)
+                K += qd.cast(H_fib, self._acc)
             if qd.static(self._damping > 0.0):
                 for r in qd.static(range(4)):
                     if r != role:
@@ -593,6 +628,13 @@ class VBDSolver(Solver):
     def _func_diag_block(self, f, i_v, i_b):
         """Exact J_ii = dr_i/dx_i: the forward Hessian with the friction block replaced by its exact derivative."""
         _, H = self._func_vertex_system(f, i_v, i_b)
+        kd_h = 1.0 + self._damping / self._substep_dt
+        for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
+            i_e = self.ve_elem[c]
+            if self.elems_info[i_e].k_fiber > 0.0:
+                w0 = self._func_vertex_weight(self.elems_info[i_e].B_rest, self.ve_role[c])
+                _, H_exact, H_psd = self._func_fiber_terms(f + 1, i_e, i_b, w0)
+                H += qd.cast(kd_h, qd.f64) * qd.cast(H_exact - H_psd, qd.f64)  # the forward kept only the PSD part
         lam_n, A_f, coupling = self._func_friction_terms(f, i_v, i_b)
         if lam_n > 0.0:
             # remove the forward's symmetric friction approximation (lam_n g P) and add the exact terms
@@ -651,6 +693,22 @@ class VBDSolver(Solver):
                     Kv = -(F @ w_i.cross(w_j)).cross(vj)
                     sym += qd.cast(V * (mu * w_i.dot(w_j) * vj + lam * q_j.dot(vj) * q_i), qd.f64)
                     cross += qd.cast(V * lam * (J - alpha) * Kv, qd.f64)
+                    if self.elems_info[i_e].k_fiber > 0.0:
+                        # fibre coupling: J_ij = V k (w0_i.a)(w0_j.a) [u u^T + (l-1)/l (I - u u^T)], exact and symmetric;
+                        # the PSD part joins the damped block, the compression part the undamped one
+                        B0 = self.elems_info[i_e].B_rest
+                        a = self.elems_info[i_e].fiber
+                        wi0 = self._func_vertex_weight(B0, role)
+                        wj0 = self._func_vertex_weight_static(B0, r)
+                        v0 = self.elems_info[i_e].v
+                        p00 = self.verts[f + 1, v0[0], i_b].pos
+                        F0 = qd.Matrix.cols([self.verts[f + 1, v0[1], i_b].pos - p00, self.verts[f + 1, v0[2], i_b].pos - p00, self.verts[f + 1, v0[3], i_b].pos - p00]) @ B0
+                        u = F0 @ a
+                        l = u.norm()
+                        u_hat = u / l
+                        cf = V * self.elems_info[i_e].k_fiber * wi0.dot(a) * wj0.dot(a)
+                        sym += qd.cast(cf * u_hat.dot(vj) * u_hat, qd.f64)
+                        cross += qd.cast(cf * ((l - 1.0) / l) * (vj - u_hat.dot(vj) * u_hat), qd.f64)
         return sym, cross
 
     @qd.kernel
@@ -777,6 +835,12 @@ class VBDSolver(Solver):
             alpha = 1.0 + mu / lam
             J = F.determinant()
             psi = 0.5 * (mu * (F.norm_sqr() - 3.0) + lam * (J - alpha) ** 2)
+            if self.elems_info[i_e].k_fiber > 0.0:
+                v = self.elems_info[i_e].v
+                p0 = self.verts[f + 1, v[0], i_b].pos
+                Ds = qd.Matrix.cols([self.verts[f + 1, v[1], i_b].pos - p0, self.verts[f + 1, v[2], i_b].pos - p0, self.verts[f + 1, v[3], i_b].pos - p0])
+                l = (Ds @ self.elems_info[i_e].B_rest @ self.elems_info[i_e].fiber).norm()
+                psi += 0.5 * self.elems_info[i_e].k_fiber * (l - 1.0) ** 2
             self.energy[i_b] += qd.cast(self.elems_info[i_e].vol_rest * psi, qd.f64)
 
     def compute_energy(self, f):

@@ -403,6 +403,23 @@ class VBDEntity(Entity):
             gs.raise_exception("`tangent` must have a non-zero projection on the floor plane for every vertex.")
         self._solver.set_friction_frame(self._v_start, tangent)
 
+    def set_fiber_stiffness(self, k_fiber):
+        """
+        Reinforce each tetrahedron along its fiber direction (see `set_muscle`) with a stiffness in Pa: the energy
+        k/2 (|F a| - 1)^2 on the unactuated deformation, a spine or tendon that resists length change whatever the
+        muscles do. 0 disables it for that tetrahedron.
+
+        Parameters
+        ----------
+        k_fiber : array_like, shape (n_elements,)
+        """
+        k_fiber = np.asarray(k_fiber, dtype=gs.np_float)
+        if k_fiber.shape != (self.n_elements,):
+            gs.raise_exception(f"`k_fiber` should have shape ({self.n_elements},), got {k_fiber.shape}.")
+        if (k_fiber < 0.0).any():
+            gs.raise_exception("`k_fiber` must be non-negative.")
+        self._solver.set_fiber_stiffness(self._el_start, k_fiber)
+
     def set_muscle(self, group, fiber):
         """
         Set the muscle group and fiber direction of each tetrahedron.

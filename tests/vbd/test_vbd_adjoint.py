@@ -14,7 +14,7 @@ FIBER = np.array([0.6, 0.0, 0.8])
 W_DIR = np.array([0.8, 0.6, 0.0])  # tangent, oblique to the kick
 
 
-def _rig(show_viewer, substeps):
+def _rig(show_viewer, substeps, k_fiber=0.0):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=3e-3, substeps=substeps, gravity=(0.0, 0.0, -9.81), requires_grad=True),
         vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-9, max_sweeps=4000, contact_stiffness=2e3),
@@ -27,6 +27,7 @@ def _rig(show_viewer, substeps):
     scene.build()
     box.set_muscle(np.zeros(box.n_elements, dtype=np.int32), np.tile(FIBER / np.linalg.norm(FIBER), (box.n_elements, 1)))
     box.set_friction_frame(np.tile(W_DIR, (box.n_vertices, 1)))
+    box.set_fiber_stiffness(np.full(box.n_elements, k_fiber))
     box.set_actuation([0.5])
     return scene, box
 
@@ -42,8 +43,9 @@ def _kick(scene, box, f):
 
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["64"])
-def test_jacobian_matches_finite_differences_of_the_residual(show_viewer):
-    scene, box = _rig(show_viewer, substeps=1)
+@pytest.mark.parametrize("k_fiber", [0.0, 3e5])
+def test_jacobian_matches_finite_differences_of_the_residual(show_viewer, k_fiber):
+    scene, box = _rig(show_viewer, substeps=1, k_fiber=k_fiber)
     solver = scene.vbd_solver
     scene.step()  # settle into contact
     _kick(scene, box, 0)
@@ -88,9 +90,10 @@ def test_jacobian_matches_finite_differences_of_the_residual(show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("precision", ["64"])
-def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_viewer):
+@pytest.mark.parametrize("k_fiber", [0.0, 3e5])
+def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_viewer, k_fiber):
     substeps = 3
-    scene, box = _rig(show_viewer, substeps=substeps)
+    scene, box = _rig(show_viewer, substeps=substeps, k_fiber=k_fiber)
     solver = scene.vbd_solver
     scene.step()  # settle into contact; frame 0 is now the start state of the next step
     _kick(scene, box, 0)

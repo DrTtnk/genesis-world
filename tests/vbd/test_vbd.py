@@ -259,3 +259,26 @@ def test_sphere_bolus_inflating_inside_a_ring_stretches_it_to_the_sphere(show_vi
     assert abs(d_inner.mean() - 0.075) < 3e-3
     assert (vol1 > 0).all()
     assert abs(vol1.sum() / vol0.sum() - 1.0) < 0.1
+
+
+@pytest.mark.required
+def test_fiber_reinforcement_stops_the_actuated_bar_from_shortening(show_viewer):
+    """The same actuated bar as the contraction test, with every tet reinforced along the fiber at a stiffness far
+    above the tissue's: a spine. It must keep its length within a few percent where the plain bar shortens 30
+    percent, and stay stable."""
+    gain = 0.3
+    lengths = {}
+    for k_fiber in (0.0, 3e6):
+        scene, bar = _bar_scene(gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=1, gain=gain), n_iterations=2, substeps=40, show_viewer=show_viewer)
+        bar.set_muscle(np.zeros(bar.n_elements, dtype=np.int32), np.tile([1.0, 0.0, 0.0], (bar.n_elements, 1)))
+        bar.set_fiber_stiffness(np.full(bar.n_elements, k_fiber))
+        pos0 = _positions(bar)
+        for step in range(300):
+            bar.set_actuation([min(1.0, step / 100)])
+            scene.step()
+        pos1 = _positions(bar)
+        assert np.isfinite(pos1).all()
+        lengths[k_fiber] = _extent(pos1, 0) / _extent(pos0, 0)
+        print(f"k_fiber={k_fiber:.0e}: length ratio {lengths[k_fiber]:.3f}", flush=True)
+    assert lengths[0.0] < 0.75
+    assert lengths[3e6] > 0.97
