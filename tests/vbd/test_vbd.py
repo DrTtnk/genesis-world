@@ -352,3 +352,37 @@ def test_bounded_distance_constraints_stop_at_the_bound_and_are_slack_inside(sho
     assert (seg >= 0.9 * rest - 5e-4).all()
     assert np.median(seg / rest) < 0.93
     assert _extent(p1, 0) / _extent(p0, 0) < 0.95
+
+
+@pytest.mark.required
+def test_angle_constraint_caps_the_bend_of_the_actuated_bar(show_viewer):
+    """Two muscle groups (top and bottom halves) bend the bar; an angle constraint between the end quarter and the
+    middle quarter of its top edge bounded to 10 degrees must hold the measured angle near 10 where the free bar
+    bends past 25."""
+    angles = {}
+    for constrained in (False, True):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=5e-3, substeps=40, gravity=(0.0, 0.0, 0.0)),
+            vbd_options=gs.options.VBDOptions(n_iterations=2, floor_height=-1.0, constraint_tol=1e-4),
+            show_viewer=show_viewer,
+        )
+        bar = scene.add_entity(material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=2, gain=0.6), morph=gs.morphs.Box(**BAR))
+        pos0 = tensor_to_array(bar.init_positions)
+        top = np.where((pos0[:, 1] > 0.019) & (pos0[:, 2] > 0.019))[0]
+        chain = top[np.argsort(pos0[top, 0])]
+        a, b, c, d = chain[-1], chain[3 * len(chain) // 4], chain[len(chain) // 2 + 1], chain[len(chain) // 2 - 1]
+        if constrained:
+            bar.add_angle_constraints([[a, b, c, d]], 0.0, 10.0)
+        scene.build()
+        cen = pos0[bar.elems].mean(axis=1)
+        bar.set_muscle((cen[:, 2] > 0).astype(np.int32), np.tile([1.0, 0.0, 0.0], (bar.n_elements, 1)))
+        for step in range(300):
+            bar.set_actuation([min(1.0, step / 100), 0.0])
+            scene.step()
+        p = _positions(bar)
+        u, v = p[a] - p[b], p[c] - p[d]
+        angles[constrained] = float(np.degrees(np.arccos(np.clip(u @ v / np.linalg.norm(u) / np.linalg.norm(v), -1, 1))))
+        print(f"constrained={constrained}: angle={angles[constrained]:.1f} deg" + (f", cosine violation={scene.vbd_solver.angle_constraint_error():.2e}" if constrained else ""), flush=True)
+        assert np.isfinite(p).all()
+    assert angles[False] > 25.0
+    assert angles[True] < 12.0

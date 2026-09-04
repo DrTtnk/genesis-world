@@ -46,6 +46,7 @@ class VBDSolver(Solver):
         self._constraint_tol = options.constraint_tol
         self._constraint_k_max_ratio = options.constraint_k_max_ratio
         self._constraint_dual_relaxation = options.constraint_dual_relaxation
+        self._angle_tol = options.constraint_tol / 0.05  # cosine tolerance: constraint_tol over a 5 cm segment, a small angle
         self._max_sweeps = options.max_sweeps
 
     # ------------------------------------------------------------------------------------
@@ -114,6 +115,13 @@ class VBDSolver(Solver):
         self.cons_info = struct_cons_info.field(shape=(n,), layout=qd.Layout.SOA)
         self.cons = struct_cons_state.field(shape=(n, self._B), layout=qd.Layout.SOA)
         self.cons_error = qd.field(dtype=qd.f64, shape=())
+        # Angle constraints: the cosine between u = x_a - x_b and v = x_c - x_d kept in [lo, hi] (cos of the angle
+        # bounds), same augmented Lagrangian with clamped multipliers. Joint limits on rigid vertebra frames.
+        struct_acons_info = qd.types.struct(v=gs.qd_ivec4, lo=gs.qd_float, hi=gs.qd_float)
+        struct_acons_state = qd.types.struct(lam_hi=gs.qd_float, lam_lo=gs.qd_float, k=gs.qd_float)
+        na = max(self._n_angle_constraints, 1)
+        self.acons_info = struct_acons_info.field(shape=(na,), layout=qd.Layout.SOA)
+        self.acons = struct_acons_state.field(shape=(na, self._B), layout=qd.Layout.SOA)
 
     def init_vvert_fields(self):
         # Same render contract as FEMSolver: several vverts may stand for one simulated vertex.
@@ -128,7 +136,7 @@ class VBDSolver(Solver):
         self.envs_offset = qd.Vector.field(3, dtype=qd.f32, shape=self._B)
         self.envs_offset.from_numpy(self._scene.envs_offset.astype(np.float32))
 
-    def _compute_vertex_coloring_and_incidence(self, elems, cons):
+    def _compute_vertex_coloring_and_incidence(self, elems, cons, acons):
         """Greedy vertex coloring of the graph of tets and constraints plus the vertex -> incident tet CSR list.
 
         Returns (perm, color_offsets, n_colors, ve_offset, ve_elem, ve_role): vertices sorted by color
@@ -141,9 +149,12 @@ class VBDSolver(Solver):
         for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
             graph.add_edges_from(zip(elems[:, a].tolist(), elems[:, b].tolist()))
         graph.add_edges_from(zip(cons[:, 0].tolist(), cons[:, 1].tolist()))
+        for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
+            graph.add_edges_from(zip(acons[:, a].tolist(), acons[:, b].tolist()))
         coloring = nx.greedy_color(graph, strategy="smallest_last")
         color = np.array([coloring[i] for i in range(self._n_vertices)], dtype=np.int64)
         assert (color[cons[:, 0]] != color[cons[:, 1]]).all(), "a constraint joins two vertices of the same color"
+        assert all((color[acons[:, a]] != color[acons[:, b]]).all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)))
         assert all((color[elems[:, a]] != color[elems[:, b]]).all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)))
         n_colors = int(color.max()) + 1
         perm = np.argsort(color, kind="stable")
@@ -182,12 +193,19 @@ class VBDSolver(Solver):
             ).astype(np.int64)
             lo = np.concatenate([entity.distance_bounds[:, 0] for entity in self._entities] + [np.zeros(0)])
             hi = np.concatenate([entity.distance_bounds[:, 1] for entity in self._entities] + [np.zeros(0)])
+            acons = np.concatenate(
+                [entity._v_start + entity.angle_constraints for entity in self._entities] + [np.zeros((0, 4), dtype=np.int64)]
+            ).astype(np.int64)
+            alo = np.concatenate([entity.angle_bounds[:, 0] for entity in self._entities] + [np.zeros(0)])
+            ahi = np.concatenate([entity.angle_bounds[:, 1] for entity in self._entities] + [np.zeros(0)])
             self._n_constraints = len(cons)
+            self._n_angle_constraints = len(acons)
             self.init_constraint_fields()
             perm, self._color_offsets, self._n_colors, ve_offset, ve_elem, ve_role = (
-                self._compute_vertex_coloring_and_incidence(elems, cons)
+                self._compute_vertex_coloring_and_incidence(elems, cons, acons)
             )
             self._init_constraints(cons, lo, hi)
+            self._init_angle_constraints(acons, alo, ahi)
             self.color_perm = qd.field(dtype=gs.qd_int, shape=(self._n_vertices,))
             self.color_perm.from_numpy(perm.astype(gs.np_int))
             self.ve_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
@@ -224,6 +242,30 @@ class VBDSolver(Solver):
         self.cons.lam_hi.fill(0.0)
         self.cons.lam_lo.fill(0.0)
         self.cons.k.fill(self._k_start)
+
+    def _init_angle_constraints(self, acons, lo, hi):
+        """Cosine bounds, per-vertex CSR (constraint, slot 0..3) and the initial stiffness k_start."""
+        inc_vert = acons.reshape(-1)
+        inc_cons = np.repeat(np.arange(len(acons)), 4)
+        inc_slot = np.tile(np.arange(4), len(acons))
+        order = np.argsort(inc_vert, kind="stable")
+        va_offset = np.searchsorted(inc_vert[order], np.arange(self._n_vertices + 1))
+        self.va_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
+        self.va_offset.from_numpy(va_offset.astype(gs.np_int))
+        self.va_cons = qd.field(dtype=gs.qd_int, shape=(max(len(inc_cons), 1),))
+        self.va_slot = qd.field(dtype=gs.qd_int, shape=(max(len(inc_cons), 1),))
+        if len(acons):
+            assert (lo <= hi).all() and (lo >= -1.0).all() and (hi <= 1.0).all(), "cosine bounds must satisfy -1 <= lo <= hi <= 1"
+            self.va_cons.from_numpy(inc_cons[order].astype(gs.np_int))
+            self.va_slot.from_numpy(inc_slot[order].astype(gs.np_int))
+            self.acons_info.v.from_numpy(acons.astype(gs.np_int))
+            self.acons_info.lo.from_numpy(lo.astype(gs.np_float))
+            self.acons_info.hi.from_numpy(hi.astype(gs.np_float))
+        # k_start for a dimensionless cosine: the distance k_start times a squared length scale (the mean rest edge)
+        self._k_start_angle = self._k_start * float(np.mean(np.linalg.norm(np.diff(self.verts.pos.to_numpy()[0, :, 0][acons[:, :2]], axis=1), axis=-1)) ** 2) if len(acons) else self._k_start
+        self.acons.lam_hi.fill(0.0)
+        self.acons.lam_lo.fill(0.0)
+        self.acons.k.fill(self._k_start_angle)
 
     def init_ckpt(self):
         self._ckpt = dict()
@@ -524,6 +566,33 @@ class VBDSolver(Solver):
                 H += qd.cast(self.cons[i_c, i_b].k, self._acc) * qd.cast(n.outer_product(n), self._acc)
             H += qd.cast(qd.abs(mult) / dist, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n), self._acc)
 
+        # Angle constraints: C = cos(u, v) bounded; gradient wrt x_a is (v_hat - C u_hat) / |u| (minus for x_b), and
+        # wrt x_c is (u_hat - C v_hat) / |v| (minus for x_d). Hessian: k g g^T plus |mult| / |edge|^2 as the PSD proxy
+        # of the cosine's curvature.
+        for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
+            i_c = self.va_cons[c]
+            slot = self.va_slot[c]
+            vq = self.acons_info[i_c].v
+            u = self.verts[f + 1, vq[0], i_b].pos - self.verts[f + 1, vq[1], i_b].pos
+            vv = self.verts[f + 1, vq[2], i_b].pos - self.verts[f + 1, vq[3], i_b].pos
+            lu = u.norm()
+            lv = vv.norm()
+            u_hat = u / lu
+            v_hat = vv / lv
+            cosv = u_hat.dot(v_hat)
+            g = (v_hat - cosv * u_hat) / lu
+            scale = lu
+            if slot >= 2:
+                g = (u_hat - cosv * v_hat) / lv
+                scale = lv
+            if slot == 1 or slot == 3:
+                g = -g
+            mult, _ = self._func_angle_mult(i_c, i_b, cosv)
+            force -= qd.cast(mult, self._acc) * qd.cast(g, self._acc)
+            if mult != 0.0:
+                H += qd.cast(self.acons[i_c, i_b].k, self._acc) * qd.cast(g.outer_product(g), self._acc)
+            H += qd.cast(qd.abs(mult) / (scale * scale), self._acc) * qd.Matrix.identity(self._acc, 3)
+
         # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
         # Coulomb friction (3.6, Hu et al. 2009 coefficients) on the substep's tangential slide, with the IPC
         # transition f1 blending static and dynamic friction below the speed friction_eps_v. The forward/backward
@@ -615,6 +684,37 @@ class VBDSolver(Solver):
         return mult, violation
 
     @qd.func
+    def _func_angle_mult(self, i_c, i_b, cosv):
+        k = self.acons[i_c, i_b].k
+        c_hi = cosv - self.acons_info[i_c].hi
+        c_lo = cosv - self.acons_info[i_c].lo
+        mult = k * c_hi + self.acons[i_c, i_b].lam_hi
+        violation = c_hi
+        if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
+            mult = qd.max(k * c_hi + self.acons[i_c, i_b].lam_hi, 0.0) + qd.min(k * c_lo + self.acons[i_c, i_b].lam_lo, 0.0)
+            violation = qd.max(c_hi, 0.0) + qd.min(c_lo, 0.0)
+        return mult, violation
+
+    @qd.func
+    def _func_angle_dual_update(self, f, i_c, i_b):
+        vq = self.acons_info[i_c].v
+        u = self.verts[f + 1, vq[0], i_b].pos - self.verts[f + 1, vq[1], i_b].pos
+        vv = self.verts[f + 1, vq[2], i_b].pos - self.verts[f + 1, vq[3], i_b].pos
+        cosv = u.dot(vv) / (u.norm() * vv.norm())
+        k = self.acons[i_c, i_b].k
+        w = self._constraint_dual_relaxation
+        if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
+            self.acons[i_c, i_b].lam_hi = qd.max(self.acons[i_c, i_b].lam_hi + w * k * (cosv - self.acons_info[i_c].hi), 0.0)
+            self.acons[i_c, i_b].lam_lo = qd.min(self.acons[i_c, i_b].lam_lo + w * k * (cosv - self.acons_info[i_c].lo), 0.0)
+        else:
+            self.acons[i_c, i_b].lam_hi += w * k * (cosv - self.acons_info[i_c].hi)
+        _, violation = self._func_angle_mult(i_c, i_b, cosv)
+        # the tolerance for a cosine: constraint_tol over the mean rest edge (a small angle in radians)
+        self.acons[i_c, i_b].k = qd.min(
+            k + self._k_start_angle / self._angle_tol * qd.abs(violation), self._constraint_k_max_ratio * self._k_start_angle
+        )
+
+    @qd.func
     def _func_dual_update(self, f, i_c, i_b):
         """Giles et al. 2025 Eq. 11 to 13: clamped lam += k C per side, k += beta |C| with beta = k_start / constraint_tol."""
         e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
@@ -641,6 +741,9 @@ class VBDSolver(Solver):
             if qd.static(self._n_constraints > 0):
                 for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
                     self._func_dual_update(f, i_c, i_b)
+            if qd.static(self._n_angle_constraints > 0):
+                for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+                    self._func_angle_dual_update(f, i_c, i_b)
 
     @qd.kernel
     def _kernel_warm_start(self):
@@ -649,6 +752,10 @@ class VBDSolver(Solver):
             self.cons[i_c, i_b].lam_hi *= 0.95 * 0.99
             self.cons[i_c, i_b].lam_lo *= 0.95 * 0.99
             self.cons[i_c, i_b].k = qd.max(self._k_start, 0.99 * self.cons[i_c, i_b].k)
+        for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+            self.acons[i_c, i_b].lam_hi *= 0.95 * 0.99
+            self.acons[i_c, i_b].lam_lo *= 0.95 * 0.99
+            self.acons[i_c, i_b].k = qd.max(self._k_start_angle, 0.99 * self.acons[i_c, i_b].k)
 
     @qd.kernel
     def _kernel_constraint_error(self, f: qd.i32):
@@ -657,6 +764,21 @@ class VBDSolver(Solver):
             e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
             _, violation = self._func_constraint_mult(i_c, i_b, e.norm())
             qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(violation), qd.f64))
+
+    @qd.kernel
+    def _kernel_angle_error(self, f: qd.i32):
+        self.cons_error[None] = 0.0
+        for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+            vq = self.acons_info[i_c].v
+            u = self.verts[f + 1, vq[0], i_b].pos - self.verts[f + 1, vq[1], i_b].pos
+            vv = self.verts[f + 1, vq[2], i_b].pos - self.verts[f + 1, vq[3], i_b].pos
+            _, violation = self._func_angle_mult(i_c, i_b, u.dot(vv) / (u.norm() * vv.norm()))
+            qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(violation), qd.f64))
+
+    def angle_constraint_error(self):
+        """Largest cosine violation of the angle constraints at the current end-of-substep positions, over all envs."""
+        self._kernel_angle_error(self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1)
+        return float(self.cons_error[None])
 
     def constraint_error(self):
         """Largest absolute distance-constraint error (m) at the current end-of-substep positions, over all envs."""
@@ -1006,7 +1128,7 @@ class VBDSolver(Solver):
 
     def substep_pre_coupling(self, f):
         if self.is_active:
-            if self._n_constraints > 0:
+            if self._n_constraints > 0 or self._n_angle_constraints > 0:
                 if self._sim.requires_grad:
                     gs.raise_exception("Hard constraints have no adjoint yet; disable requires_grad or the constraints.")
                 if f == 0:
@@ -1172,6 +1294,10 @@ class VBDSolver(Solver):
     @property
     def n_constraints(self):
         return self._n_constraints
+
+    @property
+    def n_angle_constraints(self):
+        return self._n_angle_constraints
 
     @property
     def color_offsets(self):

@@ -132,6 +132,8 @@ class VBDEntity(Entity):
         self._step_global_added = None
         self._distance_constraints = np.zeros((0, 2), dtype=gs.np_int)
         self._distance_bounds = np.zeros((0, 2), dtype=gs.np_float)
+        self._angle_constraints = np.zeros((0, 4), dtype=gs.np_int)
+        self._angle_bounds = np.zeros((0, 2), dtype=gs.np_float)
         self.sample()
 
         self.init_tgt_vars()
@@ -437,6 +439,36 @@ class VBDEntity(Entity):
     def distance_constraints(self):
         """Declared hard distance constraints, local vertex pairs, shape (n, 2)."""
         return self._distance_constraints
+
+    def add_angle_constraints(self, quads, lo_deg, hi_deg):
+        """
+        Keep the angle between the vectors (x_a - x_b) and (x_c - x_d) inside [lo_deg, hi_deg] (equal values make an
+        equality). Local vertex indices, shape (n, 4) as (a, b, c, d); bounds in degrees, scalar or per row. Must
+        be called before `scene.build()`.
+        """
+        if self._solver._scene.is_built:
+            gs.raise_exception("`add_angle_constraints` must be called before `scene.build()`.")
+        quads = np.asarray(quads, dtype=gs.np_int).reshape(-1, 4)
+        if (quads < 0).any() or (quads >= self.n_vertices).any() or (quads[:, 0] == quads[:, 1]).any() or (quads[:, 2] == quads[:, 3]).any():
+            gs.raise_exception("`quads` must index this entity's vertices with a != b and c != d.")
+        lo = np.broadcast_to(np.asarray(lo_deg, dtype=gs.np_float), (len(quads),))
+        hi = np.broadcast_to(np.asarray(hi_deg, dtype=gs.np_float), (len(quads),))
+        if (lo > hi).any() or (lo < 0.0).any() or (hi > 180.0).any():
+            gs.raise_exception("angle bounds must satisfy 0 <= lo_deg <= hi_deg <= 180.")
+        # the solver bounds the cosine: a larger angle is a smaller cosine
+        bounds = np.stack([np.cos(np.radians(hi)), np.cos(np.radians(lo))], axis=1).astype(gs.np_float)
+        self._angle_constraints = np.concatenate([self._angle_constraints, quads])
+        self._angle_bounds = np.concatenate([self._angle_bounds, bounds])
+
+    @property
+    def angle_constraints(self):
+        """Declared angle constraints, local vertex quads (a, b, c, d), shape (n, 4)."""
+        return self._angle_constraints
+
+    @property
+    def angle_bounds(self):
+        """[cos hi, cos lo] per declared angle constraint, shape (n, 2)."""
+        return self._angle_bounds
 
     @property
     def distance_bounds(self):
