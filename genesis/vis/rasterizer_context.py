@@ -165,6 +165,7 @@ class RasterizerContext:
         self.on_sph()
         self.on_pbd()
         self.on_fem()
+        self.on_vbd()
 
         # segmentation mapping
         self.seg_color_map.generate_seg_colors()
@@ -922,6 +923,49 @@ class RasterizerContext:
                         if normal_data is not None:
                             self.jit.update_buffer(node, "normal", normal_data)
 
+    def on_vbd(self):
+        if self.sim.vbd_solver.is_active:
+            vverts_pos, _, _ = self.sim.vbd_solver.get_state_render(self.sim.cur_substep_local)
+            vverts_all = qd_to_numpy(vverts_pos, self.rendered_envs_idx, transpose=True)
+
+            for vbd_entity in self.sim.vbd_solver.entities:
+                if vbd_entity.surface.vis_mode != "visual":
+                    continue
+
+                for i_g, vgeom in enumerate(vbd_entity.vgeoms):
+                    visual = mu.surface_uvs_to_trimesh_visual(vgeom.surface, uvs=vgeom.uvs, n_verts=vgeom.n_vverts)
+                    seg_key = (vbd_entity.idx, i_g) if self.segmentation_level == "geom" else vbd_entity.idx
+                    vverts = vverts_all[:, vgeom.vvert_start : vgeom.vvert_end]
+                    for env_i, i_b in enumerate(self.rendered_envs_idx):
+                        mesh = trimesh.Trimesh(vverts[env_i], vgeom.vmesh.faces, process=False)
+                        mesh.visual = visual
+                        node = pyrender.Mesh.from_trimesh(
+                            mesh, smooth=vgeom.surface.smooth, double_sided=vgeom.surface.double_sided
+                        )
+                        static_node = self.add_node(node)
+                        self.static_nodes[(i_b, vgeom.uid)] = static_node
+                        self.create_node_seg(seg_key, static_node)
+
+    def update_vbd(self):
+        if self.sim.vbd_solver.is_active:
+            vverts_pos, _, _ = self.sim.vbd_solver.get_state_render(self.sim.cur_substep_local)
+            vverts_all = qd_to_numpy(vverts_pos, self.rendered_envs_idx, transpose=True)
+
+            for vbd_entity in self.sim.vbd_solver.entities:
+                if vbd_entity.surface.vis_mode != "visual":
+                    continue
+
+                for vgeom in vbd_entity.vgeoms:
+                    vverts = vverts_all[:, vgeom.vvert_start : vgeom.vvert_end]
+                    for env_i, i_b in enumerate(self.rendered_envs_idx):
+                        node = self.static_nodes[(i_b, vgeom.uid)]
+                        render_verts = vverts[env_i].astype(np.float32, copy=False)
+                        update_data = self._scene.reorder_vertices(node, render_verts)
+                        self.jit.update_buffer(node, "pos", update_data)
+                        normal_data = self.jit.update_normal(node, update_data)
+                        if normal_data is not None:
+                            self.jit.update_buffer(node, "normal", normal_data)
+
     def update_sensors(self):
         self.sim._sensor_manager.draw_debug(self)
 
@@ -1157,6 +1201,7 @@ class RasterizerContext:
         self.update_sph()
         self.update_pbd()
         self.update_fem()
+        self.update_vbd()
         self.update_sensors()
 
         # Update camera fructum

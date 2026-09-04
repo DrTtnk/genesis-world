@@ -18,6 +18,7 @@ from genesis.options.solvers import (
     SPHOptions,
     SimOptions,
     ToolOptions,
+    VBDOptions,
 )
 from genesis.repr_base import RBC
 
@@ -31,6 +32,7 @@ from .solvers import (
     SFSolver,
     SPHSolver,
     ToolSolver,
+    VBDSolver,
 )
 from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
 from .states.cache import QueriedStates
@@ -73,6 +75,8 @@ class Simulator(RBC):
         An SFOptions object that contains all the options for the SFSolver.
     pbd_options : gs.PBDOptions
         A PBDOptions object that contains all the options for the PBDSolver.
+    vbd_options : gs.VBDOptions
+        A VBDOptions object that contains all the options for the VBDSolver.
     """
 
     def __init__(
@@ -88,6 +92,7 @@ class Simulator(RBC):
         fem_options: FEMOptions,
         sf_options: SFOptions,
         pbd_options: PBDOptions,
+        vbd_options: VBDOptions,
     ):
         self._scene = scene
 
@@ -102,6 +107,7 @@ class Simulator(RBC):
         self.fem_options = fem_options
         self.sf_options = sf_options
         self.pbd_options = pbd_options
+        self.vbd_options = vbd_options
 
         self._dt: float = options.dt
         self._substep_dt: float = options.dt / options.substeps
@@ -121,6 +127,7 @@ class Simulator(RBC):
         self.sph_solver = SPHSolver(self.scene, self, self.sph_options)
         self.pbd_solver = PBDSolver(self.scene, self, self.pbd_options)
         self.fem_solver = FEMSolver(self.scene, self, self.fem_options)
+        self.vbd_solver = VBDSolver(self.scene, self, self.vbd_options)
         self.sf_solver = SFSolver(self.scene, self, self.sf_options)
 
         self._solvers: list["Solver"] = gs.List(
@@ -132,6 +139,7 @@ class Simulator(RBC):
                 self.sph_solver,
                 self.pbd_solver,
                 self.fem_solver,
+                self.vbd_solver,
                 self.sf_solver,
             ]
         )
@@ -178,6 +186,8 @@ class Simulator(RBC):
             entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.FEM.Base):
             entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface, name=name)
+        elif isinstance(material, gs.materials.VBD.Base):
+            entity = self.vbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.Hybrid):
             # Note that adding to solver is handled in the hybrid entity
             entity = HybridEntity(self.n_entities, self.scene, material, morph, surface, name=name)
@@ -419,7 +429,7 @@ class Simulator(RBC):
         # (kinematic/rigid) push the returned state there as a within-step cache. The SimState itself is registered just
         # below for grad collection at the simulator level, so the per-solver entry would cause `collect_output_grads`
         # to dispatch `kernel_get_state_grad` twice on the same state and double the adjoint via atomic_add. Lift those
-        # entries here. Solvers without solver-state registration (mpm, fem, sph, pbd, sf, tool) leave their queue
+        # entries here. Solvers without solver-state registration (mpm, fem, vbd, sph, pbd, sf, tool) leave their queue
         # empty, so `discard` is a no-op for them.
         for solver, solver_state in zip(self._solvers, state.solvers_state):
             if solver_state is not None:

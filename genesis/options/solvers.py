@@ -909,6 +909,25 @@ class FEMOptions(Options):
     enable_vertex_constraints: StrictBool = False
 
 
+class VBDOptions(Options):
+    """
+    Options configuring the VBDSolver (Vertex Block Descent, Chen et al. 2024).
+
+    Parameters
+    ----------
+    dt : float, optional
+        Time duration for each simulation step in seconds. If none, it will inherit from `SimOptions`. Defaults to None.
+    gravity : tuple, optional
+        Gravity force in N/kg. If none, it will inherit from `SimOptions`. Defaults to None.
+    n_iterations : int, optional
+        Number of Gauss-Seidel sweeps (over all vertex colors) per substep. Defaults to 10.
+    """
+
+    dt: PositiveFloat | None = None
+    gravity: Vec3FType | None = None
+    n_iterations: PositiveInt = 10
+
+
 class SFOptions(Options):
     """
     Options configuring the SFSolver.

@@ -31,6 +31,7 @@ from genesis.options import (
     SimOptions,
     SPHOptions,
     ToolOptions,
+    VBDOptions,
     ViewerOptions,
     VisOptions,
 )
@@ -79,6 +80,8 @@ class Scene(RBC):
         The options configuring the sf_solver (``scene.sim.SFSolver``).
     pbd_options : gs.options.PBDOptions
         The options configuring the pbd_solver (``scene.sim.PBDSolver``).
+    vbd_options : gs.options.VBDOptions
+        The options configuring the vbd_solver (``scene.sim.VBDSolver``).
     vis_options : gs.options.VisOptions
         The options configuring the visualization system (``scene.visualizer``). Visualizer controls both the interactive viewer and the cameras.
     viewer_options : gs.options.ViewerOptions
@@ -103,6 +106,7 @@ class Scene(RBC):
         fem_options: FEMOptions | None = None,
         sf_options: SFOptions | None = None,
         pbd_options: PBDOptions | None = None,
+        vbd_options: VBDOptions | None = None,
         vis_options: VisOptions | None = None,
         viewer_options: ViewerOptions | None = None,
         profiling_options: ProfilingOptions | None = None,
@@ -124,6 +128,7 @@ class Scene(RBC):
         fem_options = fem_options or FEMOptions()
         sf_options = sf_options or SFOptions()
         pbd_options = pbd_options or PBDOptions()
+        vbd_options = vbd_options or VBDOptions()
         vis_options = vis_options or VisOptions()
         viewer_options = viewer_options or ViewerOptions()
         profiling_options = profiling_options or ProfilingOptions()
@@ -145,6 +150,7 @@ class Scene(RBC):
             fem_options,
             sf_options,
             pbd_options,
+            vbd_options,
             vis_options,
             viewer_options,
             profiling_options,
@@ -161,6 +167,7 @@ class Scene(RBC):
         self.fem_options = fem_options.model_copy_from(sim_options)
         self.sf_options = sf_options.model_copy_from(sim_options)
         self.pbd_options = pbd_options.model_copy_from(sim_options)
+        self.vbd_options = vbd_options.model_copy_from(sim_options)
         self.profiling_options = profiling_options
 
         self.vis_options = vis_options
@@ -180,6 +187,7 @@ class Scene(RBC):
             fem_options=self.fem_options,
             sf_options=self.sf_options,
             pbd_options=self.pbd_options,
+            vbd_options=self.vbd_options,
         )
 
         # visualizer
@@ -222,6 +230,7 @@ class Scene(RBC):
         fem_options: FEMOptions,
         sf_options: SFOptions,
         pbd_options: PBDOptions,
+        vbd_options: VBDOptions,
         vis_options: VisOptions,
         viewer_options: ViewerOptions,
         profiling_options: ProfilingOptions,
@@ -256,6 +265,9 @@ class Scene(RBC):
 
         if not isinstance(pbd_options, PBDOptions):
             gs.raise_exception("`pbd_options` should be an instance of `PBDOptions`.")
+
+        if not isinstance(vbd_options, VBDOptions):
+            gs.raise_exception("`vbd_options` should be an instance of `VBDOptions`.")
 
         if not isinstance(vis_options, VisOptions):
             gs.raise_exception("`vis_options` should be an instance of `VisOptions`.")
@@ -463,6 +475,15 @@ class Scene(RBC):
                 )
 
         elif isinstance(material, gs.materials.FEM.Base):
+            if surface.vis_mode is None:
+                surface.vis_mode = "visual"
+
+            if surface.vis_mode not in ("visual",):
+                gs.raise_exception(
+                    f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual']."
+                )
+
+        elif isinstance(material, gs.materials.VBD.Base):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 
@@ -1771,6 +1792,11 @@ class Scene(RBC):
     def pbd_solver(self):
         """The scene's `pbd_solver`, managing all the `PBDEntity` in the scene."""
         return self._sim.pbd_solver
+
+    @property
+    def vbd_solver(self):
+        """The scene's `vbd_solver`, managing all the `VBDEntity` in the scene."""
+        return self._sim.vbd_solver
 
     @property
     def segmentation_idx_dict(self):

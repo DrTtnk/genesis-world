@@ -340,6 +340,13 @@ class Raytracer:
                     for vgeom in fem_entity.vgeoms:
                         self.add_deformable(str(vgeom.uid))
 
+        # VBD entities
+        if self.sim.vbd_solver.is_active:
+            for vbd_entity in self.sim.vbd_solver.entities:
+                if vbd_entity.surface.vis_mode == "visual":
+                    for vgeom in vbd_entity.vgeoms:
+                        self.add_deformable(str(vgeom.uid))
+
     def get_transform(self, matrix):
         if matrix is None:
             return None
@@ -793,6 +800,28 @@ class Raytracer:
                     continue
 
                 for vgeom in fem_entity.vgeoms:
+                    render_verts = vverts_all[vgeom.vvert_start : vgeom.vvert_end]
+                    vertex_normals = trimesh.Trimesh(
+                        vertices=render_verts, faces=vgeom.vmesh.faces, process=False
+                    ).vertex_normals
+                    self.update_deformable(
+                        str(vgeom.uid),
+                        render_verts,
+                        vgeom.vmesh.faces,
+                        vertex_normals,
+                        np.array([]) if vgeom.uvs is None else vgeom.uvs,
+                    )
+
+        # VBD entities
+        if self.sim.vbd_solver.is_active:
+            vverts_pos, _, _ = self.sim.vbd_solver.get_state_render(self.sim.cur_substep_local)
+            vverts_all = miscu.qd_to_numpy(vverts_pos, self.rendered_envs_idx[0], keepdim=False, transpose=True)
+
+            for vbd_entity in self.sim.vbd_solver.entities:
+                if vbd_entity.surface.vis_mode != "visual":
+                    continue
+
+                for vgeom in vbd_entity.vgeoms:
                     render_verts = vverts_all[vgeom.vvert_start : vgeom.vvert_end]
                     vertex_normals = trimesh.Trimesh(
                         vertices=render_verts, faces=vgeom.vmesh.faces, process=False
