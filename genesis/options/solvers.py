@@ -921,11 +921,15 @@ class VBDOptions(Options):
         Gravity force in N/kg. If none, it will inherit from `SimOptions`. Defaults to None.
     n_iterations : int, optional
         Number of Gauss-Seidel sweeps (over all vertex colors) per substep. Defaults to 10.
+    accumulate_f64 : bool, optional
+        Assemble each vertex's 3x3 system in float64. Float32 is faster on consumer GPUs but loses digits for
+        near-incompressible materials and sliver tets. Defaults to True.
     """
 
     dt: PositiveFloat | None = None
     gravity: Vec3FType | None = None
     n_iterations: PositiveInt = 10
+    accumulate_f64: StrictBool = True
 
 
 class SFOptions(Options):

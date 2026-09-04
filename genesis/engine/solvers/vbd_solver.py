@@ -36,6 +36,7 @@ class VBDSolver(Solver):
     def __init__(self, scene, sim, options):
         super().__init__(scene, sim, options)
         self._n_iterations = options.n_iterations
+        self._acc = qd.f64 if options.accumulate_f64 else gs.qd_float
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
@@ -272,6 +273,40 @@ class VBDSolver(Solver):
             w = B[role - 1, :]
         return w
 
+    @qd.func
+    def _func_solve_vertex(self, i_v, i_b, inv_h2):
+        m_h2 = qd.cast(self.verts_info[i_v].mass * inv_h2, self._acc)
+        x = self.verts[i_v, i_b].pos
+        force = -m_h2 * qd.cast(x - self.verts[i_v, i_b].ypos, self._acc)
+        H = m_h2 * qd.Matrix.identity(self._acc, 3)
+
+        for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
+            i_e = self.ve_elem[c]
+            role = self.ve_role[c]
+            F, B = self._func_deformation(i_e, i_b)
+            mu = self.elems_info[i_e].mu
+            lam = self.elems_info[i_e].lam
+            alpha = 1.0 + mu / lam
+            cof = self._func_cofactor(F)
+            J = F.determinant()
+            P = mu * F + lam * (J - alpha) * cof
+            w = self._func_vertex_weight(B, role)
+            V = self.elems_info[i_e].vol_rest
+            q = qd.cast(cof @ w, self._acc)
+            force -= qd.cast(V * (P @ w), self._acc)
+            H += qd.cast(V * mu * w.norm_sqr(), self._acc) * qd.Matrix.identity(self._acc, 3)
+            H += qd.cast(V * lam, self._acc) * q.outer_product(q)
+
+        dx = H.inverse() @ force
+        self.verts[i_v, i_b].pos = x + qd.cast(dx, gs.qd_float)
+
+    @qd.kernel
+    def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
+        """One color of one sweep. Kept for tests that watch the energy sweep by sweep."""
+        inv_h2 = 1.0 / (self._substep_dt * self._substep_dt)
+        for k, i_b in qd.ndrange((lo, hi), self._B):
+            self._func_solve_vertex(self.color_perm[k], i_b, inv_h2)
+
     @qd.kernel
     def _kernel_predict(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
@@ -281,44 +316,26 @@ class VBDSolver(Solver):
             self.verts[i_v, i_b].pos = self.verts[i_v, i_b].ypos
 
     @qd.kernel
-    def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
+    def _kernel_substep(self, f: qd.i32):
+        """A whole substep in one launch: predict, every sweep over every color, velocity update.
+
+        Each top-level loop is a serial task with an implicit barrier after it, so the statically
+        unrolled color loops are race-free Gauss-Seidel sweeps without any Python round trip.
+        """
         inv_h2 = 1.0 / (self._substep_dt * self._substep_dt)
-        for k, i_b in qd.ndrange((lo, hi), self._B):
-            i_v = self.color_perm[k]
-            m_h2 = qd.cast(self.verts_info[i_v].mass * inv_h2, qd.f64)
-            x = self.verts[i_v, i_b].pos
-            force = -m_h2 * qd.cast(x - self.verts[i_v, i_b].ypos, qd.f64)
-            H = m_h2 * qd.Matrix.identity(qd.f64, 3)
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.verts[i_v, i_b].ipos = self.verts[i_v, i_b].pos
+            vel = self.verts[i_v, i_b].vel + self._gravity[i_b] * self._substep_dt
+            self.verts[i_v, i_b].ypos = self.verts[i_v, i_b].pos + vel * self._substep_dt
+            self.verts[i_v, i_b].pos = self.verts[i_v, i_b].ypos
 
-            for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
-                i_e = self.ve_elem[c]
-                role = self.ve_role[c]
-                F, B = self._func_deformation(i_e, i_b)
-                mu = self.elems_info[i_e].mu
-                lam = self.elems_info[i_e].lam
-                alpha = 1.0 + mu / lam
-                cof = self._func_cofactor(F)
-                J = F.determinant()
-                P = mu * F + lam * (J - alpha) * cof
-                w = self._func_vertex_weight(B, role)
-                V = self.elems_info[i_e].vol_rest
-                q = qd.cast(cof @ w, qd.f64)
-                force -= qd.cast(V * (P @ w), qd.f64)
-                H += qd.cast(V * mu * w.norm_sqr(), qd.f64) * qd.Matrix.identity(qd.f64, 3)
-                H += qd.cast(V * lam, qd.f64) * q.outer_product(q)
+        for _ in qd.static(range(self._n_iterations)):
+            for c in qd.static(range(self._n_colors)):
+                for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
+                    self._func_solve_vertex(self.color_perm[k], i_b, inv_h2)
 
-            dx = H.inverse() @ force
-            self.verts[i_v, i_b].pos = x + qd.cast(dx, gs.qd_float)
-
-    @qd.kernel
-    def _kernel_update_velocity(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             self.verts[i_v, i_b].vel = (self.verts[i_v, i_b].pos - self.verts[i_v, i_b].ipos) / self._substep_dt
-
-    def solve(self, f):
-        for _ in range(self._n_iterations):
-            for c in range(self._n_colors):
-                self._kernel_solve_color(f, self._color_offsets[c], self._color_offsets[c + 1])
 
     @qd.kernel
     def _kernel_compute_energy(self):
@@ -356,9 +373,7 @@ class VBDSolver(Solver):
 
     def substep_pre_coupling(self, f):
         if self.is_active:
-            self._kernel_predict(f)
-            self.solve(f)
-            self._kernel_update_velocity(f)
+            self._kernel_substep(f)
 
     def substep_pre_coupling_grad(self, f):
         pass

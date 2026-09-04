@@ -95,22 +95,24 @@ def test_incremental_potential_never_increases_across_sweeps(show_viewer):
 def test_actuation_contracts_along_the_fiber_at_constant_volume(show_viewer):
     """Fully actuated, every tet must reach the stress-free F = A^-1 = diag(s, 1/sqrt(s), 1/sqrt(s))."""
     gain = 0.3
-    scene, bar = _bar_scene(gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=1, gain=gain), n_iterations=60, show_viewer=show_viewer)
+    scene, bar = _bar_scene(gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=1, gain=gain), n_iterations=2, substeps=40, show_viewer=show_viewer)
     bar.set_muscle(np.zeros(bar.n_elements, dtype=np.int32), np.tile([1.0, 0.0, 0.0], (bar.n_elements, 1)))
     pos0 = _positions(bar)
+    el = bar.elems
+    shape = lambda p: np.stack([p[el[:, 1]] - p[el[:, 0]], p[el[:, 2]] - p[el[:, 0]], p[el[:, 3]] - p[el[:, 0]]], axis=-1)
+    Dm_inv = np.linalg.inv(shape(pos0))
+    F_sum, vol_sum, n = 0.0, 0.0, 0
     for step in range(300):
         bar.set_actuation([min(1.0, step / 100)])
         scene.step()
-    pos1 = _positions(bar)
-    assert np.isfinite(pos1).all()
+        if step >= 200:  # the bar is undamped, so average over the oscillation around equilibrium
+            Ds = shape(_positions(bar))
+            F_sum, vol_sum, n = F_sum + (Ds @ Dm_inv).mean(axis=0), vol_sum + np.linalg.det(Ds @ Dm_inv), n + 1
+    assert np.isfinite(F_sum).all()
 
-    el = bar.elems
-    shape = lambda p: np.stack([p[el[:, 1]] - p[el[:, 0]], p[el[:, 2]] - p[el[:, 0]], p[el[:, 3]] - p[el[:, 0]]], axis=-1)
-    Ds, Dm = shape(pos1), shape(pos0)
-    F = Ds @ np.linalg.inv(Dm)
     s = 1.0 - gain
-    np.testing.assert_allclose(F.mean(axis=0), np.diag([s, 1 / np.sqrt(s), 1 / np.sqrt(s)]), atol=1e-2)
-    np.testing.assert_allclose(np.linalg.det(Ds) / np.linalg.det(Dm), 1.0, atol=1e-3)
+    np.testing.assert_allclose(F_sum / n, np.diag([s, 1 / np.sqrt(s), 1 / np.sqrt(s)]), atol=1e-2)
+    np.testing.assert_allclose(vol_sum / n, 1.0, atol=1e-3)
 
 
 @pytest.mark.required
@@ -119,7 +121,7 @@ def test_opposed_fiber_groups_bend_the_bar_both_ways(show_viewer):
     ends (negative sag); bottom-side fibers do the opposite; null control stays straight."""
     dev = {}
     for actu_top, actu_bottom in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0)):
-        scene, bar = _bar_scene(gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=2, gain=0.3), n_iterations=60, show_viewer=show_viewer)
+        scene, bar = _bar_scene(gs.materials.VBD.Muscle(E=1e5, nu=0.3, n_groups=2, gain=0.3), n_iterations=2, substeps=40, show_viewer=show_viewer)
         pos0 = _positions(bar)
         mid_y = pos0[bar.elems].mean(axis=1)[:, 1]
         group = np.full(bar.n_elements, -1, dtype=np.int32)
