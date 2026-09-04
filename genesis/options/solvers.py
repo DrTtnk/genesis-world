@@ -941,6 +941,9 @@ class VBDOptions(Options):
     constraint_k_max_ratio : float, optional
         Upper bound of a constraint's stiffness as a multiple of k_start (the mean vertex mass over h^2). Defaults
         to 100.
+    angle_tol : float, optional
+        Target cosine error of angle constraints, driving their stiffness ramp; 4e-5 is half a degree near
+        perpendicular. Defaults to 4e-5.
     constraint_dual_relaxation : float, optional
         Factor on the dual update lam += relaxation * k * C. Below 1 slows the multiplier when the primal sweeps
         between updates are few. Defaults to 0.25, which keeps rigid clusters of constraints stable at two sweeps.
@@ -962,6 +965,7 @@ class VBDOptions(Options):
     constraint_tol: PositiveFloat = 1e-4
     constraint_k_max_ratio: PositiveFloat = 100.0
     constraint_dual_relaxation: PositiveFloat = 0.25
+    angle_tol: PositiveFloat = 4e-5
     residual_tol: PositiveFloat = 1e-6
     max_sweeps: PositiveInt = 400
 

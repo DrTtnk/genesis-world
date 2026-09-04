@@ -46,7 +46,7 @@ class VBDSolver(Solver):
         self._constraint_tol = options.constraint_tol
         self._constraint_k_max_ratio = options.constraint_k_max_ratio
         self._constraint_dual_relaxation = options.constraint_dual_relaxation
-        self._angle_tol = options.constraint_tol / 0.05  # cosine tolerance: constraint_tol over a 5 cm segment, a small angle
+        self._angle_tol = options.angle_tol
         self._max_sweeps = options.max_sweeps
 
     # ------------------------------------------------------------------------------------
@@ -117,7 +117,7 @@ class VBDSolver(Solver):
         self.cons_error = qd.field(dtype=qd.f64, shape=())
         # Angle constraints: the cosine between u = x_a - x_b and v = x_c - x_d kept in [lo, hi] (cos of the angle
         # bounds), same augmented Lagrangian with clamped multipliers. Joint limits on rigid vertebra frames.
-        struct_acons_info = qd.types.struct(v=gs.qd_ivec4, lo=gs.qd_float, hi=gs.qd_float)
+        struct_acons_info = qd.types.struct(v=gs.qd_ivec4, lo=gs.qd_float, hi=gs.qd_float, k0=gs.qd_float)
         struct_acons_state = qd.types.struct(lam_hi=gs.qd_float, lam_lo=gs.qd_float, k=gs.qd_float)
         na = max(self._n_angle_constraints, 1)
         self.acons_info = struct_acons_info.field(shape=(na,), layout=qd.Layout.SOA)
@@ -264,11 +264,19 @@ class VBDSolver(Solver):
             self.acons_info.v.from_numpy(acons.astype(gs.np_int))
             self.acons_info.lo.from_numpy(lo.astype(gs.np_float))
             self.acons_info.hi.from_numpy(hi.astype(gs.np_float))
-        # k_start for a dimensionless cosine: the distance k_start times a squared length scale (the mean rest edge)
-        self._k_start_angle = self._k_start * float(np.mean(np.linalg.norm(np.diff(self.verts.pos.to_numpy()[0, :, 0][acons[:, :2]], axis=1), axis=-1)) ** 2) if len(acons) else self._k_start
+        # base stiffness per constraint so that k |grad C|^2 matches a distance constraint of stiffness k_start:
+        # k0 = k_start |u|^2 |v|^2 / (|u|^2 + |v|^2) on the rest vectors (the review's harmonic scale)
+        if len(acons):
+            pos = self.verts.pos.to_numpy()[0, :, 0]
+            lu2 = (np.linalg.norm(pos[acons[:, 0]] - pos[acons[:, 1]], axis=1) ** 2)
+            lv2 = (np.linalg.norm(pos[acons[:, 2]] - pos[acons[:, 3]], axis=1) ** 2)
+            k0 = self._k_start * lu2 * lv2 / (lu2 + lv2)
+            self.acons_info.k0.from_numpy(k0.astype(gs.np_float))
+            self.acons.k.from_numpy(np.tile(k0.astype(gs.np_float)[:, None], (1, self._B)))
+        else:
+            self.acons.k.fill(self._k_start)
         self.acons.lam_hi.fill(0.0)
         self.acons.lam_lo.fill(0.0)
-        self.acons.k.fill(self._k_start_angle)
 
     def init_ckpt(self):
         self._ckpt = dict()
@@ -594,7 +602,10 @@ class VBDSolver(Solver):
             force -= qd.cast(mult, self._acc) * qd.cast(g, self._acc)
             if mult != 0.0:
                 H += qd.cast(self.acons[i_c, i_b].k, self._acc) * qd.cast(g.outer_product(g), self._acc)
-            H += qd.cast(qd.abs(mult) / (scale * scale), self._acc) * qd.Matrix.identity(self._acc, 3)
+            own = u_hat
+            if slot >= 2:
+                own = v_hat
+            H += qd.cast(qd.abs(mult) / (scale * scale), self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - own.outer_product(own), self._acc)
 
         # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
         # Coulomb friction (3.6, Hu et al. 2009 coefficients) on the substep's tangential slide, with the IPC
@@ -712,10 +723,8 @@ class VBDSolver(Solver):
         else:
             self.acons[i_c, i_b].lam_hi += w * k * (cosv - self.acons_info[i_c].hi)
         _, violation = self._func_angle_mult(i_c, i_b, cosv)
-        # the tolerance for a cosine: constraint_tol over the mean rest edge (a small angle in radians)
-        self.acons[i_c, i_b].k = qd.min(
-            k + self._k_start_angle / self._angle_tol * qd.abs(violation), self._constraint_k_max_ratio * self._k_start_angle
-        )
+        k0 = self.acons_info[i_c].k0
+        self.acons[i_c, i_b].k = qd.min(k + k0 / self._angle_tol * qd.abs(violation), self._constraint_k_max_ratio * k0)
 
     @qd.func
     def _func_dual_update(self, f, i_c, i_b):
@@ -758,7 +767,7 @@ class VBDSolver(Solver):
         for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
             self.acons[i_c, i_b].lam_hi *= 0.95 * 0.99
             self.acons[i_c, i_b].lam_lo *= 0.95 * 0.99
-            self.acons[i_c, i_b].k = qd.max(self._k_start_angle, 0.99 * self.acons[i_c, i_b].k)
+            self.acons[i_c, i_b].k = qd.max(self.acons_info[i_c].k0, 0.99 * self.acons[i_c, i_b].k)
 
     @qd.kernel
     def _kernel_constraint_error(self, f: qd.i32):
