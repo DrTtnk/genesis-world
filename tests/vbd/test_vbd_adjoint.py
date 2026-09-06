@@ -19,13 +19,17 @@ def _constrain(box):
     at its lower bound, a bounded distance inside its bounds (inactive), and an angle active at its lower bound."""
     p = tensor_to_array(box.init_positions)
     q = p - p.mean(axis=0)
-    # six distinct corners of the box: each axis with a tie-break that lands on a different corner
+    # six distinct corners of the box (each axis with a tie-break that lands on a different corner), then the two
+    # vertices farthest from everything already picked
     v = [int(np.argmax(q @ d)) for d in ([1, 0.3, 0.2], [-1, -0.3, -0.2], [-0.3, 1, -0.2], [0.3, -1, 0.2], [-0.3, -0.2, 1], [0.3, 0.2, -1])]
-    assert len(set(v)) == 6, v
+    for _ in range(2):
+        v.append(int(np.argmax(np.linalg.norm(p[:, None] - p[v][None], axis=-1).min(axis=1))))
+    assert len(set(v)) == 8, v
     d = lambda i, j: float(np.linalg.norm(p[v[i]] - p[v[j]]))
     box.add_distance_constraints(np.array([[v[0], v[1]]]), lo=np.array([0.98 * d(0, 1)]), hi=np.array([0.98 * d(0, 1)]))
     # the active bound is the lower one: the rig's squash shortens every distance and keeps it pressed against it
     box.add_distance_constraints(np.array([[v[2], v[3]], [v[4], v[5]]]), lo=np.array([1.05 * d(2, 3), 0.5 * d(4, 5)]), hi=np.array([1.5 * d(2, 3), 1.5 * d(4, 5)]))
+    box.add_distance_constraints(np.array([[v[6], v[7]]]))  # an equality at its rest length: lightly loaded, still a constraint
     u, w = p[v[0]] - p[v[1]], p[v[2]] - p[v[3]]  # two body diagonals, about 109 degrees apart
     a0 = np.degrees(np.arccos(u.dot(w) / np.linalg.norm(u) / np.linalg.norm(w)))
     box.add_angle_constraints(np.array([[v[0], v[1], v[2], v[3]]]), np.array([a0 + 2.0]), np.array([a0 + 40.0]))
@@ -74,8 +78,10 @@ def test_jacobian_matches_finite_differences_of_the_residual(show_viewer, k_fibe
     solver._kernel_sweeps(0)  # a generic, unconverged iterate: J is the Jacobian of r at any x
     if constrained:
         mult = solver.cons_hist.mult.to_numpy()[1, :, 0]
+        k_eff = solver.cons_hist.k_eff.to_numpy()[1, :, 0]
         assert mult[0] != 0.0 and mult[1] != 0.0 and mult[2] == 0.0, f"active set is not as designed: {mult}"
-        assert solver.acons_hist.mult.to_numpy()[1, 0, 0] != 0.0
+        assert k_eff[0] > 0.0 and k_eff[1] > 0.0 and k_eff[2] == 0.0 and k_eff[3] > 0.0, f"effective stiffness: {k_eff}"
+        assert solver.acons_hist.k_eff.to_numpy()[1, 0, 0] > 0.0
 
     n = solver.n_vertices
     pos = torch.zeros((1, n, 3), dtype=torch.float64, device=gs.device)
@@ -148,8 +154,10 @@ def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_vie
     if constrained:
         assert solver.constraint_error() < 1e-9 and solver.angle_constraint_error() < 1e-9
         mult = solver.cons_hist.mult.to_numpy()[1:, :, 0]  # the squash presses the bounded pair into its bound in substep 0
-        assert (mult[:, 0] != 0.0).all() and mult[0, 1] != 0.0 and (mult[:, 2] == 0.0).all(), f"active set is not as designed: {mult}"
-        assert solver.acons_hist.mult.to_numpy()[1, 0, 0] != 0.0
+        k_eff = solver.cons_hist.k_eff.to_numpy()[1:, :, 0]
+        assert (mult[:, 0] != 0.0).all() and mult[0, 1] != 0.0 and (k_eff[:, 2] == 0.0).all(), f"active set is not as designed: {mult}"
+        assert (k_eff[:, 3] > 0.0).all(), "the rest-length equality must be recorded active whatever its load"
+        assert solver.acons_hist.k_eff.to_numpy()[1, 0, 0] > 0.0
 
     solver.reset_grad()
     solver.adj.pos.from_numpy(np.zeros((substeps + 1, n, 1, 3)))
@@ -178,3 +186,24 @@ def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_vie
     np.testing.assert_allclose(g_x, g_x_fd, atol=1e-6 * np.abs(g_x_fd).max(), rtol=0)
     np.testing.assert_allclose(g_v, g_v_fd, atol=1e-6 * np.abs(g_v_fd).max(), rtol=0)
     assert g_a == pytest.approx(g_a_fd, rel=1e-6)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_record_is_taken_at_the_converged_state_even_without_a_sweep(show_viewer):
+    """A predicted state that is already stationary sweeps zero times; the record must still be this substep's."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=3e-3, substeps=1, gravity=(0.0, 0.0, 0.0), requires_grad=True),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-9, max_sweeps=4000, floor_height=-1.0),
+        show_viewer=show_viewer,
+    )
+    bar = scene.add_entity(material=gs.materials.VBD.Base(E=1e5, nu=0.3), morph=gs.morphs.Box(size=(0.2, 0.05, 0.05), pos=(0.0, 0.0, 0.5), nobisect=False, maxvolume=5e-5))
+    p = tensor_to_array(bar.init_positions)
+    bar.add_distance_constraints(np.array([[int(np.argmin(p[:, 0])), int(np.argmax(p[:, 0]))]]))  # equality at rest
+    scene.build()
+    solver = scene.vbd_solver
+    solver.cons_hist.mult.fill(123.0)  # stale garbage from "a previous substep"
+    solver.cons_hist.k_eff.fill(0.0)
+    scene.step()
+    assert solver.cons_hist.mult.to_numpy()[1, 0, 0] == 0.0
+    assert solver.cons_hist.k_eff.to_numpy()[1, 0, 0] == solver._k_start

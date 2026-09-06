@@ -397,3 +397,27 @@ def test_get_state_does_not_retain_states_without_gradients(show_viewer):
         scene.step()
         bar.get_state()
     assert len(bar._queried_states.states) == 0
+
+
+def test_multiplier_decay_runs_every_substep(show_viewer):
+    """The decay is the dual damping of the two-sweep solve; it runs once per substep, 20 times per step here."""
+    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=5e-3, substeps=20, gravity=(0.0, 0.0, 0.0)), vbd_options=gs.options.VBDOptions(n_iterations=2, floor_height=-1.0), show_viewer=show_viewer)
+    bar = scene.add_entity(material=gs.materials.VBD.Base(E=1e5, nu=0.3), morph=gs.morphs.Box(size=(0.2, 0.05, 0.05), pos=(0.0, 0.0, 0.5), nobisect=False, maxvolume=5e-5))
+    p = tensor_to_array(bar.init_positions)
+    bar.add_distance_constraints(np.array([[int(np.argmin(p[:, 0])), int(np.argmax(p[:, 0]))]]))
+    scene.build()
+    solver = scene.vbd_solver
+    calls = []
+    kernel = solver._kernel_warm_start
+    solver._kernel_warm_start = lambda: (calls.append(1), kernel())
+    for _ in range(3):
+        scene.step()
+    assert len(calls) == 60
+
+
+def test_rayleigh_damping_refuses_a_poisson_ratio_below_one_eighth(show_viewer):
+    """The rest Hessian is positive semidefinite only for lam' >= mu / 3; below that damping would inject energy."""
+    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=1e-3, substeps=2), vbd_options=gs.options.VBDOptions(n_iterations=2, damping=0.005), show_viewer=show_viewer)
+    scene.add_entity(material=gs.materials.VBD.Base(E=1e5, nu=0.1), morph=gs.morphs.Box(size=(0.1, 0.05, 0.05), pos=(0.0, 0.0, 0.1), nobisect=False, maxvolume=1e-4))
+    with pytest.raises(gs.GenesisException):
+        scene.build()

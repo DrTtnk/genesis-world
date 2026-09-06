@@ -364,6 +364,7 @@ class VBDEntity(Entity):
         for key in self._tgt_keys:
             self._tgt_buffer[key].clear()
         self._queried_states.clear()
+        self._held_actu = None  # a new rollout must not back-propagate into the previous rollout's tensor
 
     def save_ckpt(self, ckpt_name):
         if ckpt_name not in self._ckpt:

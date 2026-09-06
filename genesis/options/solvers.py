@@ -950,6 +950,8 @@ class VBDOptions(Options):
     residual_tol : float, optional
         Under `requires_grad`, each substep sweeps until the largest leftover force component (N) is below this
         tolerance, because the adjoint differentiates the converged stationarity condition. Defaults to 1e-6.
+    max_dual_steps : int, optional
+        Under `requires_grad`, the largest number of exact Uzawa dual updates per substep before failing. Defaults to 200.
     max_sweeps : int, optional
         Under `requires_grad`, the sweep budget per substep before failing. Defaults to 400.
     """
@@ -968,6 +970,7 @@ class VBDOptions(Options):
     angle_tol: PositiveFloat = 4e-5
     residual_tol: PositiveFloat = 1e-6
     max_sweeps: PositiveInt = 400
+    max_dual_steps: PositiveInt = 200
 
 
 class SFOptions(Options):

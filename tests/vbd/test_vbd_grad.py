@@ -132,3 +132,20 @@ def test_vbd_actuation_grad_with_decimation_matches_finite_differences(show_view
         print(f"control step {i}: analytic={analytic[i]:.6e} fd={numeric[i]:.6e}", flush=True)
         assert abs(analytic[i]) > 1e-9
         assert analytic[i] == pytest.approx(numeric[i], rel=1e-5)
+
+
+@pytest.mark.parametrize("precision", ["64"])
+def test_held_actuation_does_not_leak_into_the_next_rollout(show_viewer):
+    """After a reset, steps taken before the first set_actuation carry no actuation and must not back-propagate into the
+    previous rollout's tensor."""
+    scene, box = _build(show_viewer)
+    w = gs.tensor(np.zeros((1, box.n_vertices, 3)))
+    loss, tensors = _rollout_decimated(scene, box, [0.4], w, requires_grad=True)
+    scene.backward(loss)
+    grad_before = tensors[0].grad.clone()
+    scene.reset()
+    for _ in range(3):
+        scene.step()  # no set_actuation: nothing in force
+    state = box.get_state()
+    scene.backward((state.pos**2).sum())
+    assert torch.equal(tensors[0].grad, grad_before)
