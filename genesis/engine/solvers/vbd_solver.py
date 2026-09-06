@@ -149,7 +149,7 @@ class VBDSolver(Solver):
     def _compute_vertex_coloring_and_incidence(self, elems, cons, acons):
         """Greedy vertex coloring of the graph of tets and constraints plus the vertex -> incident tet CSR list.
 
-        Returns (perm, color_offsets, n_colors, ve_offset, ve_elem, ve_role): vertices sorted by color
+        Returns (perm, color_offsets, n_colors, ve_offset, ve_elem, ve_role, color): vertices sorted by color
         (`perm[color_offsets[c]:color_offsets[c+1]]` is color `c`), and for vertex `i` the incident tets
         `ve_elem[ve_offset[i]:ve_offset[i+1]]` with `ve_role` the local index of `i` in each tet. Two vertices
         that share a tet or a constraint never share a color, so each color is one race-free Gauss-Seidel sweep.
@@ -178,7 +178,22 @@ class VBDSolver(Solver):
         inc_role = np.tile(np.arange(4), self._n_elements)
         order = np.argsort(inc_vert, kind="stable")
         ve_offset = np.searchsorted(inc_vert[order], np.arange(self._n_vertices + 1))
-        return perm, color_offsets, n_colors, ve_offset, inc_elem[order], inc_role[order]
+        return perm, color_offsets, n_colors, ve_offset, inc_elem[order], inc_role[order], color
+
+    def _owner_csr(self, verts_per_constraint, color):
+        """Per-vertex CSR of the constraints it owns. The owner is the constraint's vertex of highest color: when its
+        color pass runs, every other vertex of the constraint has been updated this sweep and none is being written,
+        so the owner can run the constraint's dual update inside its own pass, with no pass and barrier of its own."""
+        n = len(verts_per_constraint)
+        owner = verts_per_constraint[np.arange(n), np.argmax(color[verts_per_constraint], axis=1)] if n else np.zeros(0, dtype=np.int64)
+        order = np.argsort(owner, kind="stable")
+        offset = np.searchsorted(owner[order], np.arange(self._n_vertices + 1))
+        f_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
+        f_offset.from_numpy(offset.astype(gs.np_int))
+        f_cons = qd.field(dtype=gs.qd_int, shape=(max(n, 1),))
+        if n:
+            f_cons.from_numpy(order.astype(gs.np_int))
+        return f_offset, f_cons
 
     def build(self):
         super().build()
@@ -214,11 +229,13 @@ class VBDSolver(Solver):
             self._n_constraints = len(cons)
             self._n_angle_constraints = len(acons)
             self.init_constraint_fields()
-            perm, self._color_offsets, self._n_colors, ve_offset, ve_elem, ve_role = (
+            perm, self._color_offsets, self._n_colors, ve_offset, ve_elem, ve_role, color = (
                 self._compute_vertex_coloring_and_incidence(elems, cons, acons)
             )
             self._init_constraints(cons, lo, hi)
             self._init_angle_constraints(acons, alo, ahi)
+            self.vo_offset, self.vo_cons = self._owner_csr(cons, color)
+            self.vao_offset, self.vao_cons = self._owner_csr(acons, color)
             self.color_perm = qd.field(dtype=gs.qd_int, shape=(self._n_vertices,))
             self.color_perm.from_numpy(perm.astype(gs.np_int))
             self.ve_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
@@ -698,9 +715,22 @@ class VBDSolver(Solver):
         return blk
 
     @qd.func
-    def _func_solve_vertex(self, f, i_v, i_b):
+    def _func_solve_vertex(self, f, i_v, i_b, w, ramp, record):
+        """One Newton step of vertex i_v, then the dual updates of the constraints it owns (relaxation w, stiffness
+        ramp on or off), recording their multipliers for the adjoint when `record` is set. w = 0 skips the duals."""
         force, H, K_unused = self._func_vertex_system(f, i_v, i_b)
         self.verts[f + 1, i_v, i_b].pos += qd.cast(H.inverse() @ force, gs.qd_float)
+        if w > 0.0:
+            for c in range(self.vo_offset[i_v], self.vo_offset[i_v + 1]):
+                i_c = self.vo_cons[c]
+                self._func_dual_update(f, i_c, i_b, w, ramp)
+                if record:
+                    self._func_record_constraint(f, i_c, i_b)
+            for c in range(self.vao_offset[i_v], self.vao_offset[i_v + 1]):
+                i_c = self.vao_cons[c]
+                self._func_angle_dual_update(f, i_c, i_b, w, ramp)
+                if record:
+                    self._func_record_angle(f, i_c, i_b)
 
     @qd.kernel
     def _kernel_predict(self, f: qd.i32):
@@ -711,7 +741,7 @@ class VBDSolver(Solver):
     def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
         """One color of one sweep. Kept for tests that watch the energy sweep by sweep."""
         for k, i_b in qd.ndrange((lo, hi), self._B):
-            self._func_solve_vertex(f, self.color_perm[k], i_b)
+            self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, True)
 
     @qd.func
     def _func_constraint_mult(self, i_c, i_b, dist):
@@ -774,25 +804,14 @@ class VBDSolver(Solver):
 
     @qd.kernel
     def _kernel_sweeps(self, f: qd.i32):
-        """`n_iterations` Gauss-Seidel sweeps in one launch, each followed by the constraints' dual update. Each
-        top-level loop is a serial task with an implicit barrier after it, so the statically unrolled color loops
-        are race-free without a Python round trip."""
-        for _ in qd.static(range(self._n_iterations)):
+        """`n_iterations` Gauss-Seidel sweeps in one launch. Each top-level loop is a serial task with an implicit
+        barrier after it, so the statically unrolled color loops are race-free without a Python round trip. The
+        constraints' dual updates ride inside the color pass of their owner vertex (see `_owner_csr`): a pass of
+        their own would be a few thousand threads behind a barrier, and cost half the step on the ladder body."""
+        for sweep in qd.static(range(self._n_iterations)):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    self._func_solve_vertex(f, self.color_perm[k], i_b)
-            if qd.static(self._n_constraints > 0):
-                for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-                    self._func_dual_update(f, i_c, i_b, self._constraint_dual_relaxation, 1.0)
-            if qd.static(self._n_angle_constraints > 0):
-                for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
-                    self._func_angle_dual_update(f, i_c, i_b, self._constraint_dual_relaxation, 1.0)
-        if qd.static(self._n_constraints > 0):
-            for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-                self._func_record_constraint(f, i_c, i_b)
-        if qd.static(self._n_angle_constraints > 0):
-            for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
-                self._func_record_angle(f, i_c, i_b)
+                    self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, sweep == self._n_iterations - 1)
 
     @qd.func
     def _func_record_constraint(self, f, i_c, i_b):
@@ -817,7 +836,7 @@ class VBDSolver(Solver):
         for _ in qd.static(range(self._n_iterations)):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    self._func_solve_vertex(f, self.color_perm[k], i_b)
+                    self._func_solve_vertex(f, self.color_perm[k], i_b, 0.0, 0.0, False)
         if qd.static(self._n_constraints > 0):
             for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
                 self._func_record_constraint(f, i_c, i_b)
