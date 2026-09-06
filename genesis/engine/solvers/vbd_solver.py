@@ -834,6 +834,24 @@ class VBDSolver(Solver):
             self._func_angle_dual_update(f, i_c, i_b, 1.0, 0.0)
 
     @qd.kernel
+    def _kernel_reset_constraints(self, mask: qd.types.ndarray()):
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            if mask[i_b] != 0:
+                self.cons[i_c, i_b].lam_hi = 0.0
+                self.cons[i_c, i_b].lam_lo = 0.0
+                self.cons[i_c, i_b].k = self._k_start
+        for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+            if mask[i_b] != 0:
+                self.acons[i_c, i_b].lam_hi = 0.0
+                self.acons[i_c, i_b].lam_lo = 0.0
+                self.acons[i_c, i_b].k = self.acons_info[i_c].k0
+
+    def reset_constraints(self, envs_mask):
+        """Clear the constraint multipliers and stiffness ramps of the environments where `envs_mask` (bool tensor of
+        shape (n_envs,)) is true: a body put back to its rest state must not keep the tensions of its last episode."""
+        self._kernel_reset_constraints(envs_mask.to(torch.int32).contiguous())
+
+    @qd.kernel
     def _kernel_warm_start(self):
         """Once per step (the paper runs it per frame): lam <- alpha gamma lam, k <- max(k_start, gamma k)."""
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
