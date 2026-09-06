@@ -86,3 +86,49 @@ def test_vbd_actuation_grad_matches_finite_differences(show_viewer):
         assert analytic[i] == pytest.approx(numeric[i], rel=1e-5), (
             f"step {i}: analytic gradient {analytic[i]:.6e} disagrees with finite differences {numeric[i]:.6e}"
         )
+
+
+DECIMATION = 10
+
+
+def _rollout_decimated(scene, box, actu_values, w, requires_grad):
+    """One actuation per control step, held over `DECIMATION` simulation steps: the pattern of the RL environment.
+    The gradient of the loss with respect to a control step's actuation must sum over every simulation step that
+    used it."""
+    scene.reset()
+    tensors = []
+    for value in actu_values:
+        actus = gs.tensor([value], requires_grad=requires_grad)
+        tensors.append(actus)
+        box.set_actuation(actus)
+        for _ in range(DECIMATION):
+            scene.step()
+    state = box.get_state()
+    loss = (w * state.pos).sum() + 0.5 * (state.vel**2).sum()
+    return loss, tensors
+
+
+@pytest.mark.parametrize("precision", ["64"])
+def test_vbd_actuation_grad_with_decimation_matches_finite_differences(show_viewer):
+    """APG story 1: an actuation set once and held over ten steps gets the gradient of all ten."""
+    scene, box = _build(show_viewer)
+    rng = np.random.default_rng(1)
+    w = gs.tensor(rng.normal(size=(1, box.n_vertices, 3)))
+    nominal = [0.3, 0.5]
+
+    loss, tensors = _rollout_decimated(scene, box, nominal, w, requires_grad=True)
+    scene.backward(loss)
+    analytic = [t.grad.item() for t in tensors]
+
+    eps = 1e-5
+    numeric = []
+    for i in range(len(nominal)):
+        plus, minus = list(nominal), list(nominal)
+        plus[i] += eps
+        minus[i] -= eps
+        with torch.no_grad():
+            numeric.append((_rollout_decimated(scene, box, plus, w, False)[0].item() - _rollout_decimated(scene, box, minus, w, False)[0].item()) / (2 * eps))
+    for i in range(len(nominal)):
+        print(f"control step {i}: analytic={analytic[i]:.6e} fd={numeric[i]:.6e}", flush=True)
+        assert abs(analytic[i]) > 1e-9
+        assert analytic[i] == pytest.approx(numeric[i], rel=1e-5)

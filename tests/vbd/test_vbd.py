@@ -386,3 +386,14 @@ def test_angle_constraint_caps_the_bend_of_the_actuated_bar(show_viewer):
         assert np.isfinite(p).all()
     assert angles[False] > 25.0
     assert angles[True] < 12.0
+
+
+def test_get_state_does_not_retain_states_without_gradients(show_viewer):
+    """An RL environment calls get_state every control step for hours; without requires_grad nothing may accumulate."""
+    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=1e-3, substeps=2), vbd_options=gs.options.VBDOptions(n_iterations=2), show_viewer=show_viewer)
+    bar = scene.add_entity(material=gs.materials.VBD.Base(E=1e5, nu=0.3), morph=gs.morphs.Box(size=(0.1, 0.05, 0.05), pos=(0.0, 0.0, 0.1), nobisect=False, maxvolume=1e-4))
+    scene.build()
+    for _ in range(5):
+        scene.step()
+        bar.get_state()
+    assert len(bar._queried_states.states) == 0

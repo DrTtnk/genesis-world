@@ -295,6 +295,7 @@ class VBDEntity(Entity):
         for key in self._tgt_keys:
             self._tgt[key] = None
             self._tgt_buffer[key] = list()
+        self._held_actu = None  # the actuation in force: a step without set_actuation keeps the last one
 
     def process_input(self, in_backward=False):
         if in_backward:
@@ -302,6 +303,10 @@ class VBDEntity(Entity):
             index = self._sim.cur_step_local - self._sim._steps_local
             self._tgt["actu"] = self._tgt_buffer["actu"][index]
         elif self._sim.requires_grad:
+            # buffer the actuation in force at every step, held or not: the backward re-run replays this buffer, and a
+            # None here would let it run the held steps with whatever the field holds at the end of the forward
+            if self._tgt["actu"] is None:
+                self._tgt["actu"] = self._held_actu
             self._tgt_buffer["actu"].append(self._tgt["actu"])
 
         if self._tgt["actu"] is not None:
@@ -309,11 +314,13 @@ class VBDEntity(Entity):
             self._tgt["actu"].assert_sceneless()
             actus = tensor_to_array(self._tgt["actu"], dtype=gs.np_float)
             self._solver._kernel_set_actuation(actus)
+            self._held_actu = self._tgt["actu"]
 
         self._tgt["actu"] = None
 
     def process_input_grad(self):
-        """Backpropagate the gradient of the actuation set through `set_actuation` for this step."""
+        """Backpropagate this step's actuation adjoint into the tensor in force at this step. A tensor held over several
+        steps receives one backward call per step (retain_graph), so its gradient sums over the steps it acted on."""
         _tgt_actu = self._tgt_buffer["actu"].pop()
         if _tgt_actu is not None and _tgt_actu.requires_grad:
             _tgt_actu._backward_from_qd(self._kernel_get_actuation_grad)
@@ -382,7 +389,8 @@ class VBDEntity(Entity):
         """Positions and velocities of the entity's vertices, each of shape (B, n_vertices, 3)."""
         state = VBDEntityState(self, self._sim.cur_step_global)
         self._kernel_get_frame(self._sim.cur_substep_local, state.pos, state.vel)
-        self._queried_states.append(state)
+        if self._sim.requires_grad:
+            self._queried_states.append(state)  # kept for the backward pass; without gradients it is a memory leak
         return state
 
     def get_positions(self):
