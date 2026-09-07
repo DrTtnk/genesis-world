@@ -49,6 +49,7 @@ class VBDSolver(Solver):
         self._angle_tol = options.angle_tol
         self._max_sweeps = options.max_sweeps
         self._max_dual_steps = options.max_dual_steps
+        self._violation_tol = options.violation_tol
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
@@ -110,15 +111,19 @@ class VBDSolver(Solver):
         # start once per step. lam and k live per env; the constraint list per vertex is a CSR like the tets.
         # lo == hi is an equality; otherwise the distance is bounded to [lo, hi] with one clamped multiplier per side
         # (Giles et al. 2025 Eq. 13: lam_hi >= 0 pushes the distance down, lam_lo <= 0 pushes it up)
-        struct_cons_info = qd.types.struct(v=gs.qd_ivec2, lo=gs.qd_float, hi=gs.qd_float)
+        # `scale` is the pair's rest length: it turns a violation in metres into a strain, so one tolerance fits a
+        # 1 mm rib and a 10 cm spine segment
+        struct_cons_info = qd.types.struct(v=gs.qd_ivec2, lo=gs.qd_float, hi=gs.qd_float, scale=gs.qd_float)
         struct_cons_state = qd.types.struct(lam_hi=gs.qd_float, lam_lo=gs.qd_float, k=gs.qd_float)
         n = max(self._n_constraints, 1)
         self.cons_info = struct_cons_info.field(shape=(n,), layout=qd.Layout.SOA)
         self.cons = struct_cons_state.field(shape=(n, self._B), layout=qd.Layout.SOA)
-        self.cons_error = qd.field(dtype=qd.f64, shape=())
+        self.cons_error = qd.field(dtype=qd.f64, shape=())  # absolute: metres, or cosine for an angle
+        self.cons_error_rel = qd.field(dtype=qd.f64, shape=())  # relative: strain, or radians for an angle
         # Angle constraints: the cosine between u = x_a - x_b and v = x_c - x_d kept in [lo, hi] (cos of the angle
         # bounds), same augmented Lagrangian with clamped multipliers. Joint limits on rigid vertebra frames.
-        struct_acons_info = qd.types.struct(v=gs.qd_ivec4, lo=gs.qd_float, hi=gs.qd_float, k0=gs.qd_float)
+        # `sin_ref` is the sine of the rest angle: d cos / d theta = -sin, so a cosine violation over it is an angle
+        struct_acons_info = qd.types.struct(v=gs.qd_ivec4, lo=gs.qd_float, hi=gs.qd_float, k0=gs.qd_float, sin_ref=gs.qd_float)
         struct_acons_state = qd.types.struct(lam_hi=gs.qd_float, lam_lo=gs.qd_float, k=gs.qd_float)
         na = max(self._n_angle_constraints, 1)
         self.acons_info = struct_acons_info.field(shape=(na,), layout=qd.Layout.SOA)
@@ -252,6 +257,13 @@ class VBDSolver(Solver):
             self.ve_elem.from_numpy(ve_elem.astype(gs.np_int))
             self.ve_role = qd.field(dtype=gs.qd_int, shape=(len(ve_role),))
             self.ve_role.from_numpy(ve_role.astype(gs.np_int))
+            # The noise floor of the force assembly: no solve can drive the residual below the rounding error of the
+            # terms it sums, so the relative tolerance is floored here. m/h^2 times a tet edge is the force that moves
+            # a vertex one edge in one substep, the largest term in the sum; times the relative precision of the
+            # accumulator, that is the smallest residual the assembly can resolve.
+            edge = float(np.linalg.norm(self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 1], 0] - self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 0], 0], axis=1).mean())
+            unit = float(self.verts_info.mass.to_numpy().max()) / self._substep_dt**2 * edge
+            self._force_noise = unit * (1e-13 if gs.np_float == np.float64 else 1e-6)
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
     def _init_constraints(self, cons, lo, hi):
@@ -277,6 +289,7 @@ class VBDSolver(Solver):
             self.cons_info.v.from_numpy(cons.astype(gs.np_int))
             self.cons_info.lo.from_numpy(lo.astype(gs.np_float))
             self.cons_info.hi.from_numpy(hi.astype(gs.np_float))
+            self.cons_info.scale.from_numpy(np.maximum(rest, gs.EPS).astype(gs.np_float))
         self._k_start = float(self.verts_info.mass.to_numpy().mean() / self._substep_dt**2)
         self.cons.lam_hi.fill(0.0)
         self.cons.lam_lo.fill(0.0)
@@ -308,6 +321,12 @@ class VBDSolver(Solver):
             lv2 = (np.linalg.norm(pos[acons[:, 2]] - pos[acons[:, 3]], axis=1) ** 2)
             k0 = self._k_start * lu2 * lv2 / (lu2 + lv2)
             self.acons_info.k0.from_numpy(k0.astype(gs.np_float))
+            u = pos[acons[:, 0]] - pos[acons[:, 1]]
+            v = pos[acons[:, 2]] - pos[acons[:, 3]]
+            cos_rest = (u * v).sum(-1) / np.sqrt(lu2 * lv2)
+            # a cosine violation divided by sin(theta) is the angle error; near 0 or 180 degrees the cosine is flat
+            # and no cosine tolerance is an angle tolerance, so the reference is floored
+            self.acons_info.sin_ref.from_numpy(np.maximum(np.sqrt(np.clip(1.0 - cos_rest**2, 0.0, 1.0)), 0.1).astype(gs.np_float))
             self.acons.k.from_numpy(np.tile(k0.astype(gs.np_float)[:, None], (1, self._B)))
         else:
             self.acons.k.fill(self._k_start)
@@ -920,20 +939,24 @@ class VBDSolver(Solver):
     @qd.kernel
     def _kernel_constraint_error(self, f: qd.i32):
         self.cons_error[None] = 0.0
+        self.cons_error_rel[None] = 0.0
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
             e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
             _, violation = self._func_constraint_mult(i_c, i_b, e.norm())
             qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(violation), qd.f64))
+            qd.atomic_max(self.cons_error_rel[None], qd.cast(qd.abs(violation) / self.cons_info[i_c].scale, qd.f64))
 
     @qd.kernel
     def _kernel_angle_error(self, f: qd.i32):
         self.cons_error[None] = 0.0
+        self.cons_error_rel[None] = 0.0
         for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
             vq = self.acons_info[i_c].v
             u = self.verts[f + 1, vq[0], i_b].pos - self.verts[f + 1, vq[1], i_b].pos
             vv = self.verts[f + 1, vq[2], i_b].pos - self.verts[f + 1, vq[3], i_b].pos
             _, violation = self._func_angle_mult(i_c, i_b, u.dot(vv) / (u.norm() * vv.norm()))
             qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(violation), qd.f64))
+            qd.atomic_max(self.cons_error_rel[None], qd.cast(qd.abs(violation) / self.acons_info[i_c].sin_ref, qd.f64))
 
     def angle_constraint_error(self):
         """Largest cosine violation of the angle constraints at the current end-of-substep positions, over all envs."""
@@ -967,46 +990,57 @@ class VBDSolver(Solver):
                 out[i_b, i_v, j] = -force[j]
 
     def _violation(self, f):
-        """Largest constraint violation (m for distances, cosine for angles) at the current iterate of substep f."""
+        """Largest relative constraint violation at the current iterate of substep f: strain for a distance, radians
+        for an angle. Both are dimensionless, so one tolerance covers a 1 mm ligament and a 10 cm segment."""
         worst = 0.0
         if self._n_constraints > 0:
             self._kernel_constraint_error(f)
-            worst = float(self.cons_error[None])
+            worst = float(self.cons_error_rel[None])
         if self._n_angle_constraints > 0:
             self._kernel_angle_error(f)
-            worst = max(worst, float(self.cons_error[None]))
+            worst = max(worst, float(self.cons_error_rel[None]))
         return worst
 
-    def _solve_primal(self, f):
-        """Sweeps with fixed multipliers until the stationarity residual is below tolerance."""
+    def _solve_primal(self, f, force_ref):
+        """Sweeps with fixed multipliers until the stationarity residual falls to `residual_tol` of `force_ref`."""
+        # stop at the tolerance, or when the residual reaches the noise of the force assembly and no sweep can lower
+        # it further (a substep that starts already stationary never reaches a fraction of its own zero)
+        target = max(self._residual_tol * force_ref, self._force_noise)
         for _ in range(self._max_sweeps // self._n_iterations):
             self._kernel_residual(f)
-            if self.residual[None] < self._residual_tol:
+            if self.residual[None] < target:
                 return
             self._kernel_primal_sweeps(f)
         self._kernel_residual(f)
         gs.raise_exception(
-            f"VBD substep did not converge: residual {self.residual[None]:.3e} >= {self._residual_tol:.1e} "
-            f"after {self._max_sweeps} sweeps."
+            f"VBD substep did not converge: residual {self.residual[None]:.3e} >= {target:.3e} "
+            f"({self._residual_tol:.1e} of the {force_ref:.3e} N the substep started with) after {self._max_sweeps} sweeps."
         )
 
     def solve(self, f):
         """Fixed sweeps with a dual update per sweep normally. Under requires_grad the adjoint differentiates the
         converged KKT system and inherits any leftover as bias, so the step is an exact Uzawa iteration: primal
-        sweeps to tolerance, one dual update, until the constraint violation is below tolerance too. (A dual update
-        on an unconverged iterate overshoots at the stiffness cap and limit-cycles instead of converging.)"""
+        sweeps to a relative force tolerance, one dual update, until the relative constraint violation is below its
+        own tolerance too. (A dual update on an unconverged iterate overshoots at the stiffness cap and limit-cycles
+        instead of converging.)"""
         if not self._sim.requires_grad:
             self._kernel_sweeps(f)
             return
+        # The force scale of this substep: the imbalance left at the predicted position, floored by the body's own
+        # weight so that a body already at rest still has a finite scale. An absolute newton tolerance is meaningless
+        # (a 35 kg body and a 1 g block carry forces four orders apart, and float32's own residual floor is about 1 N).
+        self._kernel_residual(f)
+        force_ref = float(self.residual[None])
+        self._force_ref = force_ref  # kept for inspection: the scale the stationarity tolerance is relative to
         for _ in range(self._max_dual_steps):
-            self._solve_primal(f)
-            if self._violation(f) < self._residual_tol:
+            self._solve_primal(f, force_ref)
+            if self._violation(f) < self._violation_tol:
                 self._kernel_record(f)  # here, not inside the sweeps: an already-stationary iterate sweeps zero times
                 return
             self._kernel_dual_update(f)
         gs.raise_exception(
-            f"VBD substep did not converge: constraint violation {self._violation(f):.3e} >= {self._residual_tol:.1e} "
-            f"after {self._max_dual_steps} dual updates."
+            f"VBD substep did not converge: relative constraint violation {self._violation(f):.3e} >= "
+            f"{self._violation_tol:.1e} after {self._max_dual_steps} dual updates."
         )
 
     # ------------------------------------------------------------------------------------
@@ -1361,12 +1395,20 @@ class VBDSolver(Solver):
             r -= self._func_offdiag_apply(f, i_v, i_b, self.z) + self._func_zeta_force(f, i_v, i_b)
             qd.atomic_max(self.adj_residual[None], qd.abs(r).max())
             qd.atomic_max(self.residual[None], qd.abs(self.gbar[i_v, i_b]).max())
+        # A constraint row's error must be measured where it acts: the force `k_eff (G . z) G` that the missing dual
+        # adjoint would add to the vertex rows. For a distance |G| is 1 and nothing changes; for an angle |G| is about
+        # 1/|u|, and without it a joint limit on a 1.2 cm lever is measured 100 times too small and the adjoint stops
+        # while G z is still large on exactly the constraints the skeleton exists for.
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
             if self.cons_hist[f + 1, i_c, i_b].k_eff != 0.0:
                 qd.atomic_max(self.adj_residual[None], self.cons_hist[f + 1, i_c, i_b].k_eff * qd.abs(self._func_constraint_dot_z(f, i_c, i_b)))
         for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
             if self.acons_hist[f + 1, i_c, i_b].k_eff != 0.0:
-                qd.atomic_max(self.adj_residual[None], self.acons_hist[f + 1, i_c, i_b].k_eff * qd.abs(self._func_angle_dot_z(f, i_c, i_b)))
+                u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+                g_max = 0.0
+                for slot in qd.static(range(4)):
+                    g_max = qd.max(g_max, self._func_angle_slot_grad(slot, u_hat, v_hat, lu, lv, cosv).norm())
+                qd.atomic_max(self.adj_residual[None], self.acons_hist[f + 1, i_c, i_b].k_eff * g_max * qd.abs(self._func_angle_dot_z(f, i_c, i_b)))
 
     @qd.kernel
     def _kernel_adjoint_accumulate(self, f: qd.i32):
@@ -1428,10 +1470,13 @@ class VBDSolver(Solver):
         self.acons_zeta.fill(0.0)
         self._kernel_adjoint_rhs(f)
         self.residual[None] = 0.0
+        self._kernel_adjoint_residual(f)
+        if self.residual[None] == 0.0:  # nothing flows back into this substep
+            return
         for _ in range(self._max_sweeps // self._n_iterations):
             self._kernel_adjoint_sweeps(f)
             self._kernel_adjoint_residual(f)
-            if self.adj_residual[None] <= self._residual_tol * max(self.residual[None], 1.0):
+            if self.adj_residual[None] <= self._residual_tol * self.residual[None]:  # residual holds max |gbar|
                 break
         else:
             gs.raise_exception(

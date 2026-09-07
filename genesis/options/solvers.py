@@ -947,9 +947,13 @@ class VBDOptions(Options):
     constraint_dual_relaxation : float, optional
         Factor on the dual update lam += relaxation * k * C. Below 1 slows the multiplier when the primal sweeps
         between updates are few. Defaults to 0.25, which keeps rigid clusters of constraints stable at two sweeps.
+    violation_tol : float, optional
+        Under `requires_grad`, the relative constraint violation each substep converges to: strain for a distance
+        constraint, radians for an angle constraint. Defaults to 1e-6.
     residual_tol : float, optional
-        Under `requires_grad`, each substep sweeps until the largest leftover force component (N) is below this
-        tolerance, because the adjoint differentiates the converged stationarity condition. Defaults to 1e-6.
+        Under `requires_grad`, the stationarity residual each substep converges to, relative to the force imbalance
+        the substep started with (floored by the noise of the force assembly). Also the relative tolerance of the adjoint solve.
+        Defaults to 1e-6.
     max_dual_steps : int, optional
         Under `requires_grad`, the largest number of exact Uzawa dual updates per substep before failing. Defaults to 200.
     max_sweeps : int, optional
@@ -969,6 +973,7 @@ class VBDOptions(Options):
     constraint_dual_relaxation: PositiveFloat = 0.25
     angle_tol: PositiveFloat = 4e-5
     residual_tol: PositiveFloat = 1e-6
+    violation_tol: PositiveFloat = 1e-6
     max_sweeps: PositiveInt = 400
     max_dual_steps: PositiveInt = 200
 

@@ -18,7 +18,7 @@ N_STEPS = 3
 def _build(show_viewer):
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=3e-3, substeps=2, gravity=(0.0, 0.0, -9.81), requires_grad=True),
-        vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-9, max_sweeps=4000, contact_stiffness=2e3),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-12, violation_tol=1e-12, max_sweeps=4000, contact_stiffness=2e3),
         show_viewer=show_viewer,
     )
     box = scene.add_entity(

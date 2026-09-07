@@ -39,7 +39,7 @@ def _rig(show_viewer, substeps, k_fiber=0.0, constrained=False):
     # damping: the constrained rig must settle against its bounds instead of ringing off them
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=3e-3, substeps=substeps, gravity=(0.0, 0.0, -9.81), requires_grad=True),
-        vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-9, max_sweeps=4000, contact_stiffness=2e3, damping=0.01 if constrained else 0.0),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-12, violation_tol=1e-12, max_sweeps=4000, contact_stiffness=2e3, damping=0.01 if constrained else 0.0),
         show_viewer=show_viewer,
     )
     box = scene.add_entity(
@@ -144,6 +144,9 @@ def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_vie
 
     def rollout(x0, v0, actu):
         solver._kernel_set_state(0, x0.contiguous(), v0.contiguous())
+        # the multipliers are solver state that survives a rollout: without this every finite-difference evaluation
+        # starts from the multipliers the previous one left, and the difference measures that drift, not the gradient
+        solver.reset_constraints(torch.ones(1, dtype=torch.bool, device=gs.device))
         solver.set_actuation(np.array([[actu]], dtype=np.float64))
         for f in range(substeps):
             solver.substep_pre_coupling(f)
@@ -152,7 +155,7 @@ def test_adjoint_gradients_match_finite_differences_over_three_substeps(show_vie
 
     L0, x_end, v_end = rollout(x0, v0, 0.5)
     if constrained:
-        assert solver.constraint_error() < 1e-9 and solver.angle_constraint_error() < 1e-9
+        assert solver.constraint_error() < 1e-6 and solver.angle_constraint_error() < 1e-6  # the tolerance is relative now
         mult = solver.cons_hist.mult.to_numpy()[1:, :, 0]  # the squash presses the bounded pair into its bound in substep 0
         k_eff = solver.cons_hist.k_eff.to_numpy()[1:, :, 0]
         assert (mult[:, 0] != 0.0).all() and mult[0, 1] != 0.0 and (k_eff[:, 2] == 0.0).all(), f"active set is not as designed: {mult}"
@@ -207,3 +210,33 @@ def test_record_is_taken_at_the_converged_state_even_without_a_sweep(show_viewer
     scene.step()
     assert solver.cons_hist.mult.to_numpy()[1, 0, 0] == 0.0
     assert solver.cons_hist.k_eff.to_numpy()[1, 0, 0] == solver._k_start
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_the_solve_tolerance_is_relative_to_the_body(show_viewer):
+    """The same tolerance must mean the same accuracy on bodies of different mass and different constraint length.
+    An absolute newton tolerance asks a heavy body for a hundred times more digits than a light one, which is why
+    the full snake could not be differentiated at all."""
+    errors = {}
+    for rho, size in ((1e3, 0.1), (1e6, 0.5)):  # a 1 kg block and a 125 t one, five times longer
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=3e-3, substeps=1, gravity=(0.0, 0.0, -9.81), requires_grad=True),
+            vbd_options=gs.options.VBDOptions(n_iterations=4, residual_tol=1e-6, violation_tol=1e-6, max_sweeps=4000, contact_stiffness=2e5),
+            show_viewer=show_viewer,
+        )
+        box = scene.add_entity(
+            material=gs.materials.VBD.Base(E=2e4, nu=0.3, rho=rho),
+            morph=gs.morphs.Box(size=(size, size, size), pos=(0.0, 0.0, 0.48 * size), nobisect=False, maxvolume=0.3 * size**3),  # pressed into the floor: a real imbalance to solve
+        )
+        p = tensor_to_array(box.init_positions)
+        box.add_distance_constraints(np.array([[int(np.argmin(p[:, 0])), int(np.argmax(p[:, 0]))]]))
+        scene.build()
+        scene.step()
+        solver = scene.vbd_solver
+        errors[rho] = (solver.constraint_error() / size, float(solver.residual[None]) / solver._force_ref)
+    light, heavy = errors[1e3], errors[1e6]
+    print(f"strain error: light={light[0]:.2e} heavy={heavy[0]:.2e}; relative force residual: light={light[1]:.2e} heavy={heavy[1]:.2e}", flush=True)
+    # both bodies are solved to the tolerance they were asked for, in their own units: an absolute newton tolerance
+    # would put the heavy body 1e5 times worse in strain, or out of reach of float64 entirely
+    assert max(light[0], heavy[0]) < 1e-6 and max(light[1], heavy[1]) < 1e-6
