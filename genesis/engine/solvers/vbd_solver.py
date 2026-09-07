@@ -78,6 +78,14 @@ class VBDSolver(Solver):
         self.z = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # adjoint of the stationarity condition
         self.gbar = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # its right-hand side
         self.adj_residual = qd.field(dtype=qd.f64, shape=())
+        # Replay buffer for the solver-level adjoint: the update applied to each vertex at each sweep of each
+        # substep. The reverse pass walks it backwards, subtracting each update to recover the state the forward
+        # linearised at, so the block itself is recomputed rather than stored (24 bytes a vertex a sweep, not 72).
+        self._record_sweeps = self._sim.requires_grad
+        self.sweep_dx = qd.Vector.field(
+            3, dtype=qd.f64,
+            shape=(self._sim.substeps_local, self._n_iterations, self._n_vertices, self._B) if self._record_sweeps else (1, 1, 1, 1),
+        )
 
     def init_element_fields(self):
         struct_elem_info = qd.types.struct(
@@ -749,11 +757,15 @@ class VBDSolver(Solver):
         return blk
 
     @qd.func
-    def _func_solve_vertex(self, f, i_v, i_b, w, ramp, record):
+    def _func_solve_vertex(self, f, i_v, i_b, w, ramp, record, sweep):
         """One Newton step of vertex i_v, then the dual updates of the constraints it owns (relaxation w, stiffness
-        ramp on or off), recording their multipliers for the adjoint when `record` is set. w = 0 skips the duals."""
+        ramp on or off), recording their multipliers for the adjoint when `record` is set. w = 0 skips the duals.
+        `sweep` is the index of this sweep within the substep, for the replay buffer."""
         force, H, K_unused = self._func_vertex_system(f, i_v, i_b)
-        self.verts[f + 1, i_v, i_b].pos += qd.cast(H.inverse() @ force, gs.qd_float)
+        dx = H.inverse() @ force
+        if qd.static(self._record_sweeps):
+            self.sweep_dx[f, sweep, i_v, i_b] = qd.cast(dx, qd.f64)
+        self.verts[f + 1, i_v, i_b].pos += qd.cast(dx, gs.qd_float)
         if w > 0.0:
             for c in range(self.vo_offset[i_v], self.vo_offset[i_v + 1]):
                 i_c = self.vo_cons[c]
@@ -775,7 +787,7 @@ class VBDSolver(Solver):
     def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
         """One color of one sweep. Kept for tests that watch the energy sweep by sweep."""
         for k, i_b in qd.ndrange((lo, hi), self._B):
-            self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, True)
+            self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, True, 0)
 
     @qd.func
     def _func_constraint_mult(self, i_c, i_b, dist):
@@ -845,7 +857,7 @@ class VBDSolver(Solver):
         for sweep in qd.static(range(self._n_iterations)):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, sweep == self._n_iterations - 1)
+                    self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, sweep == self._n_iterations - 1, sweep)
 
     @qd.func
     def _func_record_constraint(self, f, i_c, i_b):
@@ -893,10 +905,10 @@ class VBDSolver(Solver):
     def _kernel_primal_sweeps(self, f: qd.i32):
         """`n_iterations` sweeps with the multipliers held fixed: the inner solve of the exact Uzawa iteration used
         under requires_grad. The constraint record is taken by `solve()` when it returns."""
-        for _ in qd.static(range(self._n_iterations)):
+        for sweep in qd.static(range(self._n_iterations)):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    self._func_solve_vertex(f, self.color_perm[k], i_b, 0.0, 0.0, False)
+                    self._func_solve_vertex(f, self.color_perm[k], i_b, 0.0, 0.0, False, sweep)
 
     @qd.kernel
     def _kernel_dual_update(self, f: qd.i32):
@@ -923,6 +935,13 @@ class VBDSolver(Solver):
         """Clear the constraint multipliers and stiffness ramps of the environments where `envs_mask` (bool tensor of
         shape (n_envs,)) is true: a body put back to its rest state must not keep the tensions of its last episode."""
         self._kernel_reset_constraints(envs_mask.to(torch.int32).contiguous())
+
+    @qd.kernel
+    def _kernel_undo_sweep(self, f: qd.i32, sweep: qd.i32):
+        """Subtract the updates one sweep applied, so the positions return to what that sweep started from. The
+        reverse pass uses this to recover each block's linearisation point without storing any position."""
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.verts[f + 1, i_v, i_b].pos -= qd.cast(self.sweep_dx[f, sweep, i_v, i_b], gs.qd_float)
 
     @qd.kernel
     def _kernel_warm_start(self):

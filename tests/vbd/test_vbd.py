@@ -421,3 +421,23 @@ def test_rayleigh_damping_refuses_a_poisson_ratio_below_one_eighth(show_viewer):
     scene.add_entity(material=gs.materials.VBD.Base(E=1e5, nu=0.1), morph=gs.morphs.Box(size=(0.1, 0.05, 0.05), pos=(0.0, 0.0, 0.1), nobisect=False, maxvolume=1e-4))
     with pytest.raises(gs.GenesisException):
         scene.build()
+
+
+def test_the_replay_buffer_reproduces_the_forward_states(show_viewer):
+    """The solver-level adjoint walks the sweeps backwards and recovers each linearisation point by subtracting the
+    update that sweep applied. That is only sound if the recorded updates reproduce the forward exactly."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=3e-3, substeps=1, gravity=(0.0, 0.0, -9.81), requires_grad=True),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, grad_converge=False, contact_stiffness=2e3),
+        show_viewer=show_viewer,
+    )
+    box = scene.add_entity(material=gs.materials.VBD.Base(E=2e4, nu=0.3), morph=gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, 0.048), nobisect=False, maxvolume=3e-4))
+    scene.build()
+    solver = scene.vbd_solver
+    solver._kernel_predict(0)
+    predicted = solver.verts.pos.to_numpy()[1].copy()
+    solver._kernel_sweeps(0)
+    for sweep in reversed(range(4)):
+        solver._kernel_undo_sweep(0, sweep)
+    np.testing.assert_allclose(solver.verts.pos.to_numpy()[1], predicted, atol=1e-14)
+    assert np.abs(solver.sweep_dx.to_numpy()).max() > 1e-6, "the buffer must hold real updates, not zeros"
