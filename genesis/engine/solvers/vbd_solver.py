@@ -1409,6 +1409,27 @@ class VBDSolver(Solver):
             V = self.elems_info[i_e].vol_rest
             w_i = self._func_vertex_weight(B, role)
             q_i = qd.cast(cof @ w_i, qd.f64)
+            if self.elems_info[i_e].k_fiber > 0.0:
+                # the fibre block is c u u^T with u the normalised fibre direction, so it depends on the state and
+                # its tangent does not vanish on the diagonal the way the elastic one does
+                B0f = self.elems_info[i_e].B_rest
+                af = self.elems_info[i_e].fiber
+                w0_i = self._func_vertex_weight(B0f, role)
+                vf = self.elems_info[i_e].v
+                p0f = self.verts[f + 1, vf[0], i_b].pos
+                F0f = qd.Matrix.cols([self.verts[f + 1, vf[1], i_b].pos - p0f, self.verts[f + 1, vf[2], i_b].pos - p0f, self.verts[f + 1, vf[3], i_b].pos - p0f]) @ B0f
+                uf = F0f @ af
+                lf = uf.norm()
+                uh = qd.cast(uf / lf, qd.f64)
+                cf_i = qd.cast(self.elems_info[i_e].vol_rest * self.elems_info[i_e].k_fiber * w0_i.dot(af) ** 2, qd.f64)
+                perp_p = p - uh.dot(p) * uh
+                perp_dx = dx - uh.dot(dx) * uh
+                base = cf_i / qd.cast(lf, qd.f64) * (uh.dot(dx) * perp_p + uh.dot(p) * perp_dx)
+                for r in qd.static(range(4)):
+                    scale = qd.cast(self._func_vertex_weight_static(B0f, r).dot(af), qd.f64)
+                    jf = self.elems_info[i_e].v[r]
+                    for d in qd.static(range(3)):
+                        qd.atomic_add(self.xb[jf, i_b][d], -scale * base[d])
             for r in qd.static(range(4)):
                 if r != role:
                     j = self.elems_info[i_e].v[r]
@@ -1421,8 +1442,74 @@ class VBDSolver(Solver):
                     grad_t = Vd * (qd.cast(mu * w_i.dot(w_j), qd.f64) * p + lamd * q_i.dot(p) * q_j + lamd * qd.cast(J - alpha, qd.f64) * a.cross(p))
                     # Hessian tangent: only q_i depends on the state, and it vanishes on the diagonal
                     hess_t = Vd * lamd * (q_i.dot(dx) * a.cross(p) + q_i.dot(p) * a.cross(dx))
+                    if self.elems_info[i_e].k_fiber > 0.0:
+                        # the fibre off-diagonal is symmetric, so its transpose is itself
+                        B0 = self.elems_info[i_e].B_rest
+                        aa = self.elems_info[i_e].fiber
+                        wi0 = self._func_vertex_weight(B0, role)
+                        wj0 = self._func_vertex_weight_static(B0, r)
+                        v0 = self.elems_info[i_e].v
+                        p00 = self.verts[f + 1, v0[0], i_b].pos
+                        F0 = qd.Matrix.cols([self.verts[f + 1, v0[1], i_b].pos - p00, self.verts[f + 1, v0[2], i_b].pos - p00, self.verts[f + 1, v0[3], i_b].pos - p00]) @ B0
+                        u = F0 @ aa
+                        l = u.norm()
+                        u_hat = qd.cast(u / l, qd.f64)
+                        cf = qd.cast(V * self.elems_info[i_e].k_fiber * wi0.dot(aa) * wj0.dot(aa), qd.f64)
+                        grad_t += cf * (u_hat.dot(p) * u_hat + qd.cast((l - 1.0) / l, qd.f64) * (p - u_hat.dot(p) * u_hat))
+                    if qd.static(self._damping > 0.0):
+                        # Rayleigh damping uses the constant rest Hessian, whose transpose is the swap of its arguments
+                        B0 = self.elems_info[i_e].B_rest
+                        w0_i = self._func_vertex_weight(B0, role)
+                        w0_j = self._func_vertex_weight_static(B0, r)
+                        kd_h = qd.cast(self._damping / self._substep_dt, qd.f64)
+                        damp_t = kd_h * (qd.cast(self._func_rest_block(i_e, w0_j, w0_i), qd.f64) @ p)
+                        grad_t += damp_t
+                        for d in qd.static(range(3)):  # the same block is how the previous position enters
+                            qd.atomic_add(self.adj[f, j, i_b].pos[d], damp_t[d])
                     for d in qd.static(range(3)):
                         qd.atomic_add(self.xb[j, i_b][d], -grad_t[d] - hess_t[d])
+
+    @qd.func
+    def _func_friction_tangent(self, f, i_v, i_b, p, dx):
+        """The friction block is lam_n g P, and all three factors move with the state: the normal force with the
+        penetration depth, g with the sliding speed, and the forward-backward blend with the tanh. The tangent is the
+        gradient of the scalar p^T H dx, so it is three terms. Returns its parts for the current and the previous
+        position; the previous one carries the opposite sign, because the slide is their difference."""
+        tangent = qd.Vector.zero(qd.f64, 3)
+        tangent_prev = qd.Vector.zero(qd.f64, 3)
+        x = self.verts[f + 1, i_v, i_b].pos
+        d = self._floor_height - x[2]
+        if d > 0.0:
+            k = self._contact_stiffness
+            lam_n = k * d
+            slide = x - self.verts[f, i_v, i_b].pos
+            slide[2] = 0.0
+            t = self.verts_info[i_v].tangent
+            t[2] = 0.0
+            t = t.normalized()
+            b = qd.Vector([-t[1], t[0], 0.0], dt=gs.qd_float)
+            u_norm = slide.norm()
+            eps = self._friction_eps_v * self._substep_dt
+            g = 1.0 / u_norm
+            dg = -1.0 / (u_norm * u_norm)
+            if u_norm < eps:
+                g = 2.0 / eps - u_norm / (eps * eps)
+                dg = -1.0 / (eps * eps)
+            mu_f = self.verts_info[i_v].mu_forward
+            mu_bw = self.verts_info[i_v].mu_backward
+            th = qd.tanh(slide.dot(t) / eps)
+            mu_ax = 0.5 * (mu_f + mu_bw) + 0.5 * (mu_f - mu_bw) * th
+            dmu_ax = 0.5 * (mu_f - mu_bw) * (1.0 - th * th) / eps
+            td = qd.cast(t, qd.f64)
+            bd = qd.cast(b, qd.f64)
+            A = qd.cast(mu_ax, qd.f64) * td.dot(p) * td.dot(dx) + qd.cast(self.verts_info[i_v].mu_lateral, qd.f64) * bd.dot(p) * bd.dot(dx)
+            e_z = qd.Vector([0.0, 0.0, 1.0], dt=qd.f64)
+            by_depth = -qd.cast(k, qd.f64) * qd.cast(g, qd.f64) * A * e_z
+            by_slide = qd.cast(lam_n, qd.f64) * A * qd.cast(dg, qd.f64) / qd.max(qd.cast(u_norm, qd.f64), 1e-300) * qd.cast(slide, qd.f64)
+            by_blend = qd.cast(lam_n * g * dmu_ax, qd.f64) * td.dot(p) * td.dot(dx) * td
+            tangent = by_depth + by_slide + by_blend
+            tangent_prev = -(by_slide + by_blend)
+        return tangent, tangent_prev
 
     @qd.kernel
     def _kernel_reverse_init(self, f: qd.i32):
@@ -1446,6 +1533,16 @@ class VBDSolver(Solver):
             self.xb[i_v, i_b] = xbar - self._func_diag_block(f, i_v, i_b).transpose() @ p
             # the predictor enters every block through the inertia term, dg_i/dy = -m/h^2
             self.yb[i_v, i_b] += qd.cast(self.verts_info[i_v].mass / (self._substep_dt * self._substep_dt), qd.f64) * p
+            # friction and damping read the previous position, so every block scatters to it as well
+            lam_n, A_f, coupling_unused = self._func_friction_terms(f, i_v, i_b)
+            if lam_n > 0.0:
+                self.adj[f, i_v, i_b].pos += A_f.transpose() @ p
+                fr_t, fr_prev = self._func_friction_tangent(f, i_v, i_b, p, dx)
+                self.xb[i_v, i_b] -= fr_t
+                self.adj[f, i_v, i_b].pos -= fr_prev
+            if qd.static(self._damping > 0.0):
+                force_u, H_u, K0_ii = self._func_vertex_system(f, i_v, i_b)
+                self.adj[f, i_v, i_b].pos += qd.cast(self._damping / self._substep_dt, qd.f64) * (qd.cast(K0_ii, qd.f64) @ p)
             self._func_scatter_reverse(f, i_v, i_b, p, dx)
 
     @qd.kernel
