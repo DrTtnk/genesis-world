@@ -50,6 +50,7 @@ class VBDSolver(Solver):
         self._max_sweeps = options.max_sweeps
         self._max_dual_steps = options.max_dual_steps
         self._violation_tol = options.violation_tol
+        self._grad_converge = options.grad_converge
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
@@ -1023,8 +1024,8 @@ class VBDSolver(Solver):
         sweeps to a relative force tolerance, one dual update, until the relative constraint violation is below its
         own tolerance too. (A dual update on an unconverged iterate overshoots at the stiffness cap and limit-cycles
         instead of converging.)"""
-        if not self._sim.requires_grad:
-            self._kernel_sweeps(f)
+        if not self._sim.requires_grad or not self._grad_converge:
+            self._kernel_sweeps(f)  # the fast path: a fixed number of sweeps, the duals fused into the colour passes
             return
         # The force scale of this substep: the imbalance left at the predicted position, floored by the body's own
         # weight so that a body already at rest still has a finite scale. An absolute newton tolerance is meaningless

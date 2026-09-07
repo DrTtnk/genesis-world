@@ -947,6 +947,10 @@ class VBDOptions(Options):
     constraint_dual_relaxation : float, optional
         Factor on the dual update lam += relaxation * k * C. Below 1 slows the multiplier when the primal sweeps
         between updates are few. Defaults to 0.25, which keeps rigid clusters of constraints stable at two sweeps.
+    grad_converge : bool, optional
+        Whether a substep converges under `requires_grad`. True, the default, is what the present
+        adjoint needs, because it differentiates the converged stationarity condition. False runs the
+        fast fixed-sweep path, which is what a solver-level adjoint differentiates. Defaults to True.
     violation_tol : float, optional
         Under `requires_grad`, the relative constraint violation each substep converges to: strain for a distance
         constraint, radians for an angle constraint. Defaults to 1e-6.
@@ -974,6 +978,7 @@ class VBDOptions(Options):
     angle_tol: PositiveFloat = 4e-5
     residual_tol: PositiveFloat = 1e-6
     violation_tol: PositiveFloat = 1e-6
+    grad_converge: bool = True
     max_sweeps: PositiveInt = 400
     max_dual_steps: PositiveInt = 200
 
