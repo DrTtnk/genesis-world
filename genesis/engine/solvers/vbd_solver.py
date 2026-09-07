@@ -115,6 +115,10 @@ class VBDSolver(Solver):
             half_length=gs.qd_float,  # 0 makes it a sphere
         )
         self.bolus = struct_bolus.field(shape=(self._B,))
+        # The reaction the body exerts on the bolus, so a caller can let it move under the forces the
+        # wall applies instead of scripting its path. A scripted bolus is infinitely strong: it tows
+        # the body when it travels, and cannot be transported when it is held.
+        self.bolus_force = qd.Vector.field(3, dtype=qd.f64, shape=(self._B,))
         self.muscle_actu_adj = qd.field(dtype=qd.f64, shape=(max(self._n_muscle_groups, 1), self._B))
         self.energy = qd.field(dtype=qd.f64, shape=(self._B,))
 
@@ -1028,6 +1032,41 @@ class VBDSolver(Solver):
         """Largest absolute distance-constraint error (m) at the current end-of-substep positions, over all envs."""
         self._kernel_constraint_error(self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1)
         return float(self.cons_error[None])
+
+    @qd.kernel
+    def _kernel_bolus_reaction(self, f: qd.i32):
+        """Total force the body applies to the bolus: the negative of the contact and friction forces it
+        applies to the body, summed over the vertices touching it."""
+        for i_b in range(self._B):
+            self.bolus_force[i_b] = qd.Vector.zero(qd.f64, 3)
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            r_b = self.bolus[i_b].radius
+            if r_b > 0.0:
+                x = self.verts[f + 1, i_v, i_b].pos
+                rel = x - self.bolus[i_b].center
+                along = qd.min(qd.max(rel.dot(self.bolus[i_b].axis), -self.bolus[i_b].half_length), self.bolus[i_b].half_length)
+                rel = rel - along * self.bolus[i_b].axis
+                dist = rel.norm()
+                pen = r_b - dist
+                if pen > 0.0:
+                    k = self._contact_stiffness
+                    n_b = rel / dist
+                    on_body = qd.cast(k * pen, qd.f64) * qd.cast(n_b, qd.f64)
+                    slide = x - self.verts[f, i_v, i_b].pos - self.bolus[i_b].vel * self._substep_dt
+                    slide -= slide.dot(n_b) * n_b
+                    u_norm = slide.norm()
+                    eps = self._friction_eps_v * self._substep_dt
+                    g = 1.0 / u_norm
+                    if u_norm < eps:
+                        g = 2.0 / eps - u_norm / (eps * eps)
+                    on_body -= qd.cast(k * pen * self.bolus[i_b].friction * g, qd.f64) * qd.cast(slide, qd.f64)
+                    for d in qd.static(range(3)):
+                        qd.atomic_add(self.bolus_force[i_b][d], -on_body[d])
+
+    def bolus_reaction(self):
+        """The force the body is applying to the bolus, shape (B, 3), from the state of the last substep."""
+        self._kernel_bolus_reaction(self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1)
+        return self.bolus_force.to_numpy()
 
     @qd.kernel
     def _kernel_update_velocity(self, f: qd.i32):
