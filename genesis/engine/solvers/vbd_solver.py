@@ -151,6 +151,13 @@ class VBDSolver(Solver):
         self.cons_hist = struct_cons_hist.field(shape=(frames, n, self._B), layout=qd.Layout.SOA)
         self.acons_hist = struct_cons_hist.field(shape=(frames, na, self._B), layout=qd.Layout.SOA)
         self.cons_zeta = qd.field(dtype=qd.f64, shape=(n, self._B))
+        # The multiplier state at the start of every sweep: every position update in that sweep used it, because a
+        # constraint's dual update runs in the colour pass of its owner, the last of its vertices to move.
+        rec = qd.types.struct(lam_hi=gs.qd_float, lam_lo=gs.qd_float, k=gs.qd_float)
+        bar = qd.types.struct(lam_hi=qd.f64, lam_lo=qd.f64, k=qd.f64)
+        shape = (self._sim.substeps_local, self._n_iterations, n, self._B) if self._sim.requires_grad else (1, 1, 1, 1)
+        self.cons_rec = rec.field(shape=shape, layout=qd.Layout.SOA)
+        self.cons_bar = bar.field(shape=(n, self._B), layout=qd.Layout.SOA)
         self.acons_zeta = qd.field(dtype=qd.f64, shape=(na, self._B))
 
     def init_vvert_fields(self):
@@ -857,6 +864,11 @@ class VBDSolver(Solver):
         constraints' dual updates ride inside the color pass of their owner vertex (see `_owner_csr`): a pass of
         their own would be a few thousand threads behind a barrier, and cost half the step on the ladder body."""
         for sweep in qd.static(range(self._n_iterations)):
+            if qd.static(self._record_sweeps and self._n_constraints > 0):
+                for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+                    self.cons_rec[f, sweep, i_c, i_b].lam_hi = self.cons[i_c, i_b].lam_hi
+                    self.cons_rec[f, sweep, i_c, i_b].lam_lo = self.cons[i_c, i_b].lam_lo
+                    self.cons_rec[f, sweep, i_c, i_b].k = self.cons[i_c, i_b].k
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
                     self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, sweep == self._n_iterations - 1, sweep)
@@ -1187,7 +1199,7 @@ class VBDSolver(Solver):
     @qd.func
     def _func_diag_block(self, f, i_v, i_b):
         """Exact J_ii = dr_i/dx_i: the forward Hessian with the friction block replaced by its exact derivative and
-        the constraints' positive semidefinite proxies replaced by their exact curvature at the recorded multipliers."""
+        the constraints' positive semidefinite proxies replaced by their exact curvature."""
         force_unused, H, K_unused = self._func_vertex_system(f, i_v, i_b)
         for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
             i_e = self.ve_elem[c]
@@ -1211,6 +1223,76 @@ class VBDSolver(Solver):
             for t in qd.static(range(2)):
                 if self.cons_info[i_c].v[t] == i_v:
                     H += self._func_distance_block(f, i_c, i_b, s, t)
+        for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
+            i_c = self.va_cons[c]
+            slot = self.va_slot[c]
+            u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+            mult, _ = self._func_angle_mult(i_c, i_b, qd.cast(cosv, gs.qd_float))
+            g = self._func_angle_slot_grad(slot, u_hat, v_hat, lu, lv, cosv)
+            if mult != 0.0:
+                H -= qd.cast(self.acons[i_c, i_b].k, qd.f64) * g.outer_product(g)
+            own = u_hat
+            scale = lu
+            if slot >= 2:
+                own = v_hat
+                scale = lv
+            H -= (qd.abs(qd.cast(mult, qd.f64)) / (scale * scale)) * (qd.Matrix.identity(qd.f64, 3) - own.outer_product(own))
+            vq = self.acons_info[i_c].v
+            for t in qd.static(range(4)):
+                if vq[t] == i_v:
+                    H += self._func_angle_block(f, i_c, i_b, slot, t)
+        lam_n, A_f, coupling = self._func_friction_terms(f, i_v, i_b)
+        if lam_n > 0.0:
+            # remove the forward's symmetric friction approximation (lam_n g P) and add the exact terms
+            x = self.verts[f + 1, i_v, i_b].pos
+            slide = x - self.verts[f, i_v, i_b].pos
+            slide[2] = 0.0
+            t = self.verts_info[i_v].tangent
+            t[2] = 0.0
+            t = t.normalized()
+            b = qd.Vector([-t[1], t[0], 0.0], dt=gs.qd_float)
+            u_norm = slide.norm()
+            eps = self._friction_eps_v * self._substep_dt
+            g = 1.0 / u_norm
+            if u_norm < eps:
+                g = 2.0 / eps - u_norm / (eps * eps)
+            th = qd.tanh(slide.dot(t) / eps)
+            mu_ax = 0.5 * (self.verts_info[i_v].mu_forward + self.verts_info[i_v].mu_backward) + 0.5 * (
+                self.verts_info[i_v].mu_forward - self.verts_info[i_v].mu_backward
+            ) * th
+            P = mu_ax * t.outer_product(t) + self.verts_info[i_v].mu_lateral * b.outer_product(b)
+            H -= qd.cast(lam_n * g, qd.f64) * qd.cast(P, qd.f64)
+            H += A_f + coupling
+        return qd.cast(H, qd.f64)
+
+    @qd.func
+    def _func_diag_block_live(self, f, i_v, i_b):
+        """`_func_diag_block` with the multiplier state taken from the solver rather than from the end-of-substep
+        record. The reverse sweep needs this, because every sweep used the state it started from, and the record
+        holds only the state the substep ended with."""
+        force_unused, H, K_unused = self._func_vertex_system(f, i_v, i_b)
+        for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
+            i_e = self.ve_elem[c]
+            if self.elems_info[i_e].k_fiber > 0.0:
+                w0 = self._func_vertex_weight(self.elems_info[i_e].B_rest, self.ve_role[c])
+                _, H_exact, H_psd = self._func_fiber_terms(f + 1, i_e, i_b, w0)
+                H += qd.cast(H_exact - H_psd, qd.f64)  # the forward kept only the PSD part
+        for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
+            i_c = self.vc_cons[c]
+            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            dist = e.norm()
+            n = qd.cast(e / dist, qd.f64)
+            nn = n.outer_product(n)
+            mult, _ = self._func_constraint_mult(i_c, i_b, dist)
+            if mult != 0.0:
+                H -= qd.cast(self.cons[i_c, i_b].k, qd.f64) * nn
+            H -= qd.cast(qd.abs(mult) / dist, qd.f64) * (qd.Matrix.identity(qd.f64, 3) - nn)
+            s = 0
+            if self.vc_side[c] < 0.0:
+                s = 1
+            for t in qd.static(range(2)):
+                if self.cons_info[i_c].v[t] == i_v:
+                    H += self._func_distance_block_live(f, i_c, i_b, s, t)
         for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
             i_c = self.va_cons[c]
             slot = self.va_slot[c]
@@ -1511,12 +1593,135 @@ class VBDSolver(Solver):
             tangent_prev = -(by_slide + by_blend)
         return tangent, tangent_prev
 
+    @qd.func
+    def _func_distance_block_live(self, f, i_c, i_b, s, t):
+        """d g_s / d x_t of a distance constraint from the live multiplier state, which during the reverse pass is
+        the state that sweep started from. Symmetric, so it is its own transpose."""
+        e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+        dist = qd.cast(e.norm(), qd.f64)
+        n = qd.cast(e, qd.f64) / dist
+        nn = n.outer_product(n)
+        mult, violation_unused = self._func_constraint_mult(i_c, i_b, qd.cast(dist, gs.qd_float))
+        blk = (qd.cast(mult, qd.f64) / dist) * (qd.Matrix.identity(qd.f64, 3) - nn)
+        if mult != 0.0:
+            blk += qd.cast(self.cons[i_c, i_b].k, qd.f64) * nn
+        sign = 1.0
+        if s != t:
+            sign = -1.0
+        return sign * blk
+
+    @qd.func
+    def _func_distance_tangent(self, f, i_c, i_b, t, p, dx):
+        """The gradient with respect to vertex `t` of the scalar p^T H dx, where H is the constraint's part of the
+        block. Both k n n^T and the |mult| / dist proxy move with the position, so unlike the elastic block this
+        does not vanish on the diagonal."""
+        e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+        dist = qd.cast(e.norm(), qd.f64)
+        n = qd.cast(e, qd.f64) / dist
+        mult, violation_unused = self._func_constraint_mult(i_c, i_b, qd.cast(dist, gs.qd_float))
+        multd = qd.cast(mult, qd.f64)
+        kd_raw = qd.cast(self.cons[i_c, i_b].k, qd.f64)
+        kd = kd_raw
+        if mult == 0.0:
+            kd = 0.0
+        perp_p = p - n.dot(p) * n
+        perp_dx = dx - n.dot(dx) * n
+        A = n.dot(p) * n.dot(dx)
+        Bq = p.dot(dx)
+        sides = 1.0  # d|mult| / d(dist) is k times the number of unclamped sides, from the live state
+        if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
+            sides = 0.0
+            if kd_raw * (dist - qd.cast(self.cons_info[i_c].hi, qd.f64)) + qd.cast(self.cons[i_c, i_b].lam_hi, qd.f64) > 0.0:
+                sides += 1.0
+            if kd_raw * (dist - qd.cast(self.cons_info[i_c].lo, qd.f64)) + qd.cast(self.cons[i_c, i_b].lam_lo, qd.f64) < 0.0:
+                sides += 1.0
+        d_abs = kd_raw * sides
+        if multd < 0.0:
+            d_abs = -d_abs
+        grad = (kd - qd.abs(multd) / dist) * (n.dot(dx) * perp_p + n.dot(p) * perp_dx) / dist
+        grad += (Bq - A) * (d_abs - qd.abs(multd) / dist) / dist * n
+        sign = 1.0
+        if t != 0:
+            sign = -1.0
+        return sign * grad
+
+    @qd.kernel
+    def _kernel_restore_cons(self, f: qd.i32, sweep: qd.i32):
+        """Put the multiplier state back to what the given sweep started from."""
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            self.cons[i_c, i_b].lam_hi = self.cons_rec[f, sweep, i_c, i_b].lam_hi
+            self.cons[i_c, i_b].lam_lo = self.cons_rec[f, sweep, i_c, i_b].lam_lo
+            self.cons[i_c, i_b].k = self.cons_rec[f, sweep, i_c, i_b].k
+
+    @qd.kernel
+    def _kernel_reverse_dual(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
+        """Undo the dual updates owned by one colour, at the positions the step produced, which is what they read.
+
+        The forward updates the multiplier and then the stiffness, so the reverse undoes the stiffness first. Both
+        push on the position adjoint through the constraint's own gradient, and a clamped side or a capped stiffness
+        contributes nothing, because its derivative there is zero.
+        """
+        for kk, i_b in qd.ndrange((lo, hi), self._B):
+            i_v = self.color_perm[kk]
+            for c in range(self.vo_offset[i_v], self.vo_offset[i_v + 1]):
+                i_c = self.vo_cons[c]
+                va = self.cons_info[i_c].v[0]
+                vb = self.cons_info[i_c].v[1]
+                e = self.verts[f + 1, va, i_b].pos - self.verts[f + 1, vb, i_b].pos
+                dist = e.norm()
+                n = qd.cast(e / dist, qd.f64)
+                w = qd.cast(self._constraint_dual_relaxation, qd.f64)
+                kd = qd.cast(self.cons[i_c, i_b].k, qd.f64)
+                distd = qd.cast(dist, qd.f64)
+                hi_b = qd.cast(self.cons_info[i_c].hi, qd.f64)
+                lo_b = qd.cast(self.cons_info[i_c].lo, qd.f64)
+                push = 0.0
+
+                # the stiffness ramp came last in the forward, so it is undone first
+                mult_r_unused, violation = self._func_constraint_mult(i_c, i_b, dist)
+                beta = qd.cast(self._k_start / self._constraint_tol, qd.f64)
+                if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(self._constraint_k_max_ratio * self._k_start, qd.f64):
+                    sides_v = 1.0
+                    if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
+                        sides_v = 0.0
+                        if distd > hi_b:
+                            sides_v += 1.0
+                        if distd < lo_b:
+                            sides_v += 1.0
+                    s_v = 1.0
+                    if violation < 0.0:
+                        s_v = -1.0
+                    push += beta * s_v * sides_v * self.cons_bar[i_c, i_b].k
+                else:
+                    self.cons_bar[i_c, i_b].k = 0.0
+
+                # then the multiplier update, which read the stiffness as it was before the ramp
+                bar_hi = self.cons_bar[i_c, i_b].lam_hi
+                bar_lo = self.cons_bar[i_c, i_b].lam_lo
+                active = bar_hi
+                if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
+                    active = 0.0
+                    if qd.cast(self.cons[i_c, i_b].lam_hi, qd.f64) + w * kd * (distd - hi_b) > 0.0:
+                        active += bar_hi
+                    if qd.cast(self.cons[i_c, i_b].lam_lo, qd.f64) + w * kd * (distd - lo_b) < 0.0:
+                        active += bar_lo
+                push += w * kd * active
+                self.cons_bar[i_c, i_b].k += w * (distd - hi_b) * bar_hi
+
+                for d in qd.static(range(3)):
+                    qd.atomic_add(self.xb[va, i_b][d], push * n[d])
+                    qd.atomic_add(self.xb[vb, i_b][d], -push * n[d])
+
     @qd.kernel
     def _kernel_reverse_init(self, f: qd.i32):
         """The adjoint arriving at the end of the substep, and a clean accumulator for the predictor."""
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
             self.xb[i_v, i_b] = self.adj[f + 1, i_v, i_b].pos + self.adj[f + 1, i_v, i_b].vel / self._substep_dt
             self.yb[i_v, i_b] = qd.Vector.zero(qd.f64, 3)
+        for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+            self.cons_bar[i_c, i_b].lam_hi = 0.0
+            self.cons_bar[i_c, i_b].lam_lo = 0.0
+            self.cons_bar[i_c, i_b].k = 0.0
 
     @qd.kernel
     def _kernel_reverse_color(self, f: qd.i32, sweep: qd.i32, lo: qd.i32, hi: qd.i32):
@@ -1530,7 +1735,7 @@ class VBDSolver(Solver):
             dx = self.sweep_dx[f, sweep, i_v, i_b]
             # the block's own branch: identity minus the exact local Jacobian, which cancels exactly when the
             # solver's block is the true local Hessian, as it is for the elastic terms
-            self.xb[i_v, i_b] = xbar - self._func_diag_block(f, i_v, i_b).transpose() @ p
+            self.xb[i_v, i_b] = xbar - self._func_diag_block_live(f, i_v, i_b).transpose() @ p
             # the predictor enters every block through the inertia term, dg_i/dy = -m/h^2
             self.yb[i_v, i_b] += qd.cast(self.verts_info[i_v].mass / (self._substep_dt * self._substep_dt), qd.f64) * p
             # friction and damping read the previous position, so every block scatters to it as well
@@ -1544,6 +1749,41 @@ class VBDSolver(Solver):
                 force_u, H_u, K0_ii = self._func_vertex_system(f, i_v, i_b)
                 self.adj[f, i_v, i_b].pos += qd.cast(self._damping / self._substep_dt, qd.f64) * (qd.cast(K0_ii, qd.f64) @ p)
             self._func_scatter_reverse(f, i_v, i_b, p, dx)
+            for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
+                i_c = self.vc_cons[c]
+                s = 0
+                if self.vc_side[c] < 0.0:
+                    s = 1
+                e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+                nrm = qd.cast(e / e.norm(), qd.f64)
+                mult, violation_unused = self._func_constraint_mult(i_c, i_b, e.norm())
+                # the multiplier enters the block through the constraint force, d g_s / d lam = sigma_s n
+                sigma = qd.cast(self.vc_side[c], qd.f64)
+                An_l = nrm.dot(p) * nrm.dot(dx)
+                s_m = 1.0
+                if mult < 0.0:
+                    s_m = -1.0
+                # the multiplier reaches the block twice: through the constraint force, and through the |mult| / dist
+                # term of the Hessian, which is a tangent and is what the second sweep needs to be exact
+                dH_dlam = s_m / qd.cast(e.norm(), qd.f64) * (p.dot(dx) - An_l)
+                qd.atomic_add(self.cons_bar[i_c, i_b].lam_hi, -sigma * nrm.dot(p) - dH_dlam)
+                # the stiffness enters the same block, through the multiplier and through both Hessian terms
+                distd = qd.cast(e.norm(), qd.f64)
+                c_hi = distd - qd.cast(self.cons_info[i_c].hi, qd.f64)
+                An = nrm.dot(p) * nrm.dot(dx)
+                s_mult = 1.0
+                if mult < 0.0:
+                    s_mult = -1.0
+                dH_dk = An + s_mult * c_hi / distd * (p.dot(dx) - An)
+                qd.atomic_add(self.cons_bar[i_c, i_b].k, -sigma * c_hi * nrm.dot(p) - dH_dk)
+                for t in qd.static(range(2)):
+                    j = self.cons_info[i_c].v[t]
+                    tangent = self._func_distance_tangent(f, i_c, i_b, t, p, dx)
+                    contribution = -tangent
+                    if j != i_v:
+                        contribution -= self._func_distance_block_live(f, i_c, i_b, s, t).transpose() @ p
+                    for d in qd.static(range(3)):
+                        qd.atomic_add(self.xb[j, i_b][d], contribution[d])
 
     @qd.kernel
     def _kernel_reverse_finish(self, f: qd.i32):
@@ -1554,11 +1794,19 @@ class VBDSolver(Solver):
             self.adj[f, i_v, i_b].vel += total * self._substep_dt
 
     def substep_pre_coupling_grad_sweep(self, f):
-        """The solver-level adjoint of substep `f`: the sweeps and colours of the forward, in reverse."""
+        """The solver-level adjoint of substep `f`: the sweeps and colours of the forward, in reverse.
+
+        Within a colour the dual updates are undone first, because the forward ran them after the position step and
+        they read the position it produced. Only then is the step itself undone, which puts every block at the state
+        it linearised at."""
         self._kernel_reverse_init(f)
         for sweep in reversed(range(self._n_iterations)):
+            if self._n_constraints > 0:
+                self._kernel_restore_cons(f, sweep)
             for c in reversed(range(self._n_colors)):
                 lo, hi = self._color_offsets[c], self._color_offsets[c + 1]
+                if self._n_constraints > 0:
+                    self._kernel_reverse_dual(f, lo, hi)
                 self._kernel_undo_sweep(f, sweep, lo, hi)
                 self._kernel_reverse_color(f, sweep, lo, hi)
         self._kernel_reverse_finish(f)
