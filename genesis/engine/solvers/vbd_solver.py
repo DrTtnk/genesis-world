@@ -51,6 +51,11 @@ class VBDSolver(Solver):
         self._max_dual_steps = options.max_dual_steps
         self._violation_tol = options.violation_tol
         self._self_thickness = options.self_collision_thickness
+        if self._self_thickness > 0.0 and self._sim.requires_grad:
+            gs.raise_exception(
+                "Self-collision has no adjoint term yet (story S5), so requires_grad with "
+                "self_collision_thickness > 0 would give a wrong gradient."
+            )
         self._grad_converge = options.grad_converge
 
     # ------------------------------------------------------------------------------------
@@ -90,6 +95,13 @@ class VBDSolver(Solver):
         self.sweep_dx = qd.Vector.field(
             3, dtype=qd.f64,
             shape=(self._sim.substeps_local, self._n_iterations, self._n_vertices, self._B) if self._record_sweeps else (1, 1, 1, 1),
+        )
+        # Self-collision reads the partner from here, not from the live state. A contact pair is invisible to the
+        # static colouring, which is built from the tetrahedron graph and never saw the pair, so both sides can land
+        # in the same colour and be solved by the same launch. This buffer is refreshed at the start of every colour
+        # pass, so a partner is at most one colour pass stale and no thread reads what another thread is writing.
+        self.pos_lag = qd.Vector.field(
+            3, dtype=gs.qd_float, shape=(self._n_vertices, self._B) if self._self_thickness > 0.0 else (1, 1)
         )
 
     def init_element_fields(self):
@@ -765,7 +777,7 @@ class VBDSolver(Solver):
                     if self.vn_vert[c] == j:
                         touching_mesh = True
                 if j != i_v and not touching_mesh:
-                    e_s = x - self.verts[f + 1, j, i_b].pos
+                    e_s = x - self.pos_lag[j, i_b]
                     d_s = e_s.norm()
                     if d_s < self._self_thickness:
                         n_s = e_s / d_s
@@ -847,6 +859,9 @@ class VBDSolver(Solver):
     @qd.kernel
     def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
         """One color of one sweep. Kept for tests that watch the energy sweep by sweep."""
+        if qd.static(self._self_thickness > 0.0):
+            for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+                self.pos_lag[i_v, i_b] = self.verts[f + 1, i_v, i_b].pos
         for k, i_b in qd.ndrange((lo, hi), self._B):
             self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, True, 0)
 
@@ -927,6 +942,9 @@ class VBDSolver(Solver):
                     self.acons_rec[f, sweep, i_c, i_b].lam_lo = self.acons[i_c, i_b].lam_lo
                     self.acons_rec[f, sweep, i_c, i_b].k = self.acons[i_c, i_b].k
             for c in qd.static(range(self._n_colors)):
+                if qd.static(self._self_thickness > 0.0):
+                    for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+                        self.pos_lag[i_v, i_b] = self.verts[f + 1, i_v, i_b].pos
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
                     # the stiffness ramp is frozen when the sweeps are being differentiated: its coefficient is
                     # k_start / constraint_tol, about 3e9 on the snake, and it multiplies straight into the position

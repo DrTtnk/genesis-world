@@ -92,3 +92,35 @@ def test_a_single_cube_ignores_its_own_mesh_at_a_thickness_it_cannot_satisfy():
     pos = tensor_to_array(cube.get_positions())[0]
     assert np.isfinite(pos).all()
     assert np.abs(pos - rest).max() < 0.02
+
+
+@pytest.mark.required
+def test_contacting_vertices_share_a_colour_and_the_result_is_reproducible():
+    """Story S4. The vertex colouring is built from the tetrahedron graph, which never sees a contact
+    pair, so both sides of a contact can share a colour and be solved by the same parallel launch.
+    This scene shows that the case is common rather than rare: it must therefore be handled by
+    construction, which is what the `pos_lag` buffer does — a contact partner is read from a snapshot
+    taken at the start of the colour pass, so no thread reads a position another thread is writing.
+    VBD (Chen et al. 2024, section 5) and AVBD (Giles et al. 2025) take the same step on the write
+    side, by double buffering the position updates."""
+    scene, left, right = _two_cubes(THICK, gap=0.03, steps=1)
+    solver = scene.vbd_solver
+
+    perm = solver.color_perm.to_numpy()
+    colour = np.empty(solver.n_vertices, dtype=np.int64)
+    for c in range(solver.n_colors):
+        colour[perm[solver.color_offsets[c] : solver.color_offsets[c + 1]]] = c
+
+    a = tensor_to_array(left.get_positions())[0]
+    b = tensor_to_array(right.get_positions())[0]
+    touching = np.argwhere(np.linalg.norm(a[:, None, :] - b[None, :, :], axis=-1) < THICK)
+    shared = [(i, j) for i, j in touching if colour[i] == colour[left.n_vertices + j]]
+    assert len(touching) > 0, "the scene must be in contact for this test to say anything"
+    assert len(shared) > 0, "the hazard this test guards against is not present in this scene"
+
+    first = np.concatenate([a, b])
+    for _ in range(3):
+        scene.reset()
+        scene.step()
+        again = np.concatenate([tensor_to_array(e.get_positions())[0] for e in (left, right)])
+        assert np.array_equal(first, again)
