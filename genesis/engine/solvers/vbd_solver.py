@@ -84,6 +84,8 @@ class VBDSolver(Solver):
         # substep. The reverse pass walks it backwards, subtracting each update to recover the state the forward
         # linearised at, so the block itself is recomputed rather than stored (24 bytes a vertex a sweep, not 72).
         self._record_sweeps = self._sim.requires_grad
+        # the stiffness ramp is frozen while the sweeps are being differentiated, in the forward and in the reverse
+        self._ramp_active = not (self._record_sweeps and not self._grad_converge)
         self.sweep_dx = qd.Vector.field(
             3, dtype=qd.f64,
             shape=(self._sim.substeps_local, self._n_iterations, self._n_vertices, self._B) if self._record_sweeps else (1, 1, 1, 1),
@@ -285,6 +287,16 @@ class VBDSolver(Solver):
             edge = float(np.linalg.norm(self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 1], 0] - self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 0], 0], axis=1).mean())
             unit = float(self.verts_info.mass.to_numpy().max()) / self._substep_dt**2 * edge
             self._force_noise = unit * (1e-13 if gs.np_float == np.float64 else 1e-6)
+            # The sweep kernel inlines one copy of the whole per-vertex solve for every colour of every sweep, so the
+            # compiler's memory grows with their product. At 8 colours and 16 sweeps it reached 160 GB and the machine
+            # had to be rescued; fail here instead, with the two numbers that caused it.
+            unrolled = self._n_iterations * self._n_colors
+            if unrolled > 48:
+                gs.raise_exception(
+                    f"VBD would inline {unrolled} copies of the vertex solve ({self._n_iterations} sweeps x "
+                    f"{self._n_colors} colours). Compiling that needs tens of gigabytes. Use fewer sweeps, or more "
+                    f"substeps instead of more sweeps."
+                )
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
     def _init_constraints(self, cons, lo, hi):
@@ -879,7 +891,13 @@ class VBDSolver(Solver):
                     self.acons_rec[f, sweep, i_c, i_b].k = self.acons[i_c, i_b].k
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, sweep == self._n_iterations - 1, sweep)
+                    # the stiffness ramp is frozen when the sweeps are being differentiated: its coefficient is
+                    # k_start / constraint_tol, about 3e9 on the snake, and it multiplies straight into the position
+                    # adjoint, which makes the executed map wildly expansive (measured: 1e13 over one step against
+                    # 4.2 with the stiffness held). A fixed stiffness also converges better (useful_knowledge.md).
+                    self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation,
+                                            1.0 if qd.static(self._ramp_active) else 0.0,
+                                            sweep == self._n_iterations - 1, sweep)
 
     @qd.func
     def _func_record_constraint(self, f, i_c, i_b):
@@ -1485,6 +1503,49 @@ class VBDSolver(Solver):
     # off-diagonal elastic block already uses. Nothing global is assembled and the forward need not converge.
 
     @qd.func
+    def _func_actuation_reverse(self, f, i_v, i_b, p, dx):
+        """The muscle command reaches a block twice, through the rest shape it contracts: once in the local gradient
+        and once in the local Hessian, since both are built from the actuated weights. The second is the tangent."""
+        for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
+            i_e = self.ve_elem[c]
+            group = self.elems_info[i_e].group
+            if group >= 0:
+                role = self.ve_role[c]
+                s_ = 1.0 - self.muscle_actu[group, i_b] * self.elems_info[i_e].gain
+                m = self.elems_info[i_e].fiber
+                mmT = m.outer_product(m)
+                I3 = qd.Matrix.identity(gs.qd_float, 3)
+                A_dot = self.elems_info[i_e].gain * ((1.0 / (s_ * s_)) * mmT - (0.5 / qd.sqrt(s_)) * (I3 - mmT))
+                F, B = self._func_deformation(f + 1, i_e, i_b)
+                A = (1.0 / s_) * mmT + qd.sqrt(s_) * (I3 - mmT)
+                F_dot = (F @ A.inverse()) @ A_dot
+                mu = self.elems_info[i_e].mu
+                lam = self.elems_info[i_e].lam
+                alpha = 1.0 + mu / lam
+                cof = self._func_cofactor(F)
+                J = F.determinant()
+                P = mu * F + lam * (J - alpha) * cof
+                dcof = qd.Matrix.cols(
+                    [
+                        F_dot[:, 1].cross(F[:, 2]) + F[:, 1].cross(F_dot[:, 2]),
+                        F_dot[:, 2].cross(F[:, 0]) + F[:, 2].cross(F_dot[:, 0]),
+                        F_dot[:, 0].cross(F[:, 1]) + F[:, 0].cross(F_dot[:, 1]),
+                    ]
+                )
+                P_dot = mu * F_dot + lam * (cof * F_dot).sum() * cof + lam * (J - alpha) * dcof
+                w0 = self._func_vertex_weight(self.elems_info[i_e].B_rest, role)
+                w = self._func_vertex_weight(B, role)
+                dg = self.elems_info[i_e].vol_rest * (P_dot @ w + P @ (A_dot @ w0))
+                # the block Hessian is built from the same actuated weights, so it moves with the command too
+                dw = A_dot @ w0
+                q = qd.cast(cof @ w, qd.f64)
+                dq = qd.cast(dcof @ w + cof @ dw, qd.f64)
+                V = qd.cast(self.elems_info[i_e].vol_rest, qd.f64)
+                dH = V * (qd.cast(2.0 * mu * w.dot(dw), qd.f64) * p.dot(dx)
+                          + qd.cast(lam, qd.f64) * (dq.dot(p) * q.dot(dx) + q.dot(p) * dq.dot(dx)))
+                qd.atomic_add(self.muscle_actu_adj[group, i_b], -qd.cast(dg, qd.f64).dot(p) - dH)
+
+    @qd.func
     def _func_scatter_reverse(self, f, i_v, i_b, p, dx):
         """Scatter one block's two tangents to its neighbours. Elastic terms only for now."""
         for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
@@ -1719,6 +1780,8 @@ class VBDSolver(Solver):
                 # the stiffness ramp came last in the forward, so it is undone first
                 mult_r_unused, violation = self._func_constraint_mult(i_c, i_b, dist)
                 beta = qd.cast(self._k_start / self._constraint_tol, qd.f64)
+                if qd.static(not self._ramp_active):
+                    beta = 0.0
                 if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(self._constraint_k_max_ratio * self._k_start, qd.f64):
                     sides_v = 1.0
                     if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
@@ -1761,6 +1824,8 @@ class VBDSolver(Solver):
                 push = 0.0
                 mult_u, violation = self._func_angle_mult(i_c, i_b, qd.cast(cosv, gs.qd_float))
                 beta = qd.cast(self.acons_info[i_c].k0 / self._angle_tol, qd.f64)
+                if qd.static(not self._ramp_active):
+                    beta = 0.0
                 if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(self._constraint_k_max_ratio, qd.f64) * qd.cast(self.acons_info[i_c].k0, qd.f64):
                     sides_v = 1.0
                     if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
@@ -1832,6 +1897,7 @@ class VBDSolver(Solver):
                 force_u, H_u, K0_ii = self._func_vertex_system(f, i_v, i_b)
                 self.adj[f, i_v, i_b].pos += qd.cast(self._damping / self._substep_dt, qd.f64) * (qd.cast(K0_ii, qd.f64) @ p)
             self._func_scatter_reverse(f, i_v, i_b, p, dx)
+            self._func_actuation_reverse(f, i_v, i_b, p, dx)
             for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
                 i_c = self.vc_cons[c]
                 s = 0
@@ -2025,6 +2091,10 @@ class VBDSolver(Solver):
 
     def substep_pre_coupling_grad(self, f):
         if not self.is_active:
+            return
+        if not self._grad_converge:
+            # the forward ran a fixed number of sweeps, so the gradient of that computation is the reverse of it
+            self.substep_pre_coupling_grad_sweep(f)
             return
         self.cons_zeta.fill(0.0)
         self.acons_zeta.fill(0.0)
