@@ -291,7 +291,7 @@ class VBDSolver(Solver):
             # compiler's memory grows with their product. At 8 colours and 16 sweeps it reached 160 GB and the machine
             # had to be rescued; fail here instead, with the two numbers that caused it.
             unrolled = self._n_iterations * self._n_colors
-            if unrolled > 48:
+            if unrolled > 96:  # 70 has always compiled; 128 on the constrained snake reached 160 GB
                 gs.raise_exception(
                     f"VBD would inline {unrolled} copies of the vertex solve ({self._n_iterations} sweeps x "
                     f"{self._n_colors} colours). Compiling that needs tens of gigabytes. Use fewer sweeps, or more "
