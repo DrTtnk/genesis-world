@@ -951,6 +951,10 @@ class VBDOptions(Options):
         Whether a substep converges under `requires_grad`. True, the default, is what the present
         adjoint needs, because it differentiates the converged stationarity condition. False runs the
         fast fixed-sweep path, which is what a solver-level adjoint differentiates. Defaults to True.
+    self_collision_thickness : float, optional
+        Distance at which two vertices of the body push each other apart. Zero, the default, disables
+        self-collision entirely. Vertices sharing a tetrahedron are always exempt. The present
+        implementation compares every pair, so it is for small scenes until a broad phase exists.
     violation_tol : float, optional
         Under `requires_grad`, the relative constraint violation each substep converges to: strain for a distance
         constraint, radians for an angle constraint. Defaults to 1e-6.
@@ -978,6 +982,7 @@ class VBDOptions(Options):
     angle_tol: PositiveFloat = 4e-5
     residual_tol: PositiveFloat = 1e-6
     violation_tol: PositiveFloat = 1e-6
+    self_collision_thickness: float = 0.0
     grad_converge: bool = True
     max_sweeps: PositiveInt = 400
     max_dual_steps: PositiveInt = 200

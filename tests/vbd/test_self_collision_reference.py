@@ -14,7 +14,14 @@ import numpy as np
 import pytest
 import torch
 
-torch.set_default_dtype(torch.float64)
+
+@pytest.fixture(autouse=True)
+def _double_precision():
+    """Genesis sets the torch default dtype to float32 when it initialises, and that happens after
+    this module is imported, so the dtype has to be set per test rather than once at import."""
+    torch.set_default_dtype(torch.float64)
+
+
 K, THICK = 3.0e3, 0.05
 
 

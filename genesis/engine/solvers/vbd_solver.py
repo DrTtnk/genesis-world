@@ -50,6 +50,7 @@ class VBDSolver(Solver):
         self._max_sweeps = options.max_sweeps
         self._max_dual_steps = options.max_dual_steps
         self._violation_tol = options.violation_tol
+        self._self_thickness = options.self_collision_thickness
         self._grad_converge = options.grad_converge
 
     # ------------------------------------------------------------------------------------
@@ -284,6 +285,7 @@ class VBDSolver(Solver):
             self.ve_elem.from_numpy(ve_elem.astype(gs.np_int))
             self.ve_role = qd.field(dtype=gs.qd_int, shape=(len(ve_role),))
             self.ve_role.from_numpy(ve_role.astype(gs.np_int))
+            self._init_self_collision(elems)
             # The noise floor of the force assembly: no solve can drive the residual below the rounding error of the
             # terms it sums, so the relative tolerance is floored here. m/h^2 times a tet edge is the force that moves
             # a vertex one edge in one substep, the largest term in the sum; times the relative precision of the
@@ -302,6 +304,18 @@ class VBDSolver(Solver):
                     f"substeps instead of more sweeps."
                 )
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
+
+    def _init_self_collision(self, elems):
+        """Which vertices may not touch each other: those sharing a tetrahedron are held together by the
+        material and their proximity is the mesh, not a collision. Stored as a per-vertex sorted list so the
+        contact loop can skip them with a short scan."""
+        pairs = {(a, b) for a in range(4) for b in range(4) if a != b}
+        neighbours = np.unique(np.concatenate([elems[:, [a, b]] for a, b in sorted(pairs)]), axis=0)
+        offset = np.searchsorted(neighbours[:, 0], np.arange(self._n_vertices + 1))
+        self.vn_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
+        self.vn_offset.from_numpy(offset.astype(gs.np_int))
+        self.vn_vert = qd.field(dtype=gs.qd_int, shape=(len(neighbours),))
+        self.vn_vert.from_numpy(neighbours[:, 1].astype(gs.np_int))
 
     def _init_constraints(self, cons, lo, hi):
         """Bounds (rest length when the entity gave none), per-vertex CSR of incident constraints, and the stiffness
@@ -739,6 +753,25 @@ class VBDSolver(Solver):
                 qd.cast(mu_ax, self._acc) * qd.cast(t.outer_product(t), self._acc)
                 + qd.cast(self.verts_info[i_v].mu_lateral, self._acc) * qd.cast(b.outer_product(b), self._acc)
             )
+
+        # The body against itself: a quadratic penalty on the overlap of two spheres of the given thickness.
+        # Vertices that share a tetrahedron are skipped, because their closeness is the mesh rather than a
+        # collision. The exact block is indefinite while a pair overlaps, so only its positive semidefinite
+        # part is kept, as the floor and the fibre term already do.
+        if qd.static(self._self_thickness > 0.0):
+            for j in range(self._n_vertices):
+                touching_mesh = False
+                for c in range(self.vn_offset[i_v], self.vn_offset[i_v + 1]):
+                    if self.vn_vert[c] == j:
+                        touching_mesh = True
+                if j != i_v and not touching_mesh:
+                    e_s = x - self.verts[f + 1, j, i_b].pos
+                    d_s = e_s.norm()
+                    if d_s < self._self_thickness:
+                        n_s = e_s / d_s
+                        k_s = self._contact_stiffness
+                        force += qd.cast(k_s * (self._self_thickness - d_s), self._acc) * qd.cast(n_s, self._acc)
+                        H += qd.cast(k_s, self._acc) * qd.cast(n_s.outer_product(n_s), self._acc)
 
         # Analytic capsule bolus: the same penalty and IPC-smoothed isotropic Coulomb friction against a moving
         # capsule (sphere when half_length is 0). `rel` is the vector from the closest point of the segment.
