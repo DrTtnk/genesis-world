@@ -438,6 +438,7 @@ def test_the_replay_buffer_reproduces_the_forward_states(show_viewer):
     predicted = solver.verts.pos.to_numpy()[1].copy()
     solver._kernel_sweeps(0)
     for sweep in reversed(range(4)):
-        solver._kernel_undo_sweep(0, sweep)
+        for c in reversed(range(solver.n_colors)):
+            solver._kernel_undo_sweep(0, sweep, solver.color_offsets[c], solver.color_offsets[c + 1])
     np.testing.assert_allclose(solver.verts.pos.to_numpy()[1], predicted, atol=1e-14)
     assert np.abs(solver.sweep_dx.to_numpy()).max() > 1e-6, "the buffer must hold real updates, not zeros"

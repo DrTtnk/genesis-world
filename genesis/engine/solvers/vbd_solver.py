@@ -76,6 +76,8 @@ class VBDSolver(Solver):
         struct_adj = qd.types.struct(pos=qd.types.vector(3, qd.f64), vel=qd.types.vector(3, qd.f64))
         self.adj = struct_adj.field(shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA)
         self.z = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # adjoint of the stationarity condition
+        self.xb = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # running position adjoint of the reverse sweep
+        self.yb = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # adjoint of the predictor y
         self.gbar = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # its right-hand side
         self.adj_residual = qd.field(dtype=qd.f64, shape=())
         # Replay buffer for the solver-level adjoint: the update applied to each vertex at each sweep of each
@@ -937,10 +939,11 @@ class VBDSolver(Solver):
         self._kernel_reset_constraints(envs_mask.to(torch.int32).contiguous())
 
     @qd.kernel
-    def _kernel_undo_sweep(self, f: qd.i32, sweep: qd.i32):
-        """Subtract the updates one sweep applied, so the positions return to what that sweep started from. The
-        reverse pass uses this to recover each block's linearisation point without storing any position."""
-        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+    def _kernel_undo_sweep(self, f: qd.i32, sweep: qd.i32, lo: qd.i32, hi: qd.i32):
+        """Subtract the updates one colour of one sweep applied, so the positions return to what that colour started
+        from. Undoing the colours in reverse recovers each block's linearisation point, and stores no position."""
+        for k, i_b in qd.ndrange((lo, hi), self._B):
+            i_v = self.color_perm[k]
             self.verts[f + 1, i_v, i_b].pos -= qd.cast(self.sweep_dx[f, sweep, i_v, i_b], gs.qd_float)
 
     @qd.kernel
@@ -1381,6 +1384,87 @@ class VBDSolver(Solver):
                 u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
                 out += self.acons_zeta[i_c, i_b] * self._func_angle_slot_grad(self.va_slot[c], u_hat, v_hat, lu, lv, cosv)
         return out
+
+    # ------------------------------------------------------------------------------------
+    # ------------------------ solver-level (reverse sweep) adjoint ----------------------
+    # ------------------------------------------------------------------------------------
+    # The forward is a composition of block updates, so its Jacobian transpose is the same blocks in
+    # reverse order (Shu et al. 2026). Each block contributes a local solve H_i^T p = xbar_i, an identity
+    # branch, and a scatter of two terms to its neighbours: the gradient tangent -(dg_i/dx_j)^T p, and the
+    # Hessian tangent -(dH_i/dx_j) : (p dx^T), which for this material reduces to the same skew matrix the
+    # off-diagonal elastic block already uses. Nothing global is assembled and the forward need not converge.
+
+    @qd.func
+    def _func_scatter_reverse(self, f, i_v, i_b, p, dx):
+        """Scatter one block's two tangents to its neighbours. Elastic terms only for now."""
+        for c in range(self.ve_offset[i_v], self.ve_offset[i_v + 1]):
+            i_e = self.ve_elem[c]
+            role = self.ve_role[c]
+            F, B = self._func_deformation(f + 1, i_e, i_b)
+            mu = self.elems_info[i_e].mu
+            lam = self.elems_info[i_e].lam
+            alpha = 1.0 + mu / lam
+            cof = self._func_cofactor(F)
+            J = F.determinant()
+            V = self.elems_info[i_e].vol_rest
+            w_i = self._func_vertex_weight(B, role)
+            q_i = qd.cast(cof @ w_i, qd.f64)
+            for r in qd.static(range(4)):
+                if r != role:
+                    j = self.elems_info[i_e].v[r]
+                    w_j = self._func_vertex_weight_static(B, r)
+                    q_j = qd.cast(cof @ w_j, qd.f64)
+                    a = qd.cast(F @ w_i.cross(w_j), qd.f64)  # K_ij = -[a]_x, so K_ij^T v = a x v
+                    Vd = qd.cast(V, qd.f64)
+                    lamd = qd.cast(lam, qd.f64)
+                    # gradient tangent: (dg_i/dx_j)^T p
+                    grad_t = Vd * (qd.cast(mu * w_i.dot(w_j), qd.f64) * p + lamd * q_i.dot(p) * q_j + lamd * qd.cast(J - alpha, qd.f64) * a.cross(p))
+                    # Hessian tangent: only q_i depends on the state, and it vanishes on the diagonal
+                    hess_t = Vd * lamd * (q_i.dot(dx) * a.cross(p) + q_i.dot(p) * a.cross(dx))
+                    for d in qd.static(range(3)):
+                        qd.atomic_add(self.xb[j, i_b][d], -grad_t[d] - hess_t[d])
+
+    @qd.kernel
+    def _kernel_reverse_init(self, f: qd.i32):
+        """The adjoint arriving at the end of the substep, and a clean accumulator for the predictor."""
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            self.xb[i_v, i_b] = self.adj[f + 1, i_v, i_b].pos + self.adj[f + 1, i_v, i_b].vel / self._substep_dt
+            self.yb[i_v, i_b] = qd.Vector.zero(qd.f64, 3)
+
+    @qd.kernel
+    def _kernel_reverse_color(self, f: qd.i32, sweep: qd.i32, lo: qd.i32, hi: qd.i32):
+        """One colour of one sweep, in reverse. The positions must already be rolled back to this colour's
+        linearisation point."""
+        for k, i_b in qd.ndrange((lo, hi), self._B):
+            i_v = self.color_perm[k]
+            xbar = self.xb[i_v, i_b]
+            force_unused, H, K_unused = self._func_vertex_system(f, i_v, i_b)
+            p = qd.cast(H, qd.f64).transpose().inverse() @ xbar
+            dx = self.sweep_dx[f, sweep, i_v, i_b]
+            # the block's own branch: identity minus the exact local Jacobian, which cancels exactly when the
+            # solver's block is the true local Hessian, as it is for the elastic terms
+            self.xb[i_v, i_b] = xbar - self._func_diag_block(f, i_v, i_b).transpose() @ p
+            # the predictor enters every block through the inertia term, dg_i/dy = -m/h^2
+            self.yb[i_v, i_b] += qd.cast(self.verts_info[i_v].mass / (self._substep_dt * self._substep_dt), qd.f64) * p
+            self._func_scatter_reverse(f, i_v, i_b, p, dx)
+
+    @qd.kernel
+    def _kernel_reverse_finish(self, f: qd.i32):
+        """y = x^t + h (v^t + h g), so the adjoint of the predictor reaches both the position and the velocity."""
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            total = self.xb[i_v, i_b] + self.yb[i_v, i_b]
+            self.adj[f, i_v, i_b].pos += total - self.adj[f + 1, i_v, i_b].vel / self._substep_dt
+            self.adj[f, i_v, i_b].vel += total * self._substep_dt
+
+    def substep_pre_coupling_grad_sweep(self, f):
+        """The solver-level adjoint of substep `f`: the sweeps and colours of the forward, in reverse."""
+        self._kernel_reverse_init(f)
+        for sweep in reversed(range(self._n_iterations)):
+            for c in reversed(range(self._n_colors)):
+                lo, hi = self._color_offsets[c], self._color_offsets[c + 1]
+                self._kernel_undo_sweep(f, sweep, lo, hi)
+                self._kernel_reverse_color(f, sweep, lo, hi)
+        self._kernel_reverse_finish(f)
 
     @qd.kernel
     def _kernel_adjoint_rhs(self, f: qd.i32):
