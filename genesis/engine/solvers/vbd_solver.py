@@ -158,6 +158,9 @@ class VBDSolver(Solver):
         shape = (self._sim.substeps_local, self._n_iterations, n, self._B) if self._sim.requires_grad else (1, 1, 1, 1)
         self.cons_rec = rec.field(shape=shape, layout=qd.Layout.SOA)
         self.cons_bar = bar.field(shape=(n, self._B), layout=qd.Layout.SOA)
+        ashape = (self._sim.substeps_local, self._n_iterations, na, self._B) if self._sim.requires_grad else (1, 1, 1, 1)
+        self.acons_rec = rec.field(shape=ashape, layout=qd.Layout.SOA)
+        self.acons_bar = bar.field(shape=(na, self._B), layout=qd.Layout.SOA)
         self.acons_zeta = qd.field(dtype=qd.f64, shape=(na, self._B))
 
     def init_vvert_fields(self):
@@ -869,6 +872,11 @@ class VBDSolver(Solver):
                     self.cons_rec[f, sweep, i_c, i_b].lam_hi = self.cons[i_c, i_b].lam_hi
                     self.cons_rec[f, sweep, i_c, i_b].lam_lo = self.cons[i_c, i_b].lam_lo
                     self.cons_rec[f, sweep, i_c, i_b].k = self.cons[i_c, i_b].k
+            if qd.static(self._record_sweeps and self._n_angle_constraints > 0):
+                for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+                    self.acons_rec[f, sweep, i_c, i_b].lam_hi = self.acons[i_c, i_b].lam_hi
+                    self.acons_rec[f, sweep, i_c, i_b].lam_lo = self.acons[i_c, i_b].lam_lo
+                    self.acons_rec[f, sweep, i_c, i_b].k = self.acons[i_c, i_b].k
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
                     self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation, 1.0, sweep == self._n_iterations - 1, sweep)
@@ -1310,7 +1318,7 @@ class VBDSolver(Solver):
             vq = self.acons_info[i_c].v
             for t in qd.static(range(4)):
                 if vq[t] == i_v:
-                    H += self._func_angle_block(f, i_c, i_b, slot, t)
+                    H += self._func_angle_block_live(f, i_c, i_b, slot, t)
         lam_n, A_f, coupling = self._func_friction_terms(f, i_v, i_b)
         if lam_n > 0.0:
             # remove the forward's symmetric friction approximation (lam_n g P) and add the exact terms
@@ -1611,6 +1619,33 @@ class VBDSolver(Solver):
         return sign * blk
 
     @qd.func
+    def _func_angle_block_live(self, f, i_c, i_b, s, t):
+        """d g_s / d x_t of an angle constraint from the live multiplier state."""
+        u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+        I3 = qd.Matrix.identity(qd.f64, 3)
+        nu = v_hat - cosv * u_hat
+        nv = u_hat - cosv * v_hat
+        H = qd.Matrix.zero(qd.f64, 3, 3)
+        if s < 2 and t < 2:
+            H = -(u_hat.outer_product(nu) + nu.outer_product(u_hat) + cosv * (I3 - u_hat.outer_product(u_hat))) / (lu * lu)
+        elif s >= 2 and t >= 2:
+            H = -(v_hat.outer_product(nv) + nv.outer_product(v_hat) + cosv * (I3 - v_hat.outer_product(v_hat))) / (lv * lv)
+        elif s < 2:
+            H = ((I3 - v_hat.outer_product(v_hat)) - u_hat.outer_product(nv)) / (lu * lv)
+        else:
+            H = ((I3 - u_hat.outer_product(u_hat)) - v_hat.outer_product(nu)) / (lu * lv)
+        sign = 1.0
+        if (s % 2) != (t % 2):
+            sign = -1.0
+        mult, violation_unused = self._func_angle_mult(i_c, i_b, qd.cast(cosv, gs.qd_float))
+        blk = (sign * qd.cast(mult, qd.f64)) * H
+        if mult != 0.0:
+            g_s = self._func_angle_slot_grad(s, u_hat, v_hat, lu, lv, cosv)
+            g_t = self._func_angle_slot_grad(t, u_hat, v_hat, lu, lv, cosv)
+            blk += qd.cast(self.acons[i_c, i_b].k, qd.f64) * g_s.outer_product(g_t)
+        return blk
+
+    @qd.func
     def _func_distance_tangent(self, f, i_c, i_b, t, p, dx):
         """The gradient with respect to vertex `t` of the scalar p^T H dx, where H is the constraint's part of the
         block. Both k n n^T and the |mult| / dist proxy move with the position, so unlike the elastic block this
@@ -1652,6 +1687,10 @@ class VBDSolver(Solver):
             self.cons[i_c, i_b].lam_hi = self.cons_rec[f, sweep, i_c, i_b].lam_hi
             self.cons[i_c, i_b].lam_lo = self.cons_rec[f, sweep, i_c, i_b].lam_lo
             self.cons[i_c, i_b].k = self.cons_rec[f, sweep, i_c, i_b].k
+        for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+            self.acons[i_c, i_b].lam_hi = self.acons_rec[f, sweep, i_c, i_b].lam_hi
+            self.acons[i_c, i_b].lam_lo = self.acons_rec[f, sweep, i_c, i_b].lam_lo
+            self.acons[i_c, i_b].k = self.acons_rec[f, sweep, i_c, i_b].k
 
     @qd.kernel
     def _kernel_reverse_dual(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
@@ -1711,6 +1750,46 @@ class VBDSolver(Solver):
                 for d in qd.static(range(3)):
                     qd.atomic_add(self.xb[va, i_b][d], push * n[d])
                     qd.atomic_add(self.xb[vb, i_b][d], -push * n[d])
+            for c in range(self.vao_offset[i_v], self.vao_offset[i_v + 1]):
+                i_c = self.vao_cons[c]
+                u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+                vq = self.acons_info[i_c].v
+                w = qd.cast(self._constraint_dual_relaxation, qd.f64)
+                kd = qd.cast(self.acons[i_c, i_b].k, qd.f64)
+                hi_b = qd.cast(self.acons_info[i_c].hi, qd.f64)
+                lo_b = qd.cast(self.acons_info[i_c].lo, qd.f64)
+                push = 0.0
+                mult_u, violation = self._func_angle_mult(i_c, i_b, qd.cast(cosv, gs.qd_float))
+                beta = qd.cast(self.acons_info[i_c].k0 / self._angle_tol, qd.f64)
+                if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(self._constraint_k_max_ratio, qd.f64) * qd.cast(self.acons_info[i_c].k0, qd.f64):
+                    sides_v = 1.0
+                    if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
+                        sides_v = 0.0
+                        if cosv > hi_b:
+                            sides_v += 1.0
+                        if cosv < lo_b:
+                            sides_v += 1.0
+                    s_v = 1.0
+                    if violation < 0.0:
+                        s_v = -1.0
+                    push += beta * s_v * sides_v * self.acons_bar[i_c, i_b].k
+                else:
+                    self.acons_bar[i_c, i_b].k = 0.0
+                bar_hi = self.acons_bar[i_c, i_b].lam_hi
+                bar_lo = self.acons_bar[i_c, i_b].lam_lo
+                active = bar_hi
+                if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
+                    active = 0.0
+                    if qd.cast(self.acons[i_c, i_b].lam_hi, qd.f64) + w * kd * (cosv - hi_b) > 0.0:
+                        active += bar_hi
+                    if qd.cast(self.acons[i_c, i_b].lam_lo, qd.f64) + w * kd * (cosv - lo_b) < 0.0:
+                        active += bar_lo
+                push += w * kd * active
+                self.acons_bar[i_c, i_b].k += w * (cosv - hi_b) * bar_hi
+                for slot in qd.static(range(4)):
+                    gsl = self._func_angle_slot_grad(slot, u_hat, v_hat, lu, lv, cosv)
+                    for d in qd.static(range(3)):
+                        qd.atomic_add(self.xb[vq[slot], i_b][d], push * gsl[d])
 
     @qd.kernel
     def _kernel_reverse_init(self, f: qd.i32):
@@ -1722,6 +1801,10 @@ class VBDSolver(Solver):
             self.cons_bar[i_c, i_b].lam_hi = 0.0
             self.cons_bar[i_c, i_b].lam_lo = 0.0
             self.cons_bar[i_c, i_b].k = 0.0
+        for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+            self.acons_bar[i_c, i_b].lam_hi = 0.0
+            self.acons_bar[i_c, i_b].lam_lo = 0.0
+            self.acons_bar[i_c, i_b].k = 0.0
 
     @qd.kernel
     def _kernel_reverse_color(self, f: qd.i32, sweep: qd.i32, lo: qd.i32, hi: qd.i32):
@@ -1784,6 +1867,34 @@ class VBDSolver(Solver):
                         contribution -= self._func_distance_block_live(f, i_c, i_b, s, t).transpose() @ p
                     for d in qd.static(range(3)):
                         qd.atomic_add(self.xb[j, i_b][d], contribution[d])
+            for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
+                i_c = self.va_cons[c]
+                slot = self.va_slot[c]
+                u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
+                vq = self.acons_info[i_c].v
+                g_s = self._func_angle_slot_grad(slot, u_hat, v_hat, lu, lv, cosv)
+                mult, violation_unused = self._func_angle_mult(i_c, i_b, qd.cast(cosv, gs.qd_float))
+                own = u_hat
+                scale = lu
+                if slot >= 2:
+                    own = v_hat
+                    scale = lv
+                s_m = 1.0
+                if mult < 0.0:
+                    s_m = -1.0
+                proxy = (p.dot(dx) - own.dot(p) * own.dot(dx)) / (scale * scale)
+                qd.atomic_add(self.acons_bar[i_c, i_b].lam_hi, -g_s.dot(p) - s_m * proxy)
+                dHk = 0.0
+                if mult != 0.0:
+                    dHk = g_s.dot(p) * g_s.dot(dx)
+                qd.atomic_add(self.acons_bar[i_c, i_b].k, -(cosv - qd.cast(self.acons_info[i_c].hi, qd.f64)) * (g_s.dot(p) + s_m * proxy) - dHk)
+                for t in qd.static(range(4)):
+                    j = vq[t]
+                    if j != i_v:
+                        blk = self._func_angle_block_live(f, i_c, i_b, slot, t)
+                        contribution = -(blk.transpose() @ p)
+                        for d in qd.static(range(3)):
+                            qd.atomic_add(self.xb[j, i_b][d], contribution[d])
 
     @qd.kernel
     def _kernel_reverse_finish(self, f: qd.i32):
