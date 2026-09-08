@@ -320,7 +320,9 @@ class VBDSolver(Solver):
     def _init_self_collision(self, elems):
         """Which vertices may not touch each other: those sharing a tetrahedron are held together by the
         material and their proximity is the mesh, not a collision. Stored as a per-vertex sorted list so the
-        contact loop can skip them with a short scan."""
+        contact loop can skip them with a short scan. Also the uniform grid the contact loop searches:
+        cell size from the mesh itself (Teschner et al. 2005), buckets addressed by a hash of the cell so
+        that no bound on the body's extent is needed."""
         pairs = {(a, b) for a in range(4) for b in range(4) if a != b}
         neighbours = np.unique(np.concatenate([elems[:, [a, b]] for a, b in sorted(pairs)]), axis=0)
         offset = np.searchsorted(neighbours[:, 0], np.arange(self._n_vertices + 1))
@@ -328,6 +330,32 @@ class VBDSolver(Solver):
         self.vn_offset.from_numpy(offset.astype(gs.np_int))
         self.vn_vert = qd.field(dtype=gs.qd_int, shape=(len(neighbours),))
         self.vn_vert.from_numpy(neighbours[:, 1].astype(gs.np_int))
+        if self._self_thickness > 0.0:
+            pos = self.verts.pos.to_numpy()[0, :, 0]
+            edge = float(np.linalg.norm(pos[neighbours[:, 0]] - pos[neighbours[:, 1]], axis=1).mean())
+            # A cell must hold every partner a vertex can touch within one cell of its own, so it cannot be
+            # smaller than the interaction distance; below the mesh edge it would only add empty cells.
+            self._self_cell = max(edge, 2.0 * self._self_thickness)
+            self._hash_buckets = 2 * self._n_vertices
+            self._hash_cap = 32
+        else:
+            self._self_cell, self._hash_buckets, self._hash_cap = 1.0, 1, 1
+        self.cell_n = qd.field(dtype=gs.qd_int, shape=(self._hash_buckets, self._B))
+        self.cell_v = qd.field(dtype=gs.qd_int, shape=(self._hash_buckets, self._hash_cap, self._B))
+        self.cell_overflow = qd.field(dtype=gs.qd_int, shape=())
+        # The cell each vertex was filed under. Vertices move while the sweeps run, so the cell of a current
+        # position is not the cell the grid holds it in. Pairing on the filed cell keeps the candidate set fixed
+        # for the whole substep and, above all, symmetric: A finds B exactly when B finds A. An asymmetric pair
+        # applies a force to one side only, which injects momentum and throws the bodies apart.
+        self.cell_of = qd.Vector.field(
+            3, dtype=gs.qd_int, shape=(self._n_vertices, self._B) if self._self_thickness > 0.0 else (1, 1)
+        )
+        # The low corner of the 2x2x2 block of cells that holds every point within half a cell of the vertex.
+        # A cell is at least twice the thickness, so eight cells cover the whole interaction sphere and the
+        # twenty seven of a full neighbourhood are not needed.
+        self.cell_lo = qd.Vector.field(
+            3, dtype=gs.qd_int, shape=(self._n_vertices, self._B) if self._self_thickness > 0.0 else (1, 1)
+        )
 
     def _init_constraints(self, cons, lo, hi):
         """Bounds (rest length when the entity gave none), per-vertex CSR of incident constraints, and the stiffness
@@ -771,19 +799,27 @@ class VBDSolver(Solver):
         # collision. The exact block is indefinite while a pair overlaps, so only its positive semidefinite
         # part is kept, as the floor and the fibre term already do.
         if qd.static(self._self_thickness > 0.0):
-            for j in range(self._n_vertices):
-                touching_mesh = False
-                for c in range(self.vn_offset[i_v], self.vn_offset[i_v + 1]):
-                    if self.vn_vert[c] == j:
-                        touching_mesh = True
-                if j != i_v and not touching_mesh:
-                    e_s = x - self.pos_lag[j, i_b]
-                    d_s = e_s.norm()
-                    if d_s < self._self_thickness:
-                        n_s = e_s / d_s
-                        k_s = self._contact_stiffness
-                        force += qd.cast(k_s * (self._self_thickness - d_s), self._acc) * qd.cast(n_s, self._acc)
-                        H += qd.cast(k_s, self._acc) * qd.cast(n_s.outer_product(n_s), self._acc)
+            base = self.cell_lo[i_v, i_b]
+            for di, dj, dk in qd.ndrange(2, 2, 2):
+                cell = base + qd.Vector([di, dj, dk], dt=gs.qd_int)
+                h = self._func_cell_hash(cell)
+                for slot in range(qd.min(self.cell_n[h, i_b], self._hash_cap)):
+                    j = self.cell_v[h, slot, i_b]
+                    # Two cells can hash to one bucket, and a vertex must not be visited twice, so a candidate
+                    # counts only for the cell it actually sits in.
+                    if (self.cell_of[j, i_b] == cell).all():
+                        touching_mesh = False
+                        for c in range(self.vn_offset[i_v], self.vn_offset[i_v + 1]):
+                            if self.vn_vert[c] == j:
+                                touching_mesh = True
+                        if j != i_v and not touching_mesh:
+                            e_s = x - self.pos_lag[j, i_b]
+                            d_s = e_s.norm()
+                            if d_s < self._self_thickness:
+                                n_s = e_s / d_s
+                                k_s = self._contact_stiffness
+                                force += qd.cast(k_s * (self._self_thickness - d_s), self._acc) * qd.cast(n_s, self._acc)
+                                H += qd.cast(k_s, self._acc) * qd.cast(n_s.outer_product(n_s), self._acc)
 
         # Analytic capsule bolus: the same penalty and IPC-smoothed isotropic Coulomb friction against a moving
         # capsule (sphere when half_length is 0). `rel` is the vector from the closest point of the segment.
@@ -850,6 +886,38 @@ class VBDSolver(Solver):
                 self._func_angle_dual_update(f, i_c, i_b, w, ramp)
                 if record:
                     self._func_record_angle(f, i_c, i_b)
+
+    @qd.func
+    def _func_cell(self, x):
+        return qd.Vector([qd.floor(x[0] / self._self_cell), qd.floor(x[1] / self._self_cell),
+                          qd.floor(x[2] / self._self_cell)], dt=gs.qd_int)
+
+    @qd.func
+    def _func_cell_hash(self, c):
+        """Teschner et al. 2005: three large primes, exclusive or, then the table size. The remainder of a
+        negative product is negative in Quadrants as in C, so it is folded back into range."""
+        h = ((c[0] * 73856093) ^ (c[1] * 19349663) ^ (c[2] * 83492791)) % self._hash_buckets
+        if h < 0:
+            h += self._hash_buckets
+        return h
+
+    @qd.kernel
+    def _kernel_build_hash(self, f: qd.i32):
+        """The grid for one substep, from the predicted positions. Contacts change while the body folds, so it
+        is rebuilt every substep, but not every sweep: a vertex moves a fraction of a cell in 0.25 ms."""
+        for h, i_b in qd.ndrange(self._hash_buckets, self._B):
+            self.cell_n[h, i_b] = 0
+        for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+            x = self.verts[f + 1, i_v, i_b].pos
+            cell = self._func_cell(x)
+            self.cell_of[i_v, i_b] = cell
+            self.cell_lo[i_v, i_b] = self._func_cell(x - 0.5 * self._self_cell)
+            h = self._func_cell_hash(cell)
+            slot = qd.atomic_add(self.cell_n[h, i_b], 1)
+            if slot < self._hash_cap:
+                self.cell_v[h, slot, i_b] = i_v
+            else:
+                self.cell_overflow[None] = 1
 
     @qd.kernel
     def _kernel_predict(self, f: qd.i32):
@@ -2270,6 +2338,16 @@ class VBDSolver(Solver):
             if self._n_constraints > 0 or self._n_angle_constraints > 0:
                 self._kernel_warm_start()
             self._kernel_predict(f)
+            if self._self_thickness > 0.0:
+                self._kernel_build_hash(f)
+                # Reading the flag waits for the device, so it is read once a step, not once a substep. An
+                # overflowed cell is therefore reported up to one step late, which is still loud and still stops
+                # the run; a wait every substep cost about five times the whole contact solve.
+                if f == 0 and self.cell_overflow[None]:
+                    gs.raise_exception(
+                        f"More than {self._hash_cap} vertices in one self-collision grid cell of "
+                        f"{self._self_cell:.4f} m. Raise the cell capacity or the cell size."
+                    )
             self.solve(f)
             self._kernel_update_velocity(f)
 
