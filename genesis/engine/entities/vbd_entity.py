@@ -501,6 +501,42 @@ class VBDEntity(Entity):
             gs.raise_exception("`k_fiber` must be non-negative.")
         self._solver.set_fiber_stiffness(self._el_start, k_fiber)
 
+    def set_pinned(self, pinned):
+        """
+        Choose which vertices a prescribed boundary owns, such as the flesh a bone carries.
+
+        A pinned vertex is not solved: the predictor puts it on its target and the sweeps leave it
+        there. It is therefore infinitely strong, and nothing the flesh does can slow it down. Until
+        `set_pin_targets` is called, each pinned vertex holds the pose it is already in.
+
+        Parameters
+        ----------
+        pinned : array_like, shape (n_vertices,)
+            True for each vertex the boundary owns.
+        """
+        pinned = np.asarray(pinned)
+        if pinned.shape != (self.n_vertices,):
+            gs.raise_exception(f"`pinned` should have shape ({self.n_vertices},), got {pinned.shape}.")
+        self._solver._kernel_set_pinned(self._v_start, pinned.astype(gs.np_int))
+
+    def set_pin_targets(self, target):
+        """
+        Move the prescribed boundary. Only the vertices marked by `set_pinned` read their target.
+
+        Parameters
+        ----------
+        target : array_like, shape (n_vertices, 3) or (B, n_vertices, 3)
+            Where each pinned vertex is to be. A 2D array is tiled across environments.
+        """
+        target = np.asarray(target, dtype=gs.np_float)
+        if target.ndim == 2:
+            target = np.tile(target, (self._solver._B, 1, 1))
+        if target.shape != (self._solver._B, self.n_vertices, 3):
+            gs.raise_exception(
+                f"`target` should have shape ({self._solver._B}, {self.n_vertices}, 3), got {target.shape}."
+            )
+        self._solver._kernel_set_pin_targets(self._v_start, np.ascontiguousarray(target))
+
     def set_muscle(self, group, fiber):
         """
         Set the muscle group and fiber direction of each tetrahedron.

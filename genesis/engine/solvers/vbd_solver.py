@@ -65,6 +65,7 @@ class VBDSolver(Solver):
     def init_vertex_fields(self):
         struct_vert_info = qd.types.struct(
             mass=gs.qd_float,
+            pinned=gs.qd_int,  # 1 when a bone owns this vertex, so the solve treats it as a boundary
             tangent=gs.qd_vec3,  # friction frame: forward direction on the floor plane
             mu_forward=gs.qd_float,
             mu_backward=gs.qd_float,
@@ -78,6 +79,10 @@ class VBDSolver(Solver):
             shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA
         )
         self.residual = qd.field(dtype=qd.f64, shape=())
+        # Where each pinned vertex is told to be. A prescribed boundary is per environment, because
+        # every environment poses its skeleton differently, while which vertices are pinned is a
+        # property of the rig and so is shared.
+        self.pin_target = qd.Vector.field(3, dtype=gs.qd_float, shape=(self._n_vertices, self._B))
         # Adjoint state, one frame per position frame: dL/dx and dL/dv accumulated by the backward pass.
         struct_adj = qd.types.struct(pos=qd.types.vector(3, qd.f64), vel=qd.types.vector(3, qd.f64))
         self.adj = struct_adj.field(shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA)
@@ -476,6 +481,7 @@ class VBDSolver(Solver):
         for i_v_ in range(verts.shape[0]):
             i_v = i_v_ + v_start
             self.verts_info[i_v].mass = mass
+            self.verts_info[i_v].pinned = 0
             self.verts_info[i_v].tangent = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
             self.verts_info[i_v].mu_forward = mu_forward
             self.verts_info[i_v].mu_backward = mu_backward
@@ -564,6 +570,21 @@ class VBDSolver(Solver):
     def _kernel_set_fiber_stiffness(self, el_start: qd.i32, k_fiber: qd.types.ndarray()):
         for i_e_ in range(k_fiber.shape[0]):
             self.elems_info[i_e_ + el_start].k_fiber = k_fiber[i_e_]
+
+    @qd.kernel
+    def _kernel_set_pinned(self, v_start: qd.i32, pinned: qd.types.ndarray()):
+        for i_v_ in range(pinned.shape[0]):
+            i_v = i_v_ + v_start
+            self.verts_info[i_v].pinned = pinned[i_v_]
+            for i_b in range(self._B):
+                # A vertex pinned without a target yet holds the pose it is already in
+                self.pin_target[i_v, i_b] = self.verts[self._sim.cur_substep_local, i_v, i_b].pos
+
+    @qd.kernel
+    def _kernel_set_pin_targets(self, v_start: qd.i32, target: qd.types.ndarray()):
+        for i_v_, i_b in qd.ndrange(target.shape[1], self._B):
+            for j in qd.static(range(3)):
+                self.pin_target[i_v_ + v_start, i_b][j] = target[i_b, i_v_, j]
 
     def set_muscle(self, el_start, group, fiber):
         self._kernel_set_muscle(el_start, group, fiber)
@@ -870,11 +891,12 @@ class VBDSolver(Solver):
         """One Newton step of vertex i_v, then the dual updates of the constraints it owns (relaxation w, stiffness
         ramp on or off), recording their multipliers for the adjoint when `record` is set. w = 0 skips the duals.
         `sweep` is the index of this sweep within the substep, for the replay buffer."""
-        force, H, K_unused = self._func_vertex_system(f, i_v, i_b)
-        dx = H.inverse() @ force
-        if qd.static(self._record_sweeps):
-            self.sweep_dx[f, sweep, i_v, i_b] = qd.cast(dx, qd.f64)
-        self.verts[f + 1, i_v, i_b].pos += qd.cast(dx, gs.qd_float)
+        if not self.verts_info[i_v].pinned:
+            force, H, K_unused = self._func_vertex_system(f, i_v, i_b)
+            dx = H.inverse() @ force
+            if qd.static(self._record_sweeps):
+                self.sweep_dx[f, sweep, i_v, i_b] = qd.cast(dx, qd.f64)
+            self.verts[f + 1, i_v, i_b].pos += qd.cast(dx, gs.qd_float)
         if w > 0.0:
             for c in range(self.vo_offset[i_v], self.vo_offset[i_v + 1]):
                 i_c = self.vo_cons[c]
@@ -922,7 +944,10 @@ class VBDSolver(Solver):
     @qd.kernel
     def _kernel_predict(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            self.verts[f + 1, i_v, i_b].pos = self._func_inertia_target(f, i_v, i_b)
+            if self.verts_info[i_v].pinned:
+                self.verts[f + 1, i_v, i_b].pos = self.pin_target[i_v, i_b]
+            else:
+                self.verts[f + 1, i_v, i_b].pos = self._func_inertia_target(f, i_v, i_b)
 
     @qd.kernel
     def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):
