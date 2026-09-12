@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
-from genesis.typing import NonNegativeFloat, PositiveFloat, ValidFloat
+from genesis.typing import NonNegativeFloat, NonNegativeInt, PositiveFloat, ValidFloat
 
 from ..base import Material
 
@@ -33,6 +33,10 @@ class Base(Material["VBDEntity"]):
         Floor friction coefficient when sliding against the tangent. Default is 0.3.
     mu_lateral : float, optional
         Floor friction coefficient when sliding sideways to the tangent. Default is 0.3.
+    collision_group : int, optional
+        Collision group of the entity's boundary for mesh contact (see ``VBDSolver.add_contact_rule``). Two
+        groups collide only through a declared rule; without any rule the entity has no mesh contact and keeps
+        the cheaper floor and vertex-sphere contacts only. Default is 0.
     """
 
     E: PositiveFloat = 1e6
@@ -41,6 +45,7 @@ class Base(Material["VBDEntity"]):
     mu_forward: NonNegativeFloat = 0.3
     mu_backward: NonNegativeFloat = 0.3
     mu_lateral: NonNegativeFloat = 0.3
+    collision_group: NonNegativeInt = 0
 
     # Lamé parameters, computed in model_post_init, not user-specified.
     mu: ValidFloat = Field(default=0.0, exclude=True)

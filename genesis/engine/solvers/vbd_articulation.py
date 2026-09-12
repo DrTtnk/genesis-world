@@ -8,6 +8,7 @@ import quadrants as qd
 
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd.forward_kinematics import func_forward_kinematics_batch
+from genesis.engine.solvers.vbd_contact import func_contact_dual_update
 from genesis.engine.solvers.vbd_rigid_attachment import func_update_attachment_dual
 from genesis.utils.array_class import DynInfo, DynState, RigidInfo
 
@@ -32,6 +33,9 @@ def kernel_sweeps_articulation(
                 solver.rigid_attachment.articulation_pose[i_l, i_b].quat = dyn_state.links.quat[i_l, i_b]
         for i_a, i_b in qd.ndrange(solver.rigid_attachment.n_attachments, solver._B):
             func_update_attachment_dual(f, i_a, i_b, solver, solver.rigid_attachment)
+        # see _kernel_sweeps in vbd_solver.py: no dual update after the last sweep
+        if qd.static(solver.has_contact and sweep < solver._n_iterations - 1):
+            func_contact_dual_update(f, solver._constraint_dual_relaxation, solver, solver.contact)
 
 
 @qd.kernel

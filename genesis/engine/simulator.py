@@ -286,6 +286,12 @@ class Simulator(RBC):
         # continue growing endlessly, which will not make the simulation faster either.
         if self.rigid_solver.is_active and self._cur_substep_global % RATE_CHECK_ERRNO == 0:
             self.rigid_solver.check_errno()
+        if (
+            self.vbd_solver.is_active
+            and self.vbd_solver.has_contact
+            and self._cur_substep_global % RATE_CHECK_ERRNO == 0
+        ):
+            self.vbd_solver.check_errno()
 
         if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
             for _ in range(self._substeps):

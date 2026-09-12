@@ -970,6 +970,16 @@ class VBDOptions(Options):
         Under `requires_grad`, the largest number of exact Uzawa dual updates per substep before failing. Defaults to 200.
     max_sweeps : int, optional
         Under `requires_grad`, the sweep budget per substep before failing. Defaults to 400.
+    contact_pair_cap : int, optional
+        Largest number of candidate mesh-contact pairs per environment and substep (point-triangle and edge-edge
+        counted separately). Memory grows with it; a substep that finds more pairs fails with an error instead of
+        dropping contacts. Defaults to 65536.
+    contact_vertex_cap : int, optional
+        Largest number of candidate pairs one contact vertex may take part in per substep. Larger values cost the
+        same memory per vertex whether used or not; overflow fails the substep. Defaults to 32.
+    contact_cell_cap : int, optional
+        Largest number of contact vertices per hash-grid cell. Overflow fails the substep; raise it for meshes much
+        finer than the contact thickness. Defaults to 64.
     """
 
     dt: PositiveFloat | None = None
@@ -990,6 +1000,9 @@ class VBDOptions(Options):
     grad_converge: bool = True
     max_sweeps: PositiveInt = 400
     max_dual_steps: PositiveInt = 200
+    contact_pair_cap: PositiveInt = 65536
+    contact_vertex_cap: PositiveInt = 32
+    contact_cell_cap: PositiveInt = 64
 
 
 class SFOptions(Options):

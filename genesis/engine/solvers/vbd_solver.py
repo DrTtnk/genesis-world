@@ -33,6 +33,14 @@ from genesis.engine.solvers.vbd_articulation import (
     kernel_end_articulation,
     kernel_sweeps_articulation,
 )
+from genesis.engine.solvers.vbd_contact import (
+    VBDContact,
+    func_contact_dual_update,
+    func_contact_vertex_terms,
+    kernel_begin_contact,
+    kernel_end_contact,
+    kernel_reset_contact,
+)
 from genesis.engine.solvers.vbd_rigid import func_attachment_soft_system
 from genesis.engine.solvers.vbd_rigid_attachment import (
     VBDRigidAttachment,
@@ -45,6 +53,7 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     kernel_set_vertex_state,
 )
 from genesis.engine.states.solvers import VBDSolverState
+from genesis.utils.array_class import ErrorCode
 from genesis.utils.misc import qd_to_torch, sanitize_index
 
 from .base_solver import Solver
@@ -84,10 +93,63 @@ class VBDSolver(Solver):
         self._grad_converge = options.grad_converge
         self.rigid_attachment = None
         self._n_muscle_groups = 0
+        self.contact = None
+        self._contact_rules = []
+        self._rigid_colliders = []
+        self._contact_pair_cap = options.contact_pair_cap
+        self._contact_vertex_cap = options.contact_vertex_cap
+        self._contact_cell_cap = options.contact_cell_cap
 
     @property
     def has_rigid_attachment(self):
         return self.rigid_attachment is not None
+
+    @property
+    def has_contact(self):
+        return self.contact is not None
+
+    def add_rigid_collider(self, link, collision_group):
+        """Let the collision meshes of a rigid link take part in mesh contact with the tissue, in the given
+        collision group. Declare before `scene.build()`; the link's pose is read from the rigid solver each
+        substep, so a fixed link, a link the tissue drives, or a prescribed link all work."""
+        if self._scene.is_built:
+            gs.raise_exception("Rigid colliders must be declared before scene.build().")
+        if any(link is other for other, _ in self._rigid_colliders):
+            gs.raise_exception(f"Link {link.name} is already a collider.")
+        self._rigid_colliders.append((link, int(collision_group)))
+
+    def add_contact_rule(self, group_a, group_b, stiffness, friction, thickness):
+        """Declare that two collision groups collide, with the penalty stiffness (N/m) of a pair, the isotropic
+        Coulomb friction coefficient and the thickness (m) below which a pair is active. Declare before
+        `scene.build()`; every pair of groups collides through at most one rule."""
+        if self._scene.is_built:
+            gs.raise_exception("Contact rules must be declared before scene.build().")
+        if not stiffness > 0.0 or not thickness > 0.0 or friction < 0.0:
+            gs.raise_exception("A contact rule needs stiffness > 0, thickness > 0 and friction >= 0.")
+        self._contact_rules.append((int(group_a), int(group_b), float(stiffness), float(friction), float(thickness)))
+
+    def collider_reactions(self):
+        """Wrench the tissue applies to each declared collider link, shape (B, n_colliders, 6): world force then
+        world torque about the link origin, from the last substep."""
+        return self.contact.reactions()
+
+    def check_errno(self):
+        errno = int(qd_to_torch(self.contact.errno).max())
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_CELL:
+            gs.raise_exception("More contact vertices in one hash cell than VBDOptions.contact_cell_cap allows.")
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS:
+            gs.raise_exception("More candidate contact pairs than VBDOptions.contact_pair_cap allows.")
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_SLOTS:
+            gs.raise_exception("A contact vertex takes part in more pairs than VBDOptions.contact_vertex_cap allows.")
+        if errno & ErrorCode.INVALID_VBD_CONTACT_NAN:
+            gs.raise_exception("A contact pair has a non-finite distance.")
+        if errno & ErrorCode.VBD_CONTACT_CROSSING:
+            gs.raise_exception("A contact pair crossed its surface within one substep: the penalty did not hold it.")
+        if errno & ErrorCode.VBD_CONTACT_MOTION_BOUND:
+            gs.raise_exception(
+                "A contact vertex moved further than the contact margin in one substep, so a collision may have been "
+                "missed. Use more substeps or a larger thickness."
+            )
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
@@ -116,9 +178,15 @@ class VBDSolver(Solver):
         self.pin_target = qd.Vector.field(3, dtype=gs.qd_float, shape=(self._n_vertices, self._B))
         # Adjoint state, one frame per position frame: dL/dx and dL/dv accumulated by the backward pass.
         struct_adj = qd.types.struct(pos=qd.types.vector(3, qd.f64), vel=qd.types.vector(3, qd.f64))
-        self.adj = struct_adj.field(shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA)
-        self.z = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # adjoint of the stationarity condition
-        self.xb = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # running position adjoint of the reverse sweep
+        self.adj = struct_adj.field(
+            shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA
+        )
+        self.z = qd.Vector.field(
+            3, dtype=qd.f64, shape=(self._n_vertices, self._B)
+        )  # adjoint of the stationarity condition
+        self.xb = qd.Vector.field(
+            3, dtype=qd.f64, shape=(self._n_vertices, self._B)
+        )  # running position adjoint of the reverse sweep
         self.yb = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # adjoint of the predictor y
         self.gbar = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # its right-hand side
         self.adj_residual = qd.field(dtype=qd.f64, shape=())
@@ -129,8 +197,11 @@ class VBDSolver(Solver):
         # the stiffness ramp is frozen while the sweeps are being differentiated, in the forward and in the reverse
         self._ramp_active = not (self._record_sweeps and not self._grad_converge)
         self.sweep_dx = qd.Vector.field(
-            3, dtype=qd.f64,
-            shape=(self._sim.substeps_local, self._n_iterations, self._n_vertices, self._B) if self._record_sweeps else (1, 1, 1, 1),
+            3,
+            dtype=qd.f64,
+            shape=(self._sim.substeps_local, self._n_iterations, self._n_vertices, self._B)
+            if self._record_sweeps
+            else (1, 1, 1, 1),
         )
         # Self-collision reads the partner from here, not from the live state. A contact pair is invisible to the
         # static colouring, which is built from the tetrahedron graph and never saw the pair, so both sides can land
@@ -189,7 +260,9 @@ class VBDSolver(Solver):
         # Angle constraints: the cosine between u = x_a - x_b and v = x_c - x_d kept in [lo, hi] (cos of the angle
         # bounds), same augmented Lagrangian with clamped multipliers. Joint limits on rigid vertebra frames.
         # `sin_ref` is the sine of the rest angle: d cos / d theta = -sin, so a cosine violation over it is an angle
-        struct_acons_info = qd.types.struct(v=gs.qd_ivec4, lo=gs.qd_float, hi=gs.qd_float, k0=gs.qd_float, sin_ref=gs.qd_float)
+        struct_acons_info = qd.types.struct(
+            v=gs.qd_ivec4, lo=gs.qd_float, hi=gs.qd_float, k0=gs.qd_float, sin_ref=gs.qd_float
+        )
         struct_acons_state = qd.types.struct(lam_hi=gs.qd_float, lam_lo=gs.qd_float, k=gs.qd_float)
         na = max(self._n_angle_constraints, 1)
         self.acons_info = struct_acons_info.field(shape=(na,), layout=qd.Layout.SOA)
@@ -213,7 +286,9 @@ class VBDSolver(Solver):
         shape = (self._sim.substeps_local, self._n_iterations, n, self._B) if self._sim.requires_grad else (1, 1, 1, 1)
         self.cons_rec = rec.field(shape=shape, layout=qd.Layout.SOA)
         self.cons_bar = bar.field(shape=(n, self._B), layout=qd.Layout.SOA)
-        ashape = (self._sim.substeps_local, self._n_iterations, na, self._B) if self._sim.requires_grad else (1, 1, 1, 1)
+        ashape = (
+            (self._sim.substeps_local, self._n_iterations, na, self._B) if self._sim.requires_grad else (1, 1, 1, 1)
+        )
         self.acons_rec = rec.field(shape=ashape, layout=qd.Layout.SOA)
         self.acons_bar = bar.field(shape=(na, self._B), layout=qd.Layout.SOA)
         self.acons_zeta = qd.field(dtype=qd.f64, shape=(na, self._B))
@@ -251,9 +326,13 @@ class VBDSolver(Solver):
         color = np.array([coloring[i] for i in range(self._n_vertices)], dtype=np.int64)
         assert (color[cons[:, 0]] != color[cons[:, 1]]).all(), "a constraint joins two vertices of the same color"
         assert all(
-            (color[acons[:, a]] != color[acons[:, b]])[acons[:, a] != acons[:, b]].all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+            (color[acons[:, a]] != color[acons[:, b]])[acons[:, a] != acons[:, b]].all()
+            for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
         )
-        assert all((color[elems[:, a]] != color[elems[:, b]]).all() for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)))
+        assert all(
+            (color[elems[:, a]] != color[elems[:, b]]).all()
+            for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+        )
         n_colors = int(color.max()) + 1
         perm = np.argsort(color, kind="stable")
         color_offsets = np.searchsorted(color[perm], np.arange(n_colors + 1)).tolist()
@@ -270,7 +349,11 @@ class VBDSolver(Solver):
         color pass runs, every other vertex of the constraint has been updated this sweep and none is being written,
         so the owner can run the constraint's dual update inside its own pass, with no pass and barrier of its own."""
         n = len(verts_per_constraint)
-        owner = verts_per_constraint[np.arange(n), np.argmax(color[verts_per_constraint], axis=1)] if n else np.zeros(0, dtype=np.int64)
+        owner = (
+            verts_per_constraint[np.arange(n), np.argmax(color[verts_per_constraint], axis=1)]
+            if n
+            else np.zeros(0, dtype=np.int64)
+        )
         order = np.argsort(owner, kind="stable")
         offset = np.searchsorted(owner[order], np.arange(self._n_vertices + 1))
         f_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
@@ -300,12 +383,14 @@ class VBDSolver(Solver):
 
             elems = np.concatenate([entity._v_start + entity.elems for entity in self._entities]).astype(np.int64)
             cons = np.concatenate(
-                [entity._v_start + entity.distance_constraints for entity in self._entities] + [np.zeros((0, 2), dtype=np.int64)]
+                [entity._v_start + entity.distance_constraints for entity in self._entities]
+                + [np.zeros((0, 2), dtype=np.int64)]
             ).astype(np.int64)
             lo = np.concatenate([entity.distance_bounds[:, 0] for entity in self._entities] + [np.zeros(0)])
             hi = np.concatenate([entity.distance_bounds[:, 1] for entity in self._entities] + [np.zeros(0)])
             acons = np.concatenate(
-                [entity._v_start + entity.angle_constraints for entity in self._entities] + [np.zeros((0, 4), dtype=np.int64)]
+                [entity._v_start + entity.angle_constraints for entity in self._entities]
+                + [np.zeros((0, 4), dtype=np.int64)]
             ).astype(np.int64)
             alo = np.concatenate([entity.angle_bounds[:, 0] for entity in self._entities] + [np.zeros(0)])
             ahi = np.concatenate([entity.angle_bounds[:, 1] for entity in self._entities] + [np.zeros(0)])
@@ -321,7 +406,9 @@ class VBDSolver(Solver):
                 for entity in self._entities:
                     # K0 (the rest Hessian) is positive semidefinite only for lam' >= mu / 3, i.e. nu >= 1/8
                     if entity.material.nu < 0.125:
-                        gs.raise_exception(f"Rayleigh damping needs nu >= 0.125 for a positive semidefinite rest Hessian; got nu={entity.material.nu}.")
+                        gs.raise_exception(
+                            f"Rayleigh damping needs nu >= 0.125 for a positive semidefinite rest Hessian; got nu={entity.material.nu}."
+                        )
             self.vo_offset, self.vo_cons = self._owner_csr(cons, color)
             self.vao_offset, self.vao_cons = self._owner_csr(acons, color)
             self.color_perm = qd.field(dtype=gs.qd_int, shape=(self._n_vertices,))
@@ -337,7 +424,13 @@ class VBDSolver(Solver):
             # terms it sums, so the relative tolerance is floored here. m/h^2 times a tet edge is the force that moves
             # a vertex one edge in one substep, the largest term in the sum; times the relative precision of the
             # accumulator, that is the smallest residual the assembly can resolve.
-            edge = float(np.linalg.norm(self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 1], 0] - self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 0], 0], axis=1).mean())
+            edge = float(
+                np.linalg.norm(
+                    self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 1], 0]
+                    - self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 0], 0],
+                    axis=1,
+                ).mean()
+            )
             unit = float(self.verts_info.mass.to_numpy().max()) / self._substep_dt**2 * edge
             self._force_noise = unit * (1e-13 if gs.np_float == np.float64 else 1e-6)
             # The sweep kernel inlines one copy of the whole per-vertex solve for every colour of every sweep, so the
@@ -353,6 +446,14 @@ class VBDSolver(Solver):
             attached_entities = [entity for entity in self._entities if entity._rigid_links]
             if attached_entities:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
+            if self._contact_rules:
+                if self._sim.requires_grad:
+                    gs.raise_exception("Mesh contact has no adjoint, so it cannot be used with requires_grad.")
+                self.contact = VBDContact(self, self._entities, self._rigid_colliders, self._contact_rules)
+                rigid = self._sim.rigid_solver
+                kernel_reset_contact(torch.arange(self._B, dtype=torch.int32), self.contact, rigid.dyn_state)
+            elif self._rigid_colliders:
+                gs.raise_exception("Rigid colliders were declared without any contact rule.")
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
     def _init_self_collision(self, elems):
@@ -436,7 +537,9 @@ class VBDSolver(Solver):
         self.va_cons = qd.field(dtype=gs.qd_int, shape=(max(len(inc_cons), 1),))
         self.va_slot = qd.field(dtype=gs.qd_int, shape=(max(len(inc_cons), 1),))
         if len(acons):
-            assert (lo <= hi).all() and (lo >= -1.0).all() and (hi <= 1.0).all(), "cosine bounds must satisfy -1 <= lo <= hi <= 1"
+            assert (lo <= hi).all() and (lo >= -1.0).all() and (hi <= 1.0).all(), (
+                "cosine bounds must satisfy -1 <= lo <= hi <= 1"
+            )
             self.va_cons.from_numpy(inc_cons[order].astype(gs.np_int))
             self.va_slot.from_numpy(inc_slot[order].astype(gs.np_int))
             self.acons_info.v.from_numpy(acons.astype(gs.np_int))
@@ -446,8 +549,8 @@ class VBDSolver(Solver):
         # k0 = k_start |u|^2 |v|^2 / (|u|^2 + |v|^2) on the rest vectors (the review's harmonic scale)
         if len(acons):
             pos = self.verts.pos.to_numpy()[0, :, 0]
-            lu2 = (np.linalg.norm(pos[acons[:, 0]] - pos[acons[:, 1]], axis=1) ** 2)
-            lv2 = (np.linalg.norm(pos[acons[:, 2]] - pos[acons[:, 3]], axis=1) ** 2)
+            lu2 = np.linalg.norm(pos[acons[:, 0]] - pos[acons[:, 1]], axis=1) ** 2
+            lv2 = np.linalg.norm(pos[acons[:, 2]] - pos[acons[:, 3]], axis=1) ** 2
             k0 = self._k_start * lu2 * lv2 / (lu2 + lv2)
             self.acons_info.k0.from_numpy(k0.astype(gs.np_float))
             u = pos[acons[:, 0]] - pos[acons[:, 1]]
@@ -455,7 +558,9 @@ class VBDSolver(Solver):
             cos_rest = (u * v).sum(-1) / np.sqrt(lu2 * lv2)
             # a cosine violation divided by sin(theta) is the angle error; near 0 or 180 degrees the cosine is flat
             # and no cosine tolerance is an angle tolerance, so the reference is floored
-            self.acons_info.sin_ref.from_numpy(np.maximum(np.sqrt(np.clip(1.0 - cos_rest**2, 0.0, 1.0)), 0.1).astype(gs.np_float))
+            self.acons_info.sin_ref.from_numpy(
+                np.maximum(np.sqrt(np.clip(1.0 - cos_rest**2, 0.0, 1.0)), 0.1).astype(gs.np_float)
+            )
             self.acons.k.from_numpy(np.tile(k0.astype(gs.np_float)[:, None], (1, self._B)))
         else:
             self.acons.k.fill(self._k_start)
@@ -701,7 +806,9 @@ class VBDSolver(Solver):
         negative in compression, so the forward step uses the PSD part like the contact terms do."""
         v = self.elems_info[i_e].v
         p0 = self.verts[fr, v[0], i_b].pos
-        Ds = qd.Matrix.cols([self.verts[fr, v[1], i_b].pos - p0, self.verts[fr, v[2], i_b].pos - p0, self.verts[fr, v[3], i_b].pos - p0])
+        Ds = qd.Matrix.cols(
+            [self.verts[fr, v[1], i_b].pos - p0, self.verts[fr, v[2], i_b].pos - p0, self.verts[fr, v[3], i_b].pos - p0]
+        )
         F0 = Ds @ self.elems_info[i_e].B_rest
         a = self.elems_info[i_e].fiber
         u = F0 @ a
@@ -765,7 +872,9 @@ class VBDSolver(Solver):
                     if r != role:
                         j = self.elems_info[i_e].v[r]
                         d_j = self.verts[f + 1, j, i_b].pos - self.verts[f, j, i_b].pos
-                        damp += qd.cast(self._func_rest_block(i_e, w0, self._func_vertex_weight_static(B0, r)) @ d_j, self._acc)
+                        damp += qd.cast(
+                            self._func_rest_block(i_e, w0, self._func_vertex_weight_static(B0, r)) @ d_j, self._acc
+                        )
 
         kd_h = qd.cast(self._damping / self._substep_dt, self._acc)
         force -= kd_h * (K0 @ qd.cast(x - self.verts[f, i_v, i_b].pos, self._acc) + damp)
@@ -786,7 +895,9 @@ class VBDSolver(Solver):
             force -= qd.cast(mult * side, self._acc) * qd.cast(n, self._acc)
             if mult != 0.0:  # an active side: its stiffness enters the block (Eq. 14 without rescaling)
                 H += qd.cast(self.cons[i_c, i_b].k, self._acc) * qd.cast(n.outer_product(n), self._acc)
-            H += qd.cast(qd.abs(mult) / dist, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n), self._acc)
+            H += qd.cast(qd.abs(mult) / dist, self._acc) * qd.cast(
+                qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n), self._acc
+            )
 
         # Angle constraints: C = cos(u, v) bounded; gradient wrt x_a is (v_hat - C u_hat) / |u| (minus for x_b), and
         # wrt x_c is (u_hat - C v_hat) / |v| (minus for x_d). Hessian: k g g^T plus |mult| / |edge|^2 as the PSD proxy
@@ -816,7 +927,9 @@ class VBDSolver(Solver):
             own = u_hat
             if slot >= 2:
                 own = v_hat
-            H += qd.cast(qd.abs(mult) / (scale * scale), self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - own.outer_product(own), self._acc)
+            H += qd.cast(qd.abs(mult) / (scale * scale), self._acc) * qd.cast(
+                qd.Matrix.identity(gs.qd_float, 3) - own.outer_product(own), self._acc
+            )
 
         # Floor contact (VBD paper 3.5): penalty energy k/2 d^2 on the penetration depth d, plus anisotropic
         # Coulomb friction (3.6, Hu et al. 2009 coefficients) on the substep's tangential slide, with the IPC
@@ -875,7 +988,9 @@ class VBDSolver(Solver):
                             if d_s < self._self_thickness:
                                 n_s = e_s / d_s
                                 k_s = self._contact_stiffness
-                                force += qd.cast(k_s * (self._self_thickness - d_s), self._acc) * qd.cast(n_s, self._acc)
+                                force += qd.cast(k_s * (self._self_thickness - d_s), self._acc) * qd.cast(
+                                    n_s, self._acc
+                                )
                                 H += qd.cast(k_s, self._acc) * qd.cast(n_s.outer_product(n_s), self._acc)
 
         # Analytic capsule bolus: the same penalty and IPC-smoothed isotropic Coulomb friction against a moving
@@ -883,7 +998,9 @@ class VBDSolver(Solver):
         r_b = self.bolus[i_b].radius
         if r_b > 0.0:
             rel = x - self.bolus[i_b].center
-            along = qd.min(qd.max(rel.dot(self.bolus[i_b].axis), -self.bolus[i_b].half_length), self.bolus[i_b].half_length)
+            along = qd.min(
+                qd.max(rel.dot(self.bolus[i_b].axis), -self.bolus[i_b].half_length), self.bolus[i_b].half_length
+            )
             rel = rel - along * self.bolus[i_b].axis
             dist = rel.norm()
             pen = r_b - dist  # penetration depth into the sphere
@@ -901,19 +1018,29 @@ class VBDSolver(Solver):
                     g = 2.0 / eps - u_norm / (eps * eps)
                 lam_b = k * pen * self.bolus[i_b].friction
                 force -= qd.cast(lam_b * g, self._acc) * qd.cast(slide, self._acc)
-                H += qd.cast(lam_b * g, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n_b.outer_product(n_b), self._acc)
+                H += qd.cast(lam_b * g, self._acc) * qd.cast(
+                    qd.Matrix.identity(gs.qd_float, 3) - n_b.outer_product(n_b), self._acc
+                )
         if qd.static(self.has_rigid_attachment):
             i_a = self.rigid_attachment.vertex_attachment[i_v]
             if i_a >= 0:
                 pos, quat = func_attachment_pose(i_a, i_b, self.rigid_attachment)
                 force_a, hessian_a = func_attachment_soft_system(
-                    x, pos, quat,
-                    self.rigid_attachment.info[i_a].local_pos, self.rigid_attachment.state[i_a, i_b].multiplier,
+                    x,
+                    pos,
+                    quat,
+                    self.rigid_attachment.info[i_a].local_pos,
+                    self.rigid_attachment.state[i_a, i_b].multiplier,
                     self.rigid_attachment.state[i_a, i_b].stiffness,
-                    self.rigid_attachment.previous_error[i_a, i_b], self.rigid_attachment.alpha,
+                    self.rigid_attachment.previous_error[i_a, i_b],
+                    self.rigid_attachment.alpha,
                 )
                 force += qd.cast(force_a, self._acc)
                 H += qd.cast(hessian_a, self._acc)
+        if qd.static(self.has_contact):
+            force_c, hessian_c = func_contact_vertex_terms(f, i_v, i_b, self, self.contact)
+            force += qd.cast(force_c, self._acc)
+            H += qd.cast(hessian_c, self._acc)
         return force, H, K0
 
     @qd.func
@@ -959,8 +1086,10 @@ class VBDSolver(Solver):
 
     @qd.func
     def _func_cell(self, x):
-        return qd.Vector([qd.floor(x[0] / self._self_cell), qd.floor(x[1] / self._self_cell),
-                          qd.floor(x[2] / self._self_cell)], dt=gs.qd_int)
+        return qd.Vector(
+            [qd.floor(x[0] / self._self_cell), qd.floor(x[1] / self._self_cell), qd.floor(x[2] / self._self_cell)],
+            dt=gs.qd_int,
+        )
 
     @qd.func
     def _func_cell_hash(self, c):
@@ -1017,7 +1146,9 @@ class VBDSolver(Solver):
         mult = k * c_hi + self.cons[i_c, i_b].lam_hi  # equality: one unclamped multiplier, kept in lam_hi
         violation = c_hi
         if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
-            mult = qd.max(k * c_hi + self.cons[i_c, i_b].lam_hi, 0.0) + qd.min(k * c_lo + self.cons[i_c, i_b].lam_lo, 0.0)
+            mult = qd.max(k * c_hi + self.cons[i_c, i_b].lam_hi, 0.0) + qd.min(
+                k * c_lo + self.cons[i_c, i_b].lam_lo, 0.0
+            )
             violation = qd.max(c_hi, 0.0) + qd.min(c_lo, 0.0)
         return mult, violation
 
@@ -1029,7 +1160,9 @@ class VBDSolver(Solver):
         mult = k * c_hi + self.acons[i_c, i_b].lam_hi
         violation = c_hi
         if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
-            mult = qd.max(k * c_hi + self.acons[i_c, i_b].lam_hi, 0.0) + qd.min(k * c_lo + self.acons[i_c, i_b].lam_lo, 0.0)
+            mult = qd.max(k * c_hi + self.acons[i_c, i_b].lam_hi, 0.0) + qd.min(
+                k * c_lo + self.acons[i_c, i_b].lam_lo, 0.0
+            )
             violation = qd.max(c_hi, 0.0) + qd.min(c_lo, 0.0)
         return mult, violation
 
@@ -1041,13 +1174,19 @@ class VBDSolver(Solver):
         cosv = u.dot(vv) / (u.norm() * vv.norm())
         k = self.acons[i_c, i_b].k
         if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
-            self.acons[i_c, i_b].lam_hi = qd.max(self.acons[i_c, i_b].lam_hi + w * k * (cosv - self.acons_info[i_c].hi), 0.0)
-            self.acons[i_c, i_b].lam_lo = qd.min(self.acons[i_c, i_b].lam_lo + w * k * (cosv - self.acons_info[i_c].lo), 0.0)
+            self.acons[i_c, i_b].lam_hi = qd.max(
+                self.acons[i_c, i_b].lam_hi + w * k * (cosv - self.acons_info[i_c].hi), 0.0
+            )
+            self.acons[i_c, i_b].lam_lo = qd.min(
+                self.acons[i_c, i_b].lam_lo + w * k * (cosv - self.acons_info[i_c].lo), 0.0
+            )
         else:
             self.acons[i_c, i_b].lam_hi += w * k * (cosv - self.acons_info[i_c].hi)
         _, violation = self._func_angle_mult(i_c, i_b, cosv)
         k0 = self.acons_info[i_c].k0
-        self.acons[i_c, i_b].k = qd.min(k + ramp * k0 / self._angle_tol * qd.abs(violation), self._constraint_k_max_ratio * k0)
+        self.acons[i_c, i_b].k = qd.min(
+            k + ramp * k0 / self._angle_tol * qd.abs(violation), self._constraint_k_max_ratio * k0
+        )
 
     @qd.func
     def _func_dual_update(self, f, i_c, i_b, w, ramp):
@@ -1058,12 +1197,19 @@ class VBDSolver(Solver):
         dist = e.norm()
         k = self.cons[i_c, i_b].k
         if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
-            self.cons[i_c, i_b].lam_hi = qd.max(self.cons[i_c, i_b].lam_hi + w * k * (dist - self.cons_info[i_c].hi), 0.0)
-            self.cons[i_c, i_b].lam_lo = qd.min(self.cons[i_c, i_b].lam_lo + w * k * (dist - self.cons_info[i_c].lo), 0.0)
+            self.cons[i_c, i_b].lam_hi = qd.max(
+                self.cons[i_c, i_b].lam_hi + w * k * (dist - self.cons_info[i_c].hi), 0.0
+            )
+            self.cons[i_c, i_b].lam_lo = qd.min(
+                self.cons[i_c, i_b].lam_lo + w * k * (dist - self.cons_info[i_c].lo), 0.0
+            )
         else:
             self.cons[i_c, i_b].lam_hi += w * k * (dist - self.cons_info[i_c].hi)
         _, violation = self._func_constraint_mult(i_c, i_b, dist)
-        self.cons[i_c, i_b].k = qd.min(k + ramp * self._k_start / self._constraint_tol * qd.abs(violation), self._constraint_k_max_ratio * self._k_start)
+        self.cons[i_c, i_b].k = qd.min(
+            k + ramp * self._k_start / self._constraint_tol * qd.abs(violation),
+            self._constraint_k_max_ratio * self._k_start,
+        )
 
     @qd.kernel
     def _kernel_sweeps(self, f: qd.i32):
@@ -1074,6 +1220,10 @@ class VBDSolver(Solver):
                     func_solve_attachment_link(f, i_b, self, self.rigid_attachment)
                 for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
                     func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
+            # the pairs restart from zero next substep, so the dual update after the last sweep would only skew
+            # the reported reactions away from the forces the sweep applied
+            if qd.static(self.has_contact and sweep < self._n_iterations - 1):
+                func_contact_dual_update(f, self._constraint_dual_relaxation, self, self.contact)
 
     @qd.func
     def _func_sweep(self, f, sweep: qd.template()):
@@ -1100,9 +1250,15 @@ class VBDSolver(Solver):
                 # k_start / constraint_tol, about 3e9 on the snake, and it multiplies straight into the position
                 # adjoint, which makes the executed map wildly expansive (measured: 1e13 over one step against
                 # 4.2 with the stiffness held). A fixed stiffness also converges better (useful_knowledge.md).
-                self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation,
-                                        1.0 if qd.static(self._ramp_active) else 0.0,
-                                        sweep == self._n_iterations - 1, sweep)
+                self._func_solve_vertex(
+                    f,
+                    self.color_perm[k],
+                    i_b,
+                    self._constraint_dual_relaxation,
+                    1.0 if qd.static(self._ramp_active) else 0.0,
+                    sweep == self._n_iterations - 1,
+                    sweep,
+                )
 
     @qd.func
     def _func_record_constraint(self, f, i_c, i_b):
@@ -1207,7 +1363,10 @@ class VBDSolver(Solver):
         self.cons_error[None] = 0.0
         self.cons_error_rel[None] = 0.0
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            e = (
+                self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos
+                - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            )
             _, violation = self._func_constraint_mult(i_c, i_b, e.norm())
             qd.atomic_max(self.cons_error[None], qd.cast(qd.abs(violation), qd.f64))
             qd.atomic_max(self.cons_error_rel[None], qd.cast(qd.abs(violation) / self.cons_info[i_c].scale, qd.f64))
@@ -1226,12 +1385,16 @@ class VBDSolver(Solver):
 
     def angle_constraint_error(self):
         """Largest cosine violation of the angle constraints at the current end-of-substep positions, over all envs."""
-        self._kernel_angle_error(self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1)
+        self._kernel_angle_error(
+            self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1
+        )
         return float(self.cons_error[None])
 
     def constraint_error(self):
         """Largest absolute distance-constraint error (m) at the current end-of-substep positions, over all envs."""
-        self._kernel_constraint_error(self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1)
+        self._kernel_constraint_error(
+            self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1
+        )
         return float(self.cons_error[None])
 
     @qd.kernel
@@ -1245,7 +1408,9 @@ class VBDSolver(Solver):
             if r_b > 0.0:
                 x = self.verts[f + 1, i_v, i_b].pos
                 rel = x - self.bolus[i_b].center
-                along = qd.min(qd.max(rel.dot(self.bolus[i_b].axis), -self.bolus[i_b].half_length), self.bolus[i_b].half_length)
+                along = qd.min(
+                    qd.max(rel.dot(self.bolus[i_b].axis), -self.bolus[i_b].half_length), self.bolus[i_b].half_length
+                )
                 rel = rel - along * self.bolus[i_b].axis
                 dist = rel.norm()
                 pen = r_b - dist
@@ -1266,13 +1431,17 @@ class VBDSolver(Solver):
 
     def bolus_reaction(self):
         """The force the body is applying to the bolus, shape (B, 3), from the state of the last substep."""
-        self._kernel_bolus_reaction(self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1)
+        self._kernel_bolus_reaction(
+            self._sim.cur_substep_local - 1 if self._sim.cur_substep_local > 0 else self._sim.substeps_local - 1
+        )
         return self.bolus_force.to_numpy()
 
     @qd.kernel
     def _kernel_update_velocity(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            self.verts[f + 1, i_v, i_b].vel = (self.verts[f + 1, i_v, i_b].pos - self.verts[f, i_v, i_b].pos) / self._substep_dt
+            self.verts[f + 1, i_v, i_b].vel = (
+                self.verts[f + 1, i_v, i_b].pos - self.verts[f, i_v, i_b].pos
+            ) / self._substep_dt
 
     @qd.kernel
     def _kernel_residual(self, f: qd.i32):
@@ -1327,7 +1496,9 @@ class VBDSolver(Solver):
         if not self._sim.requires_grad or not self._grad_converge:
             if self.rigid_attachment is not None and self.rigid_attachment.is_articulated:
                 rigid = self.rigid_attachment.rigid
-                kernel_sweeps_articulation(f, self, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config)
+                kernel_sweeps_articulation(
+                    f, self, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config
+                )
             else:
                 self._kernel_sweeps(f)
             return
@@ -1447,9 +1618,13 @@ class VBDSolver(Solver):
         nv = u_hat - cosv * v_hat
         H = qd.Matrix.zero(qd.f64, 3, 3)
         if s < 2 and t < 2:
-            H = -(u_hat.outer_product(nu) + nu.outer_product(u_hat) + cosv * (I3 - u_hat.outer_product(u_hat))) / (lu * lu)
+            H = -(u_hat.outer_product(nu) + nu.outer_product(u_hat) + cosv * (I3 - u_hat.outer_product(u_hat))) / (
+                lu * lu
+            )
         elif s >= 2 and t >= 2:
-            H = -(v_hat.outer_product(nv) + nv.outer_product(v_hat) + cosv * (I3 - v_hat.outer_product(v_hat))) / (lv * lv)
+            H = -(v_hat.outer_product(nv) + nv.outer_product(v_hat) + cosv * (I3 - v_hat.outer_product(v_hat))) / (
+                lv * lv
+            )
         elif s < 2:
             H = ((I3 - v_hat.outer_product(v_hat)) - u_hat.outer_product(nv)) / (lu * lv)
         else:
@@ -1479,7 +1654,10 @@ class VBDSolver(Solver):
                 H += qd.cast(H_exact - H_psd, qd.f64)  # the forward kept only the PSD part
         for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
             i_c = self.vc_cons[c]
-            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            e = (
+                self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos
+                - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            )
             dist = e.norm()
             n = qd.cast(e / dist, qd.f64)
             nn = n.outer_product(n)
@@ -1506,7 +1684,9 @@ class VBDSolver(Solver):
             if slot >= 2:
                 own = v_hat
                 scale = lv
-            H -= (qd.abs(qd.cast(mult, qd.f64)) / (scale * scale)) * (qd.Matrix.identity(qd.f64, 3) - own.outer_product(own))
+            H -= (qd.abs(qd.cast(mult, qd.f64)) / (scale * scale)) * (
+                qd.Matrix.identity(qd.f64, 3) - own.outer_product(own)
+            )
             vq = self.acons_info[i_c].v
             for t in qd.static(range(4)):
                 if vq[t] == i_v:
@@ -1527,9 +1707,10 @@ class VBDSolver(Solver):
             if u_norm < eps:
                 g = 2.0 / eps - u_norm / (eps * eps)
             th = qd.tanh(slide.dot(t) / eps)
-            mu_ax = 0.5 * (self.verts_info[i_v].mu_forward + self.verts_info[i_v].mu_backward) + 0.5 * (
-                self.verts_info[i_v].mu_forward - self.verts_info[i_v].mu_backward
-            ) * th
+            mu_ax = (
+                0.5 * (self.verts_info[i_v].mu_forward + self.verts_info[i_v].mu_backward)
+                + 0.5 * (self.verts_info[i_v].mu_forward - self.verts_info[i_v].mu_backward) * th
+            )
             P = mu_ax * t.outer_product(t) + self.verts_info[i_v].mu_lateral * b.outer_product(b)
             H -= qd.cast(lam_n * g, qd.f64) * qd.cast(P, qd.f64)
             H += A_f + coupling
@@ -1549,7 +1730,10 @@ class VBDSolver(Solver):
                 H += qd.cast(H_exact - H_psd, qd.f64)  # the forward kept only the PSD part
         for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
             i_c = self.vc_cons[c]
-            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            e = (
+                self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos
+                - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            )
             dist = e.norm()
             n = qd.cast(e / dist, qd.f64)
             nn = n.outer_product(n)
@@ -1576,7 +1760,9 @@ class VBDSolver(Solver):
             if slot >= 2:
                 own = v_hat
                 scale = lv
-            H -= (qd.abs(qd.cast(mult, qd.f64)) / (scale * scale)) * (qd.Matrix.identity(qd.f64, 3) - own.outer_product(own))
+            H -= (qd.abs(qd.cast(mult, qd.f64)) / (scale * scale)) * (
+                qd.Matrix.identity(qd.f64, 3) - own.outer_product(own)
+            )
             vq = self.acons_info[i_c].v
             for t in qd.static(range(4)):
                 if vq[t] == i_v:
@@ -1597,9 +1783,10 @@ class VBDSolver(Solver):
             if u_norm < eps:
                 g = 2.0 / eps - u_norm / (eps * eps)
             th = qd.tanh(slide.dot(t) / eps)
-            mu_ax = 0.5 * (self.verts_info[i_v].mu_forward + self.verts_info[i_v].mu_backward) + 0.5 * (
-                self.verts_info[i_v].mu_forward - self.verts_info[i_v].mu_backward
-            ) * th
+            mu_ax = (
+                0.5 * (self.verts_info[i_v].mu_forward + self.verts_info[i_v].mu_backward)
+                + 0.5 * (self.verts_info[i_v].mu_forward - self.verts_info[i_v].mu_backward) * th
+            )
             P = mu_ax * t.outer_product(t) + self.verts_info[i_v].mu_lateral * b.outer_product(b)
             H -= qd.cast(lam_n * g, qd.f64) * qd.cast(P, qd.f64)
             H += A_f + coupling
@@ -1643,7 +1830,10 @@ class VBDSolver(Solver):
             w0 = self._func_vertex_weight(B0, role)
             for r in qd.static(range(4)):
                 if r != role:
-                    out += qd.cast(self._func_rest_block(i_e, w0, self._func_vertex_weight_static(B0, r)), qd.f64) @ vec[self.elems_info[i_e].v[r], i_b]
+                    out += (
+                        qd.cast(self._func_rest_block(i_e, w0, self._func_vertex_weight_static(B0, r)), qd.f64)
+                        @ vec[self.elems_info[i_e].v[r], i_b]
+                    )
         return out
 
     @qd.func
@@ -1681,7 +1871,16 @@ class VBDSolver(Solver):
                         wj0 = self._func_vertex_weight_static(B0, r)
                         v0 = self.elems_info[i_e].v
                         p00 = self.verts[f + 1, v0[0], i_b].pos
-                        F0 = qd.Matrix.cols([self.verts[f + 1, v0[1], i_b].pos - p00, self.verts[f + 1, v0[2], i_b].pos - p00, self.verts[f + 1, v0[3], i_b].pos - p00]) @ B0
+                        F0 = (
+                            qd.Matrix.cols(
+                                [
+                                    self.verts[f + 1, v0[1], i_b].pos - p00,
+                                    self.verts[f + 1, v0[2], i_b].pos - p00,
+                                    self.verts[f + 1, v0[3], i_b].pos - p00,
+                                ]
+                            )
+                            @ B0
+                        )
                         u = F0 @ a
                         l = u.norm()
                         u_hat = u / l
@@ -1728,13 +1927,18 @@ class VBDSolver(Solver):
         for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
             i_c = self.vc_cons[c]
             if self.cons_hist[f + 1, i_c, i_b].k_eff != 0.0:
-                e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+                e = (
+                    self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos
+                    - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+                )
                 out += (self.cons_zeta[i_c, i_b] * qd.cast(self.vc_side[c], qd.f64)) * qd.cast(e / e.norm(), qd.f64)
         for c in range(self.va_offset[i_v], self.va_offset[i_v + 1]):
             i_c = self.va_cons[c]
             if self.acons_hist[f + 1, i_c, i_b].k_eff != 0.0:
                 u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
-                out += self.acons_zeta[i_c, i_b] * self._func_angle_slot_grad(self.va_slot[c], u_hat, v_hat, lu, lv, cosv)
+                out += self.acons_zeta[i_c, i_b] * self._func_angle_slot_grad(
+                    self.va_slot[c], u_hat, v_hat, lu, lv, cosv
+                )
         return out
 
     # ------------------------------------------------------------------------------------
@@ -1785,8 +1989,10 @@ class VBDSolver(Solver):
                 q = qd.cast(cof @ w, qd.f64)
                 dq = qd.cast(dcof @ w + cof @ dw, qd.f64)
                 V = qd.cast(self.elems_info[i_e].vol_rest, qd.f64)
-                dH = V * (qd.cast(2.0 * mu * w.dot(dw), qd.f64) * p.dot(dx)
-                          + qd.cast(lam, qd.f64) * (dq.dot(p) * q.dot(dx) + q.dot(p) * dq.dot(dx)))
+                dH = V * (
+                    qd.cast(2.0 * mu * w.dot(dw), qd.f64) * p.dot(dx)
+                    + qd.cast(lam, qd.f64) * (dq.dot(p) * q.dot(dx) + q.dot(p) * dq.dot(dx))
+                )
                 qd.atomic_add(self.muscle_actu_adj[group, i_b], -qd.cast(dg, qd.f64).dot(p) - dH)
 
     @qd.func
@@ -1812,7 +2018,16 @@ class VBDSolver(Solver):
                 w0_i = self._func_vertex_weight(B0f, role)
                 vf = self.elems_info[i_e].v
                 p0f = self.verts[f + 1, vf[0], i_b].pos
-                F0f = qd.Matrix.cols([self.verts[f + 1, vf[1], i_b].pos - p0f, self.verts[f + 1, vf[2], i_b].pos - p0f, self.verts[f + 1, vf[3], i_b].pos - p0f]) @ B0f
+                F0f = (
+                    qd.Matrix.cols(
+                        [
+                            self.verts[f + 1, vf[1], i_b].pos - p0f,
+                            self.verts[f + 1, vf[2], i_b].pos - p0f,
+                            self.verts[f + 1, vf[3], i_b].pos - p0f,
+                        ]
+                    )
+                    @ B0f
+                )
                 uf = F0f @ af
                 lf = uf.norm()
                 uh = qd.cast(uf / lf, qd.f64)
@@ -1834,7 +2049,11 @@ class VBDSolver(Solver):
                     Vd = qd.cast(V, qd.f64)
                     lamd = qd.cast(lam, qd.f64)
                     # gradient tangent: (dg_i/dx_j)^T p
-                    grad_t = Vd * (qd.cast(mu * w_i.dot(w_j), qd.f64) * p + lamd * q_i.dot(p) * q_j + lamd * qd.cast(J - alpha, qd.f64) * a.cross(p))
+                    grad_t = Vd * (
+                        qd.cast(mu * w_i.dot(w_j), qd.f64) * p
+                        + lamd * q_i.dot(p) * q_j
+                        + lamd * qd.cast(J - alpha, qd.f64) * a.cross(p)
+                    )
                     # Hessian tangent: only q_i depends on the state, and it vanishes on the diagonal
                     hess_t = Vd * lamd * (q_i.dot(dx) * a.cross(p) + q_i.dot(p) * a.cross(dx))
                     if self.elems_info[i_e].k_fiber > 0.0:
@@ -1845,12 +2064,23 @@ class VBDSolver(Solver):
                         wj0 = self._func_vertex_weight_static(B0, r)
                         v0 = self.elems_info[i_e].v
                         p00 = self.verts[f + 1, v0[0], i_b].pos
-                        F0 = qd.Matrix.cols([self.verts[f + 1, v0[1], i_b].pos - p00, self.verts[f + 1, v0[2], i_b].pos - p00, self.verts[f + 1, v0[3], i_b].pos - p00]) @ B0
+                        F0 = (
+                            qd.Matrix.cols(
+                                [
+                                    self.verts[f + 1, v0[1], i_b].pos - p00,
+                                    self.verts[f + 1, v0[2], i_b].pos - p00,
+                                    self.verts[f + 1, v0[3], i_b].pos - p00,
+                                ]
+                            )
+                            @ B0
+                        )
                         u = F0 @ aa
                         l = u.norm()
                         u_hat = qd.cast(u / l, qd.f64)
                         cf = qd.cast(V * self.elems_info[i_e].k_fiber * wi0.dot(aa) * wj0.dot(aa), qd.f64)
-                        grad_t += cf * (u_hat.dot(p) * u_hat + qd.cast((l - 1.0) / l, qd.f64) * (p - u_hat.dot(p) * u_hat))
+                        grad_t += cf * (
+                            u_hat.dot(p) * u_hat + qd.cast((l - 1.0) / l, qd.f64) * (p - u_hat.dot(p) * u_hat)
+                        )
                     if qd.static(self._damping > 0.0):
                         # Rayleigh damping uses the constant rest Hessian, whose transpose is the swap of its arguments
                         B0 = self.elems_info[i_e].B_rest
@@ -1897,10 +2127,18 @@ class VBDSolver(Solver):
             dmu_ax = 0.5 * (mu_f - mu_bw) * (1.0 - th * th) / eps
             td = qd.cast(t, qd.f64)
             bd = qd.cast(b, qd.f64)
-            A = qd.cast(mu_ax, qd.f64) * td.dot(p) * td.dot(dx) + qd.cast(self.verts_info[i_v].mu_lateral, qd.f64) * bd.dot(p) * bd.dot(dx)
+            A = qd.cast(mu_ax, qd.f64) * td.dot(p) * td.dot(dx) + qd.cast(
+                self.verts_info[i_v].mu_lateral, qd.f64
+            ) * bd.dot(p) * bd.dot(dx)
             e_z = qd.Vector([0.0, 0.0, 1.0], dt=qd.f64)
             by_depth = -qd.cast(k, qd.f64) * qd.cast(g, qd.f64) * A * e_z
-            by_slide = qd.cast(lam_n, qd.f64) * A * qd.cast(dg, qd.f64) / qd.max(qd.cast(u_norm, qd.f64), 1e-300) * qd.cast(slide, qd.f64)
+            by_slide = (
+                qd.cast(lam_n, qd.f64)
+                * A
+                * qd.cast(dg, qd.f64)
+                / qd.max(qd.cast(u_norm, qd.f64), 1e-300)
+                * qd.cast(slide, qd.f64)
+            )
             by_blend = qd.cast(lam_n * g * dmu_ax, qd.f64) * td.dot(p) * td.dot(dx) * td
             tangent = by_depth + by_slide + by_blend
             tangent_prev = -(by_slide + by_blend)
@@ -1932,9 +2170,13 @@ class VBDSolver(Solver):
         nv = u_hat - cosv * v_hat
         H = qd.Matrix.zero(qd.f64, 3, 3)
         if s < 2 and t < 2:
-            H = -(u_hat.outer_product(nu) + nu.outer_product(u_hat) + cosv * (I3 - u_hat.outer_product(u_hat))) / (lu * lu)
+            H = -(u_hat.outer_product(nu) + nu.outer_product(u_hat) + cosv * (I3 - u_hat.outer_product(u_hat))) / (
+                lu * lu
+            )
         elif s >= 2 and t >= 2:
-            H = -(v_hat.outer_product(nv) + nv.outer_product(v_hat) + cosv * (I3 - v_hat.outer_product(v_hat))) / (lv * lv)
+            H = -(v_hat.outer_product(nv) + nv.outer_product(v_hat) + cosv * (I3 - v_hat.outer_product(v_hat))) / (
+                lv * lv
+            )
         elif s < 2:
             H = ((I3 - v_hat.outer_product(v_hat)) - u_hat.outer_product(nv)) / (lu * lv)
         else:
@@ -1971,9 +2213,15 @@ class VBDSolver(Solver):
         sides = 1.0  # d|mult| / d(dist) is k times the number of unclamped sides, from the live state
         if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
             sides = 0.0
-            if kd_raw * (dist - qd.cast(self.cons_info[i_c].hi, qd.f64)) + qd.cast(self.cons[i_c, i_b].lam_hi, qd.f64) > 0.0:
+            if (
+                kd_raw * (dist - qd.cast(self.cons_info[i_c].hi, qd.f64)) + qd.cast(self.cons[i_c, i_b].lam_hi, qd.f64)
+                > 0.0
+            ):
                 sides += 1.0
-            if kd_raw * (dist - qd.cast(self.cons_info[i_c].lo, qd.f64)) + qd.cast(self.cons[i_c, i_b].lam_lo, qd.f64) < 0.0:
+            if (
+                kd_raw * (dist - qd.cast(self.cons_info[i_c].lo, qd.f64)) + qd.cast(self.cons[i_c, i_b].lam_lo, qd.f64)
+                < 0.0
+            ):
                 sides += 1.0
         d_abs = kd_raw * sides
         if multd < 0.0:
@@ -2026,7 +2274,9 @@ class VBDSolver(Solver):
                 beta = qd.cast(self._k_start / self._constraint_tol, qd.f64)
                 if qd.static(not self._ramp_active):
                     beta = 0.0
-                if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(self._constraint_k_max_ratio * self._k_start, qd.f64):
+                if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(
+                    self._constraint_k_max_ratio * self._k_start, qd.f64
+                ):
                     sides_v = 1.0
                     if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
                         sides_v = 0.0
@@ -2070,7 +2320,9 @@ class VBDSolver(Solver):
                 beta = qd.cast(self.acons_info[i_c].k0 / self._angle_tol, qd.f64)
                 if qd.static(not self._ramp_active):
                     beta = 0.0
-                if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(self._constraint_k_max_ratio, qd.f64) * qd.cast(self.acons_info[i_c].k0, qd.f64):
+                if kd + beta * qd.abs(qd.cast(violation, qd.f64)) < qd.cast(
+                    self._constraint_k_max_ratio, qd.f64
+                ) * qd.cast(self.acons_info[i_c].k0, qd.f64):
                     sides_v = 1.0
                     if self.acons_info[i_c].lo < self.acons_info[i_c].hi:
                         sides_v = 0.0
@@ -2139,7 +2391,9 @@ class VBDSolver(Solver):
                 self.adj[f, i_v, i_b].pos -= fr_prev
             if qd.static(self._damping > 0.0):
                 force_u, H_u, K0_ii = self._func_vertex_system(f, i_v, i_b)
-                self.adj[f, i_v, i_b].pos += qd.cast(self._damping / self._substep_dt, qd.f64) * (qd.cast(K0_ii, qd.f64) @ p)
+                self.adj[f, i_v, i_b].pos += qd.cast(self._damping / self._substep_dt, qd.f64) * (
+                    qd.cast(K0_ii, qd.f64) @ p
+                )
             self._func_scatter_reverse(f, i_v, i_b, p, dx)
             self._func_actuation_reverse(f, i_v, i_b, p, dx)
             for c in range(self.vc_offset[i_v], self.vc_offset[i_v + 1]):
@@ -2147,7 +2401,10 @@ class VBDSolver(Solver):
                 s = 0
                 if self.vc_side[c] < 0.0:
                     s = 1
-                e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+                e = (
+                    self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos
+                    - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+                )
                 nrm = qd.cast(e / e.norm(), qd.f64)
                 mult, violation_unused = self._func_constraint_mult(i_c, i_b, e.norm())
                 # the multiplier enters the block through the constraint force, d g_s / d lam = sigma_s n
@@ -2197,7 +2454,10 @@ class VBDSolver(Solver):
                 dHk = 0.0
                 if mult != 0.0:
                     dHk = g_s.dot(p) * g_s.dot(dx)
-                qd.atomic_add(self.acons_bar[i_c, i_b].k, -(cosv - qd.cast(self.acons_info[i_c].hi, qd.f64)) * (g_s.dot(p) + s_m * proxy) - dHk)
+                qd.atomic_add(
+                    self.acons_bar[i_c, i_b].k,
+                    -(cosv - qd.cast(self.acons_info[i_c].hi, qd.f64)) * (g_s.dot(p) + s_m * proxy) - dHk,
+                )
                 for t in qd.static(range(4)):
                     j = vq[t]
                     if j != i_v:
@@ -2246,16 +2506,28 @@ class VBDSolver(Solver):
             for c in qd.static(range(self._n_colors)):
                 for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
                     i_v = self.color_perm[k]
-                    rhs = self.gbar[i_v, i_b] - self._func_offdiag_apply(f, i_v, i_b, self.z) - self._func_zeta_force(f, i_v, i_b)
+                    rhs = (
+                        self.gbar[i_v, i_b]
+                        - self._func_offdiag_apply(f, i_v, i_b, self.z)
+                        - self._func_zeta_force(f, i_v, i_b)
+                    )
                     self.z[i_v, i_b] = self._func_diag_block(f, i_v, i_b).transpose().inverse() @ rhs
             if qd.static(self._n_constraints > 0):
                 for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
                     if self.cons_hist[f + 1, i_c, i_b].k_eff != 0.0:
-                        self.cons_zeta[i_c, i_b] += self._constraint_dual_relaxation * self.cons_hist[f + 1, i_c, i_b].k_eff * self._func_constraint_dot_z(f, i_c, i_b)
+                        self.cons_zeta[i_c, i_b] += (
+                            self._constraint_dual_relaxation
+                            * self.cons_hist[f + 1, i_c, i_b].k_eff
+                            * self._func_constraint_dot_z(f, i_c, i_b)
+                        )
             if qd.static(self._n_angle_constraints > 0):
                 for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
                     if self.acons_hist[f + 1, i_c, i_b].k_eff != 0.0:
-                        self.acons_zeta[i_c, i_b] += self._constraint_dual_relaxation * self.acons_hist[f + 1, i_c, i_b].k_eff * self._func_angle_dot_z(f, i_c, i_b)
+                        self.acons_zeta[i_c, i_b] += (
+                            self._constraint_dual_relaxation
+                            * self.acons_hist[f + 1, i_c, i_b].k_eff
+                            * self._func_angle_dot_z(f, i_c, i_b)
+                        )
 
     @qd.kernel
     def _kernel_adjoint_residual(self, f: qd.i32):
@@ -2271,14 +2543,20 @@ class VBDSolver(Solver):
         # while G z is still large on exactly the constraints the skeleton exists for.
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
             if self.cons_hist[f + 1, i_c, i_b].k_eff != 0.0:
-                qd.atomic_max(self.adj_residual[None], self.cons_hist[f + 1, i_c, i_b].k_eff * qd.abs(self._func_constraint_dot_z(f, i_c, i_b)))
+                qd.atomic_max(
+                    self.adj_residual[None],
+                    self.cons_hist[f + 1, i_c, i_b].k_eff * qd.abs(self._func_constraint_dot_z(f, i_c, i_b)),
+                )
         for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
             if self.acons_hist[f + 1, i_c, i_b].k_eff != 0.0:
                 u_hat, v_hat, lu, lv, cosv = self._func_angle_geometry(f, i_c, i_b)
                 g_max = 0.0
                 for slot in qd.static(range(4)):
                     g_max = qd.max(g_max, self._func_angle_slot_grad(slot, u_hat, v_hat, lu, lv, cosv).norm())
-                qd.atomic_max(self.adj_residual[None], self.acons_hist[f + 1, i_c, i_b].k_eff * g_max * qd.abs(self._func_angle_dot_z(f, i_c, i_b)))
+                qd.atomic_max(
+                    self.adj_residual[None],
+                    self.acons_hist[f + 1, i_c, i_b].k_eff * g_max * qd.abs(self._func_angle_dot_z(f, i_c, i_b)),
+                )
 
     @qd.kernel
     def _kernel_adjoint_accumulate(self, f: qd.i32):
@@ -2296,7 +2574,9 @@ class VBDSolver(Solver):
                 # so dL/dx^t -= (dr/dx^t)^T z gives +(k_d/h) (K0 z)_i over the diagonal block and the neighbours
                 force_unused, H_unused, K0_ii = self._func_vertex_system(f, i_v, i_b)
                 kd_h = self._damping * inv_h
-                self.adj[f, i_v, i_b].pos += kd_h * (qd.cast(K0_ii, qd.f64) @ z + self._func_offdiag_rest(i_v, i_b, self.z))
+                self.adj[f, i_v, i_b].pos += kd_h * (
+                    qd.cast(K0_ii, qd.f64) @ z + self._func_offdiag_rest(i_v, i_b, self.z)
+                )
         for i_e, i_b in qd.ndrange(self._n_elements, self._B):
             group = self.elems_info[i_e].group
             if group >= 0:
@@ -2378,7 +2658,13 @@ class VBDSolver(Solver):
             if self.elems_info[i_e].k_fiber > 0.0:
                 v = self.elems_info[i_e].v
                 p0 = self.verts[f + 1, v[0], i_b].pos
-                Ds = qd.Matrix.cols([self.verts[f + 1, v[1], i_b].pos - p0, self.verts[f + 1, v[2], i_b].pos - p0, self.verts[f + 1, v[3], i_b].pos - p0])
+                Ds = qd.Matrix.cols(
+                    [
+                        self.verts[f + 1, v[1], i_b].pos - p0,
+                        self.verts[f + 1, v[2], i_b].pos - p0,
+                        self.verts[f + 1, v[3], i_b].pos - p0,
+                    ]
+                )
                 l = (Ds @ self.elems_info[i_e].B_rest @ self.elems_info[i_e].fiber).norm()
                 psi += 0.5 * self.elems_info[i_e].k_fiber * (l - 1.0) ** 2
             self.energy[i_b] += qd.cast(self.elems_info[i_e].vol_rest * psi, qd.f64)
@@ -2386,13 +2672,21 @@ class VBDSolver(Solver):
     @qd.kernel
     def _kernel_constraint_energy(self, f: qd.i32):
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-            e = self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            e = (
+                self.verts[f + 1, self.cons_info[i_c].v[0], i_b].pos
+                - self.verts[f + 1, self.cons_info[i_c].v[1], i_b].pos
+            )
             dist = e.norm()
             k = self.cons[i_c, i_b].k
             if self.cons_info[i_c].lo < self.cons_info[i_c].hi:
                 c_hi = qd.max(dist - self.cons_info[i_c].hi, 0.0)
                 c_lo = qd.min(dist - self.cons_info[i_c].lo, 0.0)
-                self.energy[i_b] += qd.cast(0.5 * k * (c_hi * c_hi + c_lo * c_lo) + self.cons[i_c, i_b].lam_hi * c_hi + self.cons[i_c, i_b].lam_lo * c_lo, qd.f64)
+                self.energy[i_b] += qd.cast(
+                    0.5 * k * (c_hi * c_hi + c_lo * c_lo)
+                    + self.cons[i_c, i_b].lam_hi * c_hi
+                    + self.cons[i_c, i_b].lam_lo * c_lo,
+                    qd.f64,
+                )
             else:
                 C = dist - self.cons_info[i_c].hi
                 self.energy[i_b] += qd.cast(0.5 * k * C * C + self.cons[i_c, i_b].lam_hi * C, qd.f64)
@@ -2422,7 +2716,13 @@ class VBDSolver(Solver):
                 rigid = self.rigid_attachment.rigid
                 if self.rigid_attachment.is_articulated:
                     kernel_begin_articulation(
-                        f, self, self.rigid_attachment, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config
+                        f,
+                        self,
+                        self.rigid_attachment,
+                        rigid.dyn_state,
+                        rigid.dyn_info,
+                        rigid.rigid_info,
+                        rigid.rigid_config,
                     )
                 else:
                     kernel_begin_attachment(f, self, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info)
@@ -2432,6 +2732,8 @@ class VBDSolver(Solver):
             if self._n_constraints > 0 or self._n_angle_constraints > 0:
                 self._kernel_warm_start()
             self._kernel_predict(f)
+            if self.contact is not None:
+                kernel_begin_contact(f, self, self.contact, self._sim.rigid_solver.dyn_state)
             if self._self_thickness > 0.0:
                 self._kernel_build_hash(f)
                 # Reading the flag waits for the device, so it is read once a step, not once a substep. An
@@ -2444,6 +2746,8 @@ class VBDSolver(Solver):
                     )
             self.solve(f)
             self._kernel_update_velocity(f)
+            if self.contact is not None:
+                kernel_end_contact(f, self, self.contact, self._sim.rigid_solver.dyn_state)
             if self.rigid_attachment is not None:
                 if self.rigid_attachment.is_articulated:
                     kernel_end_articulation(self._substep_dt, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info)
@@ -2573,6 +2877,8 @@ class VBDSolver(Solver):
                 kernel_set_attachment_state(
                     envs_idx, state.attachment_multiplier, state.attachment_stiffness, self.rigid_attachment.state
                 )
+            if self.contact is not None:
+                kernel_reset_contact(envs_idx, self.contact, self._sim.rigid_solver.dyn_state)
 
     def get_state(self, f):
         if not self.is_active:
