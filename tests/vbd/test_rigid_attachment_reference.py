@@ -192,7 +192,10 @@ def test_rigid_attachment_helpers_match_torch_reference():
     exact_curvature = (force_scale * rotated_anchor).sum(dim=1)[:, None, None] * identity3 - 0.5 * (
         force_scale[:, :, None] * rotated_anchor[:, None, :] + rotated_anchor[:, :, None] * force_scale[:, None, :]
     )
-    expected_rigid_H6[:, 3:, 3:] += torch.diag_embed(torch.linalg.vector_norm(exact_curvature, dim=1))
+    curvature_values, curvature_vectors = torch.linalg.eigh(exact_curvature)
+    expected_rigid_H6[:, 3:, 3:] += (
+        curvature_vectors @ torch.diag_embed(torch.clamp(curvature_values, min=0.0)) @ curvature_vectors.transpose(1, 2)
+    )
 
     soft_force = _field_tensor(soft_force_field, (3,))
     soft_H = _field_tensor(soft_H_field, (3, 3))

@@ -82,9 +82,10 @@ def func_attachment_blocks(
     """Return attachment forces and local positive-semidefinite curvature blocks.
 
     C = x - p - R local_anchor - alpha previous_error and y = multiplier + stiffness C.
-    The rigid Jacobian is [-I, skew(r)]. Its Gauss-Newton block is augmented by
-    diag(norm(K[:, j])), where K is the exact rotational curvature. K itself is
-    generally indefinite and is not returned as the solve curvature.
+    The rigid Jacobian is [-I, skew(r)]. Its Gauss-Newton block is augmented by the
+    positive part of K, the exact rotational curvature (eigenvalues clamped at zero).
+    K itself is generally indefinite; the augmented block is at least the exact local
+    Hessian, so the block step never overshoots its quadratic model.
     """
     rotated_anchor, force_scale = _func_attachment_values(
         x, p, quaternion, local_anchor, multiplier, stiffness, previous_error, alpha
@@ -109,11 +110,10 @@ def func_attachment_blocks(
     exact_curvature = force_scale.dot(rotated_anchor) * identity - 0.5 * (
         force_scale.outer_product(rotated_anchor) + rotated_anchor.outer_product(force_scale)
     )
-    for column in qd.static(range(3)):
-        column_norm_squared = gs.qd_float(0.0)
-        for row in qd.static(range(3)):
-            column_norm_squared += exact_curvature[row, column] * exact_curvature[row, column]
-        rigid_H6[column + 3, column + 3] += qd.sqrt(column_norm_squared)
+    positive_curvature = qd.make_spd(exact_curvature)
+    for row in qd.static(range(3)):
+        for column in qd.static(range(3)):
+            rigid_H6[row + 3, column + 3] += positive_curvature[row, column]
 
     return soft_force, soft_H, rigid_force6, rigid_H6
 
