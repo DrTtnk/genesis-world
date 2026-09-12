@@ -41,6 +41,7 @@ from genesis.engine.solvers.vbd_contact import (
     kernel_end_contact,
     kernel_prescribe_links,
     kernel_reset_contact,
+    kernel_set_prescribed_state,
     kernel_set_prescribed_targets,
 )
 from genesis.engine.solvers.vbd_rigid import func_attachment_soft_system
@@ -54,6 +55,7 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     kernel_set_attachment_state,
     kernel_set_vertex_state,
 )
+from genesis.engine.solvers.vbd_contact import EnvStatus
 from genesis.engine.states.solvers import VBDSolverState
 from genesis.utils.array_class import ErrorCode
 from genesis.utils.misc import qd_to_torch, sanitize_index
@@ -101,6 +103,7 @@ class VBDSolver(Solver):
         self._prescribed_colliders = []
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_cell_cap = options.contact_cell_cap
+        self._raise_on_env_failure = options.raise_on_env_failure
 
     @property
     def has_rigid_attachment(self):
@@ -175,6 +178,13 @@ class VBDSolver(Solver):
             gs.raise_exception("A contact rule needs stiffness > 0, thickness > 0 and friction >= 0.")
         self._contact_rules.append((int(group_a), int(group_b), float(stiffness), float(friction), float(thickness)))
 
+    def env_status(self):
+        """Per-environment failure latch: `is_failed` (bool, shape (B,)), the global substep index at which the
+        environment failed (`failed_substep`, -1 while it runs) and the raw contact error word. A failed environment
+        keeps the state of its failed attempt for diagnosis and advances again only after a reset."""
+        errno = qd_to_torch(self.contact.errno) if self.contact is not None else torch.zeros(self._B, dtype=torch.int32)
+        return EnvStatus(qd_to_torch(self.env_failed) != 0, qd_to_torch(self.failed_substep), errno)
+
     def contact_diagnostics(self):
         """Candidate pair counts, largest tissue and rigid contact-vertex motion of the last substep, and the raw
         error word, each of shape (B,). See `ContactDiagnostics`."""
@@ -227,6 +237,11 @@ class VBDSolver(Solver):
             shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA
         )
         self.residual = qd.field(dtype=qd.f64, shape=())
+        # Per-environment failure latch: 1 once a substep of that environment failed. A latched environment skips
+        # every update until it is reset, so its state stays at the failed attempt for diagnosis.
+        self.env_failed = qd.field(dtype=gs.qd_int, shape=(self._B,))
+        self.failed_substep = qd.field(dtype=gs.qd_int, shape=(self._B,))
+        self.failed_substep.fill(-1)
         # Where each pinned vertex is told to be. A prescribed boundary is per environment, because
         # every environment poses its skeleton differently, while which vertices are pinned is a
         # property of the rig and so is shared.
@@ -1127,13 +1142,13 @@ class VBDSolver(Solver):
         """One Newton step of vertex i_v, then the dual updates of the constraints it owns (relaxation w, stiffness
         ramp on or off), recording their multipliers for the adjoint when `record` is set. w = 0 skips the duals.
         `sweep` is the index of this sweep within the substep, for the replay buffer."""
-        if not self.verts_info[i_v].pinned:
+        if not self.verts_info[i_v].pinned and not self.env_failed[i_b]:
             force, H, K_unused = self._func_vertex_system(f, i_v, i_b)
             dx = H.inverse() @ force
             if qd.static(self._record_sweeps):
                 self.sweep_dx[f, sweep, i_v, i_b] = qd.cast(dx, qd.f64)
             self.verts[f + 1, i_v, i_b].pos += qd.cast(dx, gs.qd_float)
-        if w > 0.0:
+        if w > 0.0 and not self.env_failed[i_b]:
             for c in range(self.vo_offset[i_v], self.vo_offset[i_v + 1]):
                 i_c = self.vo_cons[c]
                 self._func_dual_update(f, i_c, i_b, w, ramp)
@@ -1182,7 +1197,9 @@ class VBDSolver(Solver):
     @qd.kernel
     def _kernel_predict(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            if self.verts_info[i_v].pinned:
+            if self.env_failed[i_b]:
+                self.verts[f + 1, i_v, i_b].pos = self.verts[f, i_v, i_b].pos
+            elif self.verts_info[i_v].pinned:
                 self.verts[f + 1, i_v, i_b].pos = self.pin_target[i_v, i_b]
             else:
                 self.verts[f + 1, i_v, i_b].pos = self._func_inertia_target(f, i_v, i_b)
@@ -1278,9 +1295,11 @@ class VBDSolver(Solver):
             self._func_sweep(f, sweep)
             if qd.static(self.has_rigid_attachment):
                 for i_b in range(self._B):
-                    func_solve_attachment_link(f, i_b, self, self.rigid_attachment)
+                    if not self.env_failed[i_b]:
+                        func_solve_attachment_link(f, i_b, self, self.rigid_attachment)
                 for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
-                    func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
+                    if not self.env_failed[i_b]:
+                        func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
             # the pairs restart from zero next substep, so the dual update after the last sweep would only skew
             # the reported reactions away from the forces the sweep applied
             if qd.static(self.has_contact and sweep < self._n_iterations - 1):
@@ -1411,13 +1430,15 @@ class VBDSolver(Solver):
         """Multiplier decay per substep: lam <- alpha gamma lam, k <- max(k_start, gamma k) (the AVBD warm start, run
         every substep rather than per frame; see useful_knowledge.md, 2026-09-06)."""
         for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-            self.cons[i_c, i_b].lam_hi *= 0.95 * 0.99
-            self.cons[i_c, i_b].lam_lo *= 0.95 * 0.99
-            self.cons[i_c, i_b].k = qd.max(self._k_start, 0.99 * self.cons[i_c, i_b].k)
+            if not self.env_failed[i_b]:
+                self.cons[i_c, i_b].lam_hi *= 0.95 * 0.99
+                self.cons[i_c, i_b].lam_lo *= 0.95 * 0.99
+                self.cons[i_c, i_b].k = qd.max(self._k_start, 0.99 * self.cons[i_c, i_b].k)
         for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
-            self.acons[i_c, i_b].lam_hi *= 0.95 * 0.99
-            self.acons[i_c, i_b].lam_lo *= 0.95 * 0.99
-            self.acons[i_c, i_b].k = qd.max(self.acons_info[i_c].k0, 0.99 * self.acons[i_c, i_b].k)
+            if not self.env_failed[i_b]:
+                self.acons[i_c, i_b].lam_hi *= 0.95 * 0.99
+                self.acons[i_c, i_b].lam_lo *= 0.95 * 0.99
+                self.acons[i_c, i_b].k = qd.max(self.acons_info[i_c].k0, 0.99 * self.acons[i_c, i_b].k)
 
     @qd.kernel
     def _kernel_constraint_error(self, f: qd.i32):
@@ -1500,9 +1521,12 @@ class VBDSolver(Solver):
     @qd.kernel
     def _kernel_update_velocity(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-            self.verts[f + 1, i_v, i_b].vel = (
-                self.verts[f + 1, i_v, i_b].pos - self.verts[f, i_v, i_b].pos
-            ) / self._substep_dt
+            if self.env_failed[i_b]:
+                self.verts[f + 1, i_v, i_b].vel = self.verts[f, i_v, i_b].vel
+            else:
+                self.verts[f + 1, i_v, i_b].vel = (
+                    self.verts[f + 1, i_v, i_b].pos - self.verts[f, i_v, i_b].pos
+                ) / self._substep_dt
 
     @qd.kernel
     def _kernel_residual(self, f: qd.i32):
@@ -2802,6 +2826,7 @@ class VBDSolver(Solver):
                     kernel_prescribe_links(
                         (substep_in_step + 1) / self._sim.substeps,
                         substep_in_step == 0,
+                        self,
                         self.contact,
                         rigid.dyn_state,
                         rigid.dyn_info,
@@ -2822,12 +2847,18 @@ class VBDSolver(Solver):
             self.solve(f)
             self._kernel_update_velocity(f)
             if self.contact is not None:
-                kernel_end_contact(f, self, self.contact, self._sim.rigid_solver.dyn_state)
+                kernel_end_contact(
+                    f, self._sim.cur_substep_global, self, self.contact, self._sim.rigid_solver.dyn_state
+                )
             if self.rigid_attachment is not None:
                 if self.rigid_attachment.is_articulated:
-                    kernel_end_articulation(self._substep_dt, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info)
+                    kernel_end_articulation(
+                        self._substep_dt, self, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info
+                    )
                 else:
-                    kernel_end_attachment(self.rigid_attachment, rigid.dyn_state, rigid.rigid_info, self._substep_dt)
+                    kernel_end_attachment(
+                        self, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info, self._substep_dt
+                    )
                 rigid.commit_vbd_link()
 
     def substep_post_coupling(self, f):
@@ -2952,12 +2983,26 @@ class VBDSolver(Solver):
                 kernel_set_attachment_state(
                     envs_idx, state.attachment_multiplier, state.attachment_stiffness, self.rigid_attachment.state
                 )
+            kernel_clear_env_failure(envs_idx, self.env_failed, self.failed_substep)
             if self.contact is not None:
                 kernel_reset_contact(envs_idx, self.contact, self._sim.rigid_solver.dyn_state)
+                if state.prescribed_start_pos is not None:
+                    kernel_set_prescribed_state(
+                        envs_idx,
+                        state.prescribed_start_pos,
+                        state.prescribed_start_quat,
+                        state.prescribed_target_pos,
+                        state.prescribed_target_quat,
+                        self.contact,
+                    )
 
     def get_state(self, f):
         if not self.is_active:
             return None
+        if bool((qd_to_torch(self.env_failed) != 0).any()):
+            gs.raise_exception(
+                "An environment failed a contact step; its state is diagnostic only. Reset it before taking a snapshot."
+            )
         state = VBDSolverState(self._scene)
         self._kernel_get_state(f, state.pos, state.vel)
         state.muscle_actuation = qd_to_torch(self.muscle_actu, transpose=True, copy=True).contiguous()
@@ -2967,6 +3012,19 @@ class VBDSolver(Solver):
             ).contiguous()
             state.attachment_stiffness = qd_to_torch(
                 self.rigid_attachment.state.stiffness, transpose=True, copy=True
+            ).contiguous()
+        if self.contact is not None:
+            state.prescribed_start_pos = qd_to_torch(
+                self.contact.prescribed_start.pos, transpose=True, copy=True
+            ).contiguous()
+            state.prescribed_start_quat = qd_to_torch(
+                self.contact.prescribed_start.quat, transpose=True, copy=True
+            ).contiguous()
+            state.prescribed_target_pos = qd_to_torch(
+                self.contact.prescribed_target.pos, transpose=True, copy=True
+            ).contiguous()
+            state.prescribed_target_quat = qd_to_torch(
+                self.contact.prescribed_target.quat, transpose=True, copy=True
             ).contiguous()
         return state
 
@@ -3020,3 +3078,10 @@ class VBDSolver(Solver):
     @property
     def color_offsets(self):
         return self._color_offsets
+
+
+@qd.kernel
+def kernel_clear_env_failure(envs_idx: qd.types.ndarray(), env_failed: qd.template(), failed_substep: qd.template()):
+    for i_b_ in range(envs_idx.shape[0]):
+        env_failed[envs_idx[i_b_]] = 0
+        failed_substep[envs_idx[i_b_]] = -1

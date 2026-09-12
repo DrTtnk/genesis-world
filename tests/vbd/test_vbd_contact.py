@@ -745,3 +745,124 @@ def test_opposed_colliders_squeeze_tissue_symmetrically(n_envs, show_viewer):
     assert (positions[..., 0].mean(dim=-1).abs() < 5e-4).all()
     assert (positions[..., 0].max(dim=-1).values < 0.02 - 0.004).all()
     assert torch.isfinite(positions).all()
+
+
+def test_failed_environment_latches_while_its_peer_continues_and_snapshots_replay(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+            batch_links_info=True,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-10.0,
+            damping=2e-3,
+            raise_on_env_failure=False,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.0, 0.0, 0.02),
+        ),
+        show_viewer=show_viewer,
+    )
+    table = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.2, 0.2, 0.02),
+            pos=(0.0, 0.0, -0.01),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(),
+    )
+    meal = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=_prescribed_box_xml((0.0, 0.0, 0.06), (0.01, 0.01, 0.01)),
+        ),
+        material=gs.materials.Rigid(),
+    )
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.0, 0.0, 0.0211),
+            nobisect=False,
+            maxvolume=1e-5,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=1e5,
+            nu=0.3,
+            collision_group=1,
+        ),
+    )
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0)
+    scene.vbd_solver.add_prescribed_collider(meal, collision_group=2, link=meal.links[1])
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(1, 2, stiffness=1e5, friction=0.3, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(0, 2, stiffness=1e5, friction=0.3, thickness=1e-3)
+    scene.build(n_envs=2)
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=gs.device).expand(2, 1, 4).clone()
+    pos = torch.tensor([0.0, 0.0, 0.06], device=gs.device).expand(2, 1, 3).clone()
+    # both environments press 4 mm into the cube (the box bottom meets the top after 8.9 mm)
+    for i in range(40):
+        pos[..., 2] = 0.06 - 0.0129 * (i + 1) / 40
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    # a snapshot taken between two commands carries the prescribed phase: the same commands replay bit-exactly
+    snapshot = scene.get_state()
+    for i in range(5):
+        pos[..., 2] = 0.0471 - 0.0005 * (i + 1)
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    expected_tissue = tissue.get_positions().clone()
+    expected_meal = meal.get_links_pos().clone()
+    scene.reset(snapshot)
+    for i in range(5):
+        pos[..., 2] = 0.0471 - 0.0005 * (i + 1)
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    assert_allclose(tissue.get_positions(), expected_tissue, atol=1e-9)
+    assert_allclose(meal.get_links_pos(), expected_meal, atol=1e-9)
+    # environment 0 is commanded through the table while environment 1 holds
+    for i in range(40):
+        pos[0, 0, 2] = 0.0446 - 0.06 * (i + 1) / 40
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+        status = scene.vbd_solver.env_status()
+        if bool(status.is_failed[0]):
+            break
+    status = scene.vbd_solver.env_status()
+    assert bool(status.is_failed[0]) and not bool(status.is_failed[1])
+    assert int(status.failed_substep[0]) > 0 and int(status.failed_substep[1]) == -1
+    assert int(status.errno[0]) != 0
+    frozen_tissue = tissue.get_positions()[0].clone()
+    frozen_meal = meal.get_links_pos()[0].clone()
+    peer_before = tissue.get_positions()[1].clone()
+    for i in range(10):
+        pos[0, 0, 2] -= 0.0015
+        pos[1, 0, 2] -= 0.0002
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    # the failed environment keeps the state of its failed attempt; its peer keeps advancing
+    assert_allclose(tissue.get_positions()[0], frozen_tissue, atol=0.0)
+    assert_allclose(meal.get_links_pos()[0], frozen_meal, atol=0.0)
+    assert (tissue.get_positions()[1] - peer_before).abs().max() > 1e-4
+    assert_allclose(meal.get_links_pos()[1, 1, 2], pos[1, 0, 2], atol=1e-6)
+    with pytest.raises(gs.GenesisException, match="diagnostic only"):
+        scene.get_state()
+    # resetting the failed environment alone clears its latch and leaves the peer untouched
+    peer_before = tissue.get_positions()[1].clone()
+    scene.reset(snapshot, envs_idx=[0])
+    status = scene.vbd_solver.env_status()
+    assert not bool(status.is_failed[0]) and int(status.failed_substep[0]) == -1 and int(status.errno[0]) == 0
+    assert_allclose(tissue.get_positions()[1], peer_before, atol=0.0)
+    assert_allclose(
+        tissue.get_positions()[0], snapshot.solvers_state[scene.sim.solvers.index(scene.vbd_solver)].pos[0], atol=0.0
+    )
+    pos[0, 0, 2] = 0.0471
+    scene.vbd_solver.set_prescribed_targets(pos, quat)
+    scene.step()
+    assert not bool(scene.vbd_solver.env_status().is_failed.any())

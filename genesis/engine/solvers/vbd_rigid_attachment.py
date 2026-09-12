@@ -118,39 +118,41 @@ def kernel_begin_attachment(
     f: int, solver: qd.template(), attachment: qd.template(), dyn_state: DynState, rigid_info: RigidInfo
 ):
     for i_b in range(solver._B):
-        pos = gs.qd_vec3(rigid_info.qpos[0, i_b], rigid_info.qpos[1, i_b], rigid_info.qpos[2, i_b])
-        quat = gs.qd_vec4(
-            rigid_info.qpos[3, i_b], rigid_info.qpos[4, i_b], rigid_info.qpos[5, i_b], rigid_info.qpos[6, i_b]
-        )
-        velocity = gs.qd_vec3(0.0, 0.0, 0.0)
-        angular = gs.qd_vec3(0.0, 0.0, 0.0)
-        inertia_local = qd.Matrix.zero(gs.qd_float, 3, 3)
-        for i in qd.static(range(3)):
-            velocity[i] = dyn_state.dofs.vel[i, i_b] + solver._substep_dt * dyn_state.dofs.acc[i, i_b]
-            angular[i] = dyn_state.dofs.vel[i + 3, i_b] + solver._substep_dt * dyn_state.dofs.acc[i + 3, i_b]
-            for j in qd.static(range(3)):
-                inertia_local[i, j] = rigid_info.mass_mat[i + 3, j + 3, i_b]
-        rotation = gu.qd_quat_to_R(quat, gs.EPS)
-        predicted_pos = pos + solver._substep_dt * velocity
-        predicted_quat = func_quaternion_update(quat, solver._substep_dt * (rotation @ angular))
-        attachment.link_state[i_b].previous_pos = pos
-        attachment.link_state[i_b].previous_quat = quat
-        attachment.link_state[i_b].predicted_pos = predicted_pos
-        attachment.link_state[i_b].predicted_quat = predicted_quat
-        attachment.link_state[i_b].pos = predicted_pos
-        attachment.link_state[i_b].quat = predicted_quat
-        attachment.link_state[i_b].inertia = rotation @ inertia_local @ rotation.transpose()
-        attachment.link_state[i_b].mass = rigid_info.mass_mat[0, 0, i_b]
+        if not solver.env_failed[i_b]:
+            pos = gs.qd_vec3(rigid_info.qpos[0, i_b], rigid_info.qpos[1, i_b], rigid_info.qpos[2, i_b])
+            quat = gs.qd_vec4(
+                rigid_info.qpos[3, i_b], rigid_info.qpos[4, i_b], rigid_info.qpos[5, i_b], rigid_info.qpos[6, i_b]
+            )
+            velocity = gs.qd_vec3(0.0, 0.0, 0.0)
+            angular = gs.qd_vec3(0.0, 0.0, 0.0)
+            inertia_local = qd.Matrix.zero(gs.qd_float, 3, 3)
+            for i in qd.static(range(3)):
+                velocity[i] = dyn_state.dofs.vel[i, i_b] + solver._substep_dt * dyn_state.dofs.acc[i, i_b]
+                angular[i] = dyn_state.dofs.vel[i + 3, i_b] + solver._substep_dt * dyn_state.dofs.acc[i + 3, i_b]
+                for j in qd.static(range(3)):
+                    inertia_local[i, j] = rigid_info.mass_mat[i + 3, j + 3, i_b]
+            rotation = gu.qd_quat_to_R(quat, gs.EPS)
+            predicted_pos = pos + solver._substep_dt * velocity
+            predicted_quat = func_quaternion_update(quat, solver._substep_dt * (rotation @ angular))
+            attachment.link_state[i_b].previous_pos = pos
+            attachment.link_state[i_b].previous_quat = quat
+            attachment.link_state[i_b].predicted_pos = predicted_pos
+            attachment.link_state[i_b].predicted_quat = predicted_quat
+            attachment.link_state[i_b].pos = predicted_pos
+            attachment.link_state[i_b].quat = predicted_quat
+            attachment.link_state[i_b].inertia = rotation @ inertia_local @ rotation.transpose()
+            attachment.link_state[i_b].mass = rigid_info.mass_mat[0, 0, i_b]
     for i_a, i_b in qd.ndrange(attachment.n_attachments, solver._B):
-        attachment.previous_error[i_a, i_b] = (
-            solver.verts[f, attachment.info[i_a].vertex, i_b].pos
-            - attachment.link_state[i_b].previous_pos
-            - gu.qd_transform_by_quat_fast(attachment.info[i_a].local_pos, attachment.link_state[i_b].previous_quat)
-        )
-        attachment.state[i_a, i_b].multiplier *= attachment.alpha * attachment.gamma
-        attachment.state[i_a, i_b].stiffness = qd.max(
-            solver._k_start, attachment.gamma * attachment.state[i_a, i_b].stiffness
-        )
+        if not solver.env_failed[i_b]:
+            attachment.previous_error[i_a, i_b] = (
+                solver.verts[f, attachment.info[i_a].vertex, i_b].pos
+                - attachment.link_state[i_b].previous_pos
+                - gu.qd_transform_by_quat_fast(attachment.info[i_a].local_pos, attachment.link_state[i_b].previous_quat)
+            )
+            attachment.state[i_a, i_b].multiplier *= attachment.alpha * attachment.gamma
+            attachment.state[i_a, i_b].stiffness = qd.max(
+                solver._k_start, attachment.gamma * attachment.state[i_a, i_b].stiffness
+            )
 
 
 @qd.func
@@ -216,19 +218,28 @@ def func_update_attachment_dual(f, i_a, i_b, solver: qd.template(), attachment: 
 
 
 @qd.kernel
-def kernel_end_attachment(attachment: qd.template(), dyn_state: DynState, rigid_info: RigidInfo, dt: float):
+def kernel_end_attachment(
+    solver: qd.template(), attachment: qd.template(), dyn_state: DynState, rigid_info: RigidInfo, dt: float
+):
     for i_b in range(dyn_state.dofs.vel.shape[1]):
-        state = attachment.link_state[i_b]
-        velocity = (state.pos - state.previous_pos) / dt
-        angular = gu.qd_inv_transform_by_quat(
-            func_quaternion_difference(state.quat, state.previous_quat) / dt, state.quat
-        )
-        for j in qd.static(range(3)):
-            rigid_info.qpos_next[j, i_b] = state.pos[j]
-            dyn_state.dofs.vel_next[j, i_b] = velocity[j]
-            dyn_state.dofs.vel_next[j + 3, i_b] = angular[j]
-        for j in qd.static(range(4)):
-            rigid_info.qpos_next[j + 3, i_b] = state.quat[j]
+        if solver.env_failed[i_b]:
+            # a failed environment keeps its pose and velocity
+            for j in qd.static(range(7)):
+                rigid_info.qpos_next[j, i_b] = rigid_info.qpos[j, i_b]
+            for j in qd.static(range(6)):
+                dyn_state.dofs.vel_next[j, i_b] = dyn_state.dofs.vel[j, i_b]
+        else:
+            state = attachment.link_state[i_b]
+            velocity = (state.pos - state.previous_pos) / dt
+            angular = gu.qd_inv_transform_by_quat(
+                func_quaternion_difference(state.quat, state.previous_quat) / dt, state.quat
+            )
+            for j in qd.static(range(3)):
+                rigid_info.qpos_next[j, i_b] = state.pos[j]
+                dyn_state.dofs.vel_next[j, i_b] = velocity[j]
+                dyn_state.dofs.vel_next[j + 3, i_b] = angular[j]
+            for j in qd.static(range(4)):
+                rigid_info.qpos_next[j + 3, i_b] = state.quat[j]
 
 
 @qd.kernel

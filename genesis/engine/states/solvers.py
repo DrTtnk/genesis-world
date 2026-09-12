@@ -290,6 +290,10 @@ class VBDSolverState:
         self.attachment_multiplier = None
         self.attachment_stiffness = None
         self.muscle_actuation = None
+        self.prescribed_start_pos = None
+        self.prescribed_start_quat = None
+        self.prescribed_target_pos = None
+        self.prescribed_target_quat = None
 
     def serializable(self):
         self._scene = None

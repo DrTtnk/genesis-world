@@ -977,6 +977,11 @@ class VBDOptions(Options):
     contact_cell_cap : int, optional
         Largest number of contact vertices per hash-grid cell. Overflow fails the substep; raise it for meshes much
         finer than the contact thickness. Defaults to 64.
+    raise_on_env_failure : bool, optional
+        Whether a contact failure in any environment raises at the next step. A failed environment always stops
+        advancing (its positions, prescribed motion and multipliers freeze) until it is reset. True stops the
+        program at the first failure, which suits a single environment; False lets the other environments of a
+        batch continue and leaves reading `VBDSolver.env_status()` to the caller. Defaults to True.
     """
 
     dt: PositiveFloat | None = None
@@ -999,6 +1004,7 @@ class VBDOptions(Options):
     max_dual_steps: PositiveInt = 200
     contact_pair_cap: PositiveInt = 65536
     contact_cell_cap: PositiveInt = 64
+    raise_on_env_failure: StrictBool = True
 
 
 class SFOptions(Options):
