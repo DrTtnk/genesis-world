@@ -1,5 +1,7 @@
-import pytest
+import xml.etree.ElementTree as ET
+
 import numpy as np
+import pytest
 import torch
 
 import genesis as gs
@@ -265,3 +267,217 @@ def test_cloth_attach_rigid_link(show_viewer):
     link_disp = link_pos2 - link_pos1
     cloth_disp = cloth_pos2 - cloth_pos1
     assert ((cloth_disp.movedim(0, -2) - link_disp).norm(dim=-1) > 0.2).all()
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+@pytest.mark.parametrize("compliance", [0.0, 1e-4])
+def test_cloth_attachment_reaction(n_envs, compliance, show_viewer, tol):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.002,
+            substeps=1,
+            gravity=(0, 0, 0),
+        ),
+        pbd_options=gs.options.PBDOptions(
+            particle_size=0.025,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.5, 0.8),
+            camera_lookat=(0, 0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    box = scene.add_entity(
+        morph=gs.morphs.Box(
+            pos=(0, 0, 0.5),
+            size=(0.02, 0.02, 0.02),
+        ),
+        material=gs.materials.Rigid(
+            rho=1000,
+            needs_coup=False,
+        ),
+        surface=gs.surfaces.Default(
+            vis_mode="collision",
+        ),
+    )
+    cloth = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file="meshes/cloth.obj",
+            pos=(0, 0, 0.5),
+            scale=0.1,
+        ),
+        material=gs.materials.PBD.Cloth(
+            air_resistance=0,
+        ),
+        surface=gs.surfaces.Default(
+            vis_mode="particle",
+        ),
+    )
+    scene.build(n_envs=n_envs)
+    for invalid_link in (True, -1, scene.rigid_solver.n_links, 0.5):
+        with pytest.raises(gs.GenesisException, match="link_idx must identify"):
+            cloth.attach_particles_to_link(invalid_link)
+    for invalid_compliance in (True, -1.0, np.nan, np.inf):
+        with pytest.raises(gs.GenesisException, match="compliance must be finite and nonnegative"):
+            cloth.attach_particles_to_link(box.links[0].idx, compliance=invalid_compliance)
+    cloth.attach_particles_to_link(box.links[0].idx, compliance=compliance)
+    box.set_dofs_velocity([0.1, 0, 0, 0, 0, 1])
+    box_mass = box.get_mass()
+    cloth_mass = cloth.get_mass()
+    initial_momentum = box_mass * box.get_vel()
+    origin = box.get_pos().clone()
+    inertia = box.links[0].inertial_i[2, 2]
+    initial_angular_momentum = inertia * box.get_ang()
+    scene.step()
+    angular_momentum = inertia * box.get_ang() + box_mass * torch.cross(box.get_pos() - origin, box.get_vel(), dim=-1)
+    angular_momentum = angular_momentum + cloth_mass[..., None] * torch.cross(
+        cloth.get_particles_pos() - origin.unsqueeze(-2), cloth.get_particles_vel(), dim=-1
+    ).mean(-2)
+    assert_allclose(angular_momentum, initial_angular_momentum, atol=1e-9, rtol=0)
+    assert (box.get_ang()[..., 2] < 0.9).all()
+    for _ in range(19):
+        scene.step()
+        momentum = box_mass * box.get_vel() + cloth_mass[..., None] * cloth.get_particles_vel().mean(-2)
+        assert_allclose(momentum / box_mass, initial_momentum / box_mass, atol=tol, rtol=0)
+    assert (box.get_vel()[..., 0] < 0.09).all()
+    cloth.release_particle()
+    box.set_dofs_velocity([0.1, 0, 0, 0, 0, 0])
+    scene.step()
+    assert_allclose(box.get_vel(), [0.1, 0, 0], atol=tol, rtol=0)
+    cloth.attach_particles_to_link(box.links[0].idx, compliance=compliance)
+    scene.reset()
+    box.set_dofs_velocity([0.1, 0, 0, 0, 0, 0])
+    scene.step()
+    assert_allclose(box.get_vel(), [0.1, 0, 0], atol=tol, rtol=0)
+    assert_allclose(cloth.get_particles_vel(), 0, atol=tol, rtol=0)
+    if n_envs:
+        cloth.attach_particles_to_link(box.links[0].idx, envs_idx=[1], compliance=compliance)
+        scene.step()
+        assert_allclose(box.get_vel(envs_idx=[0]), [0.1, 0, 0], atol=tol, rtol=0)
+        assert (box.get_vel(envs_idx=[1])[..., 0] < 0.09).all()
+
+
+@pytest.fixture
+def attachment_hinge_xml(is_fixed):
+    mjcf = ET.Element("mujoco")
+    world = ET.SubElement(mjcf, "worldbody")
+    rotor = ET.SubElement(world, "body", name="rotor", pos="0 0 0.5")
+    if not is_fixed:
+        ET.SubElement(rotor, "joint", name="pivot", type="hinge", axis="0 0 1", damping="0", armature="0")
+    ET.SubElement(rotor, "geom", type="box", size="0.01 0.01 0.01", mass="0.008")
+    return ET.tostring(mjcf, encoding="unicode")
+
+
+@pytest.mark.required
+def test_cloth_attachment_rejects_unequal_clocks(show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.002),
+        pbd_options=gs.options.PBDOptions(dt=0.001, particle_size=0.025),
+        show_viewer=show_viewer,
+    )
+    box = scene.add_entity(gs.morphs.Box(size=(0.02, 0.02, 0.02)))
+    cloth = scene.add_entity(
+        gs.morphs.Mesh(file="meshes/cloth.obj", scale=0.1),
+        material=gs.materials.PBD.Cloth(),
+        surface=gs.surfaces.Default(vis_mode="particle"),
+    )
+    scene.build()
+    with pytest.raises(gs.GenesisException, match="equal rigid and PBD substep durations"):
+        cloth.attach_particles_to_link(box.links[0].idx)
+
+
+@pytest.mark.required
+def test_cloth_resolution_preserves_collision_diameter(show_viewer, tol):
+    counts = []
+    masses = []
+    for ratio in (1.0, 0.5):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(gravity=(0, 0, 0)),
+            pbd_options=gs.options.PBDOptions(particle_size=0.02, cloth_mesh_size_ratio=ratio),
+            show_viewer=show_viewer,
+        )
+        scene.add_entity(gs.morphs.Plane())
+        cloth = scene.add_entity(
+            gs.morphs.Mesh(file="meshes/cloth.obj", scale=0.1, pos=(0, 0, 0.001)),
+            material=gs.materials.PBD.Cloth(air_resistance=0),
+            surface=gs.surfaces.Default(vis_mode="particle"),
+        )
+        scene.build()
+        scene.step()
+        assert scene.pbd_solver.particle_size == 0.02
+        assert_allclose(cloth.get_particles_pos()[..., 2], 0.01, atol=tol, rtol=0)
+        counts.append(cloth.n_particles)
+        masses.append(cloth.get_mass())
+    assert counts[1] > 2 * counts[0]
+    assert_allclose(masses[0], masses[1], atol=tol, rtol=0)
+
+
+@pytest.mark.required
+def test_cloth_resolution_rejects_invalid_ratio():
+    for ratio in (0, -1, np.nan, np.inf, True, "0.5"):
+        with pytest.raises(gs.GenesisException, match="cloth_mesh_size_ratio"):
+            gs.options.PBDOptions(cloth_mesh_size_ratio=ratio)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+@pytest.mark.parametrize("is_fixed", [False, True])
+def test_cloth_attachment_joint_torque(n_envs, is_fixed, attachment_hinge_xml, show_viewer, tol):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.002,
+            substeps=1,
+            gravity=(0, 0, 0),
+        ),
+        pbd_options=gs.options.PBDOptions(
+            particle_size=0.025,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.5, 0.8),
+            camera_lookat=(0, 0.05, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    rotor = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=attachment_hinge_xml,
+        ),
+        material=gs.materials.Rigid(
+            needs_coup=False,
+        ),
+        surface=gs.surfaces.Default(
+            vis_mode="collision",
+        ),
+    )
+    cloth = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file="meshes/cloth.obj",
+            pos=(0, 0.1, 0.5),
+            scale=0.1,
+        ),
+        material=gs.materials.PBD.Cloth(
+            air_resistance=0,
+        ),
+        surface=gs.surfaces.Default(
+            vis_mode="particle",
+        ),
+    )
+    scene.build(n_envs=n_envs)
+    link = rotor.get_link("rotor")
+    cloth.attach_particles_to_link(link.idx)
+    cloth.set_particles_vel([0.1, 0, 0])
+    mass = cloth.get_mass()
+    origin = link.get_pos().unsqueeze(-2)
+    initial_momentum = mass * torch.cross(cloth.get_particles_pos() - origin, cloth.get_particles_vel(), dim=-1)[
+        ..., 2
+    ].mean(-1)
+    scene.step()
+    momentum = mass * torch.cross(cloth.get_particles_pos() - origin, cloth.get_particles_vel(), dim=-1)[..., 2].mean(-1)
+    momentum = momentum + link.inertial_i[2, 2] * link.get_ang()[..., 2]
+    if is_fixed:
+        assert_allclose(cloth.get_particles_vel(), 0, atol=tol, rtol=0)
+    else:
+        assert_allclose(momentum, initial_momentum, atol=1e-9, rtol=0)
+        assert (rotor.get_dofs_velocity() < -0.01).all()
+    assert_allclose(link.get_pos(), [0, 0, 0.5], atol=tol, rtol=0)

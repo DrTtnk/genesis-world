@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from genesis.typing import NonNegativeFloat, PositiveFloat, ValidFloat
 
@@ -29,6 +29,8 @@ class Cloth(Base["PBD2DEntity"]):
         The stretch relaxation. Smaller value weakens the stretch constraint. Default is 0.3.
     bending_relaxation : float, optional
         The bending relaxation. Smaller value weakens the bending constraint. Default is 0.1.
+    bending_reference : {"flat", "mesh"}, optional
+        Rest curvature. "flat" preserves the historical planar target; "mesh" uses the initial simulation mesh.
     air_resistance : float, optional
         The air resistance. Damping force due to air drag. Default is 1e-3.
     """
@@ -40,4 +42,5 @@ class Cloth(Base["PBD2DEntity"]):
     bending_compliance: NonNegativeFloat = 1e-5
     stretch_relaxation: ValidFloat = 0.3
     bending_relaxation: ValidFloat = 0.1
+    bending_reference: Literal["flat", "mesh"] = "flat"
     air_resistance: NonNegativeFloat = 1e-3

@@ -20,16 +20,41 @@ Muscle actuation changes the rest shape, not the energy: a tet with fiber `m` an
 uses `B_a = B A`, `A = (1/s) m m^T + sqrt(s) (I - m m^T)`, `s = 1 - a gain`, `det A = 1`.
 """
 
-import numpy as np
 import networkx as nx
-import quadrants as qd
+import numpy as np
 import torch
+
+import quadrants as qd
 
 import genesis as gs
 from genesis.engine.entities.vbd_entity import VBDEntity
+from genesis.engine.solvers.vbd_articulation import (
+    kernel_begin_articulation,
+    kernel_end_articulation,
+    kernel_sweeps_articulation,
+)
+from genesis.engine.solvers.vbd_rigid import func_attachment_soft_system
+from genesis.engine.solvers.vbd_rigid_attachment import (
+    VBDRigidAttachment,
+    func_attachment_pose,
+    func_solve_attachment_link,
+    func_update_attachment_dual,
+    kernel_begin_attachment,
+    kernel_end_attachment,
+    kernel_set_attachment_state,
+    kernel_set_vertex_state,
+)
 from genesis.engine.states.solvers import VBDSolverState
+from genesis.utils.misc import qd_to_torch, sanitize_index
 
 from .base_solver import Solver
+
+
+@qd.kernel
+def kernel_set_muscle_state(envs_idx: qd.types.ndarray(), state: qd.types.ndarray(), actuation: qd.template()):
+    for i_g, i_b_ in qd.ndrange(actuation.shape[0], envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        actuation[i_g, i_b] = state[i_b, i_g]
 
 
 @qd.data_oriented
@@ -57,6 +82,12 @@ class VBDSolver(Solver):
                 "self_collision_thickness > 0 would give a wrong gradient."
             )
         self._grad_converge = options.grad_converge
+        self.rigid_attachment = None
+        self._n_muscle_groups = 0
+
+    @property
+    def has_rigid_attachment(self):
+        return self.rigid_attachment is not None
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
@@ -255,7 +286,6 @@ class VBDSolver(Solver):
         self._n_elements = self.n_elements
         self._n_vverts = self.n_vverts
         self._n_vfaces = self.n_vfaces
-        self._n_muscle_groups = max((getattr(e.material, "n_groups", 0) for e in self._entities), default=0)
 
         if self.is_active:
             self.init_vertex_fields()
@@ -320,6 +350,9 @@ class VBDSolver(Solver):
                     f"{self._n_colors} colours). Compiling that needs tens of gigabytes. Use fewer sweeps, or more "
                     f"substeps instead of more sweeps."
                 )
+            attached_entities = [entity for entity in self._entities if entity._rigid_links]
+            if attached_entities:
+                self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
     def _init_self_collision(self, elems):
@@ -454,9 +487,12 @@ class VBDSolver(Solver):
             el_start=self.n_elements,
             vvert_start=self.n_vverts,
             vface_start=self.n_vfaces,
+            muscle_group_start=self._n_muscle_groups,
             name=name,
         )
         self._entities.append(entity)
+        if isinstance(material, gs.materials.VBD.Muscle):
+            self._n_muscle_groups += material.n_groups
         return entity
 
     # ------------------------------------------------------------------------------------
@@ -598,12 +634,12 @@ class VBDSolver(Solver):
                 self.elems_info[i_e].fiber[j] = fiber[i_e_, j]
 
     def set_actuation(self, actus):
-        self._kernel_set_actuation(actus)
+        self._kernel_set_actuation(0, actus)
 
     @qd.kernel
-    def _kernel_set_actuation(self, actus: qd.types.ndarray()):
+    def _kernel_set_actuation(self, group_start: int, actus: qd.types.ndarray()):
         for i_g, i_b in qd.ndrange(actus.shape[0], actus.shape[1]):
-            self.muscle_actu[i_g, i_b] = actus[i_g, i_b]
+            self.muscle_actu[group_start + i_g, i_b] = actus[i_g, i_b]
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------- physics --------------------------------------
@@ -866,6 +902,18 @@ class VBDSolver(Solver):
                 lam_b = k * pen * self.bolus[i_b].friction
                 force -= qd.cast(lam_b * g, self._acc) * qd.cast(slide, self._acc)
                 H += qd.cast(lam_b * g, self._acc) * qd.cast(qd.Matrix.identity(gs.qd_float, 3) - n_b.outer_product(n_b), self._acc)
+        if qd.static(self.has_rigid_attachment):
+            i_a = self.rigid_attachment.vertex_attachment[i_v]
+            if i_a >= 0:
+                pos, quat = func_attachment_pose(i_a, i_b, self.rigid_attachment)
+                force_a, hessian_a = func_attachment_soft_system(
+                    x, pos, quat,
+                    self.rigid_attachment.info[i_a].local_pos, self.rigid_attachment.state[i_a, i_b].multiplier,
+                    self.rigid_attachment.state[i_a, i_b].stiffness,
+                    self.rigid_attachment.previous_error[i_a, i_b], self.rigid_attachment.alpha,
+                )
+                force += qd.cast(force_a, self._acc)
+                H += qd.cast(hessian_a, self._acc)
         return force, H, K0
 
     @qd.func
@@ -1019,33 +1067,42 @@ class VBDSolver(Solver):
 
     @qd.kernel
     def _kernel_sweeps(self, f: qd.i32):
-        """`n_iterations` Gauss-Seidel sweeps in one launch. Each top-level loop is a serial task with an implicit
+        for sweep in qd.static(range(self._n_iterations)):
+            self._func_sweep(f, sweep)
+            if qd.static(self.has_rigid_attachment):
+                for i_b in range(self._B):
+                    func_solve_attachment_link(f, i_b, self, self.rigid_attachment)
+                for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
+                    func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
+
+    @qd.func
+    def _func_sweep(self, f, sweep: qd.template()):
+        """One Gauss-Seidel sweep. Each top-level loop is a serial task with an implicit
         barrier after it, so the statically unrolled color loops are race-free without a Python round trip. The
         constraints' dual updates ride inside the color pass of their owner vertex (see `_owner_csr`): a pass of
         their own would be a few thousand threads behind a barrier, and cost half the step on the ladder body."""
-        for sweep in qd.static(range(self._n_iterations)):
-            if qd.static(self._record_sweeps and self._n_constraints > 0):
-                for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-                    self.cons_rec[f, sweep, i_c, i_b].lam_hi = self.cons[i_c, i_b].lam_hi
-                    self.cons_rec[f, sweep, i_c, i_b].lam_lo = self.cons[i_c, i_b].lam_lo
-                    self.cons_rec[f, sweep, i_c, i_b].k = self.cons[i_c, i_b].k
-            if qd.static(self._record_sweeps and self._n_angle_constraints > 0):
-                for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
-                    self.acons_rec[f, sweep, i_c, i_b].lam_hi = self.acons[i_c, i_b].lam_hi
-                    self.acons_rec[f, sweep, i_c, i_b].lam_lo = self.acons[i_c, i_b].lam_lo
-                    self.acons_rec[f, sweep, i_c, i_b].k = self.acons[i_c, i_b].k
-            for c in qd.static(range(self._n_colors)):
-                if qd.static(self._self_thickness > 0.0):
-                    for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
-                        self.pos_lag[i_v, i_b] = self.verts[f + 1, i_v, i_b].pos
-                for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    # the stiffness ramp is frozen when the sweeps are being differentiated: its coefficient is
-                    # k_start / constraint_tol, about 3e9 on the snake, and it multiplies straight into the position
-                    # adjoint, which makes the executed map wildly expansive (measured: 1e13 over one step against
-                    # 4.2 with the stiffness held). A fixed stiffness also converges better (useful_knowledge.md).
-                    self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation,
-                                            1.0 if qd.static(self._ramp_active) else 0.0,
-                                            sweep == self._n_iterations - 1, sweep)
+        if qd.static(self._record_sweeps and self._n_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+                self.cons_rec[f, sweep, i_c, i_b].lam_hi = self.cons[i_c, i_b].lam_hi
+                self.cons_rec[f, sweep, i_c, i_b].lam_lo = self.cons[i_c, i_b].lam_lo
+                self.cons_rec[f, sweep, i_c, i_b].k = self.cons[i_c, i_b].k
+        if qd.static(self._record_sweeps and self._n_angle_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+                self.acons_rec[f, sweep, i_c, i_b].lam_hi = self.acons[i_c, i_b].lam_hi
+                self.acons_rec[f, sweep, i_c, i_b].lam_lo = self.acons[i_c, i_b].lam_lo
+                self.acons_rec[f, sweep, i_c, i_b].k = self.acons[i_c, i_b].k
+        for c in qd.static(range(self._n_colors)):
+            if qd.static(self._self_thickness > 0.0):
+                for i_v, i_b in qd.ndrange(self._n_vertices, self._B):
+                    self.pos_lag[i_v, i_b] = self.verts[f + 1, i_v, i_b].pos
+            for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
+                # the stiffness ramp is frozen when the sweeps are being differentiated: its coefficient is
+                # k_start / constraint_tol, about 3e9 on the snake, and it multiplies straight into the position
+                # adjoint, which makes the executed map wildly expansive (measured: 1e13 over one step against
+                # 4.2 with the stiffness held). A fixed stiffness also converges better (useful_knowledge.md).
+                self._func_solve_vertex(f, self.color_perm[k], i_b, self._constraint_dual_relaxation,
+                                        1.0 if qd.static(self._ramp_active) else 0.0,
+                                        sweep == self._n_iterations - 1, sweep)
 
     @qd.func
     def _func_record_constraint(self, f, i_c, i_b):
@@ -1268,7 +1325,11 @@ class VBDSolver(Solver):
         own tolerance too. (A dual update on an unconverged iterate overshoots at the stiffness cap and limit-cycles
         instead of converging.)"""
         if not self._sim.requires_grad or not self._grad_converge:
-            self._kernel_sweeps(f)  # the fast path: a fixed number of sweeps, the duals fused into the colour passes
+            if self.rigid_attachment is not None and self.rigid_attachment.is_articulated:
+                rigid = self.rigid_attachment.rigid
+                kernel_sweeps_articulation(f, self, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config)
+            else:
+                self._kernel_sweeps(f)
             return
         # The force scale of this substep: the imbalance left at the predicted position, floored by the body's own
         # weight so that a body already at rest still has a finite scale. An absolute newton tolerance is meaningless
@@ -2357,6 +2418,14 @@ class VBDSolver(Solver):
 
     def substep_pre_coupling(self, f):
         if self.is_active:
+            if self.rigid_attachment is not None:
+                rigid = self.rigid_attachment.rigid
+                if self.rigid_attachment.is_articulated:
+                    kernel_begin_articulation(
+                        f, self, self.rigid_attachment, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config
+                    )
+                else:
+                    kernel_begin_attachment(f, self, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info)
             # every substep, gradients or not: at two sweeps the primal is never converged within a substep, and this
             # decay is the dual damping that stops the multipliers integrating stale violations (once per step, as the
             # AVBD paper does per frame, the ladder python's spine stretch went from 0.2 to 8 percent)
@@ -2375,6 +2444,12 @@ class VBDSolver(Solver):
                     )
             self.solve(f)
             self._kernel_update_velocity(f)
+            if self.rigid_attachment is not None:
+                if self.rigid_attachment.is_articulated:
+                    kernel_end_articulation(self._substep_dt, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info)
+                else:
+                    kernel_end_attachment(self.rigid_attachment, rigid.dyn_state, rigid.rigid_info, self._substep_dt)
+                rigid.commit_vbd_link()
 
     def substep_post_coupling(self, f):
         pass
@@ -2491,13 +2566,27 @@ class VBDSolver(Solver):
 
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
-            self._kernel_set_state(f, state.pos, state.vel)
+            envs_idx = sanitize_index(envs_idx, -1, self._B, 0, "envs_idx")
+            kernel_set_vertex_state(f, envs_idx, state.pos, state.vel, self.verts)
+            kernel_set_muscle_state(envs_idx, state.muscle_actuation, self.muscle_actu)
+            if self.rigid_attachment is not None:
+                kernel_set_attachment_state(
+                    envs_idx, state.attachment_multiplier, state.attachment_stiffness, self.rigid_attachment.state
+                )
 
     def get_state(self, f):
         if not self.is_active:
             return None
         state = VBDSolverState(self._scene)
         self._kernel_get_state(f, state.pos, state.vel)
+        state.muscle_actuation = qd_to_torch(self.muscle_actu, transpose=True, copy=True).contiguous()
+        if self.rigid_attachment is not None:
+            state.attachment_multiplier = qd_to_torch(
+                self.rigid_attachment.state.multiplier, transpose=True, copy=True
+            ).contiguous()
+            state.attachment_stiffness = qd_to_torch(
+                self.rigid_attachment.state.stiffness, transpose=True, copy=True
+            ).contiguous()
         return state
 
     @qd.kernel

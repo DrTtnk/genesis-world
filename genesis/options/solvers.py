@@ -1,7 +1,7 @@
 from typing import Any, Literal
 
 import numpy as np
-from pydantic import PrivateAttr, StrictBool, model_validator
+from pydantic import Field, PrivateAttr, StrictBool, model_validator
 
 import genesis as gs
 from genesis.typing import NonNegativeFloat, NonNegativeInt, PositiveFloat, PositiveInt, UnitVec4FType, Vec3FType
@@ -787,6 +787,9 @@ class PBDOptions(Options):
         Maximum number of iterations for the solving viscosity constraints. Defaults to 1.
     particle_size : float, optional
         Particle diameter in meters. Defaults to 1e-2.
+    cloth_mesh_size_ratio : float, optional
+        Cloth remeshing edge length divided by particle diameter. Defaults to 1.0.
+        Reduce this ratio to refine cloth without changing collision thickness.
     hash_grid_res : tuple, optional
         Size of the spatially-repetitive spatial hashing grid in meters. If none, it will be computed automatically. Defaults to None.
     hash_grid_cell_size : float, optional
@@ -809,6 +812,7 @@ class PBDOptions(Options):
 
     # self collision
     particle_size: PositiveFloat = 1e-2
+    cloth_mesh_size_ratio: float = Field(default=1.0, gt=0, allow_inf_nan=False, strict=True)
 
     # spatial hashing
     hash_grid_res: Vec3FType | None = None  # size of the spatially-repetitive hash grid in meters

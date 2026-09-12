@@ -259,6 +259,7 @@ class RigidSolver(KinematicSolver):
 
     def __init__(self, scene: "Scene", sim: "Simulator", options: RigidOptions) -> None:
         super().__init__(scene, sim, options)
+        self._has_vbd_ownership = False
 
         self._enable_collision = options.enable_collision
         self._enable_multi_contact = options.enable_multi_contact
@@ -1409,6 +1410,8 @@ class RigidSolver(KinematicSolver):
             self._is_backward,
         )
 
+        if self._has_vbd_ownership:
+            return
         if isinstance(self.sim.coupler, SAPCoupler):
             update_qvel(self.dyn_state, self.rigid_info, self.rigid_config)
         else:
@@ -1429,6 +1432,39 @@ class RigidSolver(KinematicSolver):
                 kernel_save_adjoint_cache(
                     f + 1, self.dyn_state, self._rigid_adjoint_cache, self.rigid_info, self.rigid_config
                 )
+
+    def claim_vbd_links(self):
+        """Assign integration to vertex block descent (VBD), returning whether the system uses hinge coordinates."""
+        is_articulated = self.n_dofs > 0 and all(
+            joint.type in (gs.JOINT_TYPE.FIXED, gs.JOINT_TYPE.REVOLUTE) for joint in self.joints
+        )
+        if not is_articulated and not (
+            self.n_links == 1 and self.n_dofs == 6 and self.n_qs == 7 and self.joints[0].type == gs.JOINT_TYPE.FREE
+        ):
+            gs.raise_exception("VBD rigid coupling requires one free link or fixed-base revolute joints.")
+        if self._requires_grad or self._use_hibernation or self.n_equalities:
+            gs.raise_exception("VBD rigid ownership requires forward dynamics without hibernation or equalities.")
+        if self._enable_collision or self._integrator != gs.integrator.Euler:
+            gs.raise_exception("VBD rigid ownership requires enable_collision=False and the Euler integrator.")
+        if not isinstance(self.sim.coupler_options, gs.options.LegacyCouplerOptions):
+            gs.raise_exception("VBD rigid ownership requires the legacy coupler.")
+        if (self.get_dofs_frictionloss() != 0).any():
+            gs.raise_exception("VBD rigid ownership does not support joint frictionloss.")
+        if not is_articulated:
+            if np.linalg.norm(self.links[0].inertial_pos) > gs.EPS:
+                gs.raise_exception("VBD free-link ownership requires the link origin at its centre of mass.")
+            if (self.get_dofs_armature() != 0).any() or (self.get_dofs_damping() != 0).any():
+                gs.raise_exception("The VBD free-link spike requires zero armature and joint damping.")
+        if self._has_vbd_ownership:
+            gs.raise_exception("Rigid integration ownership has already been assigned.")
+        self._has_vbd_ownership = True
+        return is_articulated
+
+    def commit_vbd_link(self):
+        """Commit the VBD next pose and velocity, then refresh all derived rigid state on device."""
+        kernel_commit_vbd_link(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, self._errno)
+        self._is_forward_pos_updated = True
+        self._is_forward_vel_updated = True
 
     def get_error_envs_mask(self):
         return qd_to_torch(self._errno) > 0
@@ -1930,6 +1966,8 @@ class RigidSolver(KinematicSolver):
             shift_dst = qd_to_torch(self.dyn_state.links.i_pos_shift, transpose=True, copy=False)
             cfrc_vel_dst = qd_to_torch(self.dyn_state.links.cfrc_applied_vel, transpose=True, copy=False)
             cfrc_ang_dst = qd_to_torch(self.dyn_state.links.cfrc_applied_ang, transpose=True, copy=False)
+            coupling_vel_dst = qd_to_torch(self.dyn_state.links.cfrc_coupling_vel, transpose=True, copy=False)
+            coupling_ang_dst = qd_to_torch(self.dyn_state.links.cfrc_coupling_ang, transpose=True, copy=False)
             mass_dst = qd_to_torch(self.dyn_state.links.mass_shift, transpose=True, copy=False)
             fric_dst = qd_to_torch(self.dyn_state.geoms.friction_ratio, transpose=True, copy=False)
             # Setting the state is a discontinuity: wake every body in the affected envs (a body left hibernated would
@@ -1979,6 +2017,8 @@ class RigidSolver(KinematicSolver):
                 torch.where(envs_mask[:, None, None], state.i_pos_shift, shift_dst, out=shift_dst)
                 cfrc_vel_dst.masked_fill_(envs_mask[:, None, None], 0.0)
                 cfrc_ang_dst.masked_fill_(envs_mask[:, None, None], 0.0)
+                coupling_vel_dst.masked_fill_(envs_mask[:, None, None], 0.0)
+                coupling_ang_dst.masked_fill_(envs_mask[:, None, None], 0.0)
                 torch.where(envs_mask[:, None], state.mass_shift, mass_dst, out=mass_dst)
                 if self.n_geoms:
                     torch.where(envs_mask[:, None], state.friction_ratio, fric_dst, out=fric_dst)
@@ -2009,6 +2049,8 @@ class RigidSolver(KinematicSolver):
                 shift_dst[envs_idx] = state.i_pos_shift[envs_idx]
                 cfrc_vel_dst[envs_idx] = 0.0
                 cfrc_ang_dst[envs_idx] = 0.0
+                coupling_vel_dst[envs_idx] = 0.0
+                coupling_ang_dst[envs_idx] = 0.0
                 mass_dst[envs_idx] = state.mass_shift[envs_idx]
                 if self.n_geoms:
                     fric_dst[envs_idx] = state.friction_ratio[envs_idx]
@@ -3145,6 +3187,11 @@ class RigidSolver(KinematicSolver):
         tensor = qd_to_torch(self.dyn_info.dofs.frictionloss, envs_idx, dofs_idx, transpose=True, copy=True)
         return tensor[0] if self.n_envs == 0 and self._options.batch_dofs_info else tensor
 
+    def update_mass_mat(self):
+        """Assemble the undamped mass matrix at the current pose for an inter-solver impulse solve."""
+        self.update_forward_pos()
+        kernel_compute_mass_matrix(self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config, decompose=False)
+
     def get_mass_mat(self, dofs_idx=None, envs_idx=None, decompose=False):
         tensor = qd_to_torch(self.mass_mat_L if decompose else self.mass_mat, envs_idx, transpose=True, copy=True)
         if dofs_idx is not None:
@@ -3432,6 +3479,27 @@ class RigidSolver(KinematicSolver):
         if self.is_built:
             return self._equalities
         return gs.List(equality for entity in self._entities for equality in entity.equalities)
+
+
+@qd.kernel
+def kernel_commit_vbd_link(
+    dyn_state: array_class.DynState,
+    dyn_info: array_class.DynInfo,
+    rigid_info: array_class.RigidInfo,
+    rigid_config: qd.template(),
+    errno: qd.Tensor,
+):
+    for i_d, i_b in qd.ndrange(dyn_state.dofs.vel.shape[0], dyn_state.dofs.vel.shape[1]):
+        dyn_state.dofs.vel_prev[i_d, i_b] = dyn_state.dofs.vel[i_d, i_b]
+        dyn_state.dofs.acc[i_d, i_b] = (
+            dyn_state.dofs.vel_next[i_d, i_b] - dyn_state.dofs.vel[i_d, i_b]
+        ) / rigid_info.substep_dt[None]
+    func_copy_next_to_curr(dyn_state, rigid_info, rigid_config, errno)
+    func_update_cartesian_space(
+        dyn_state, dyn_info, rigid_info, rigid_config, force_update_fixed_geoms=False, is_backward=False
+    )
+    func_forward_velocity(dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False)
+    func_update_acc(dyn_state, dyn_info, rigid_info, rigid_config, update_cacc=True, is_backward=False)
 
 
 @qd.kernel(fastcache=True)

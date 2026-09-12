@@ -287,6 +287,9 @@ class VBDSolverState:
         }
         self._pos = gs.zeros((scene.sim._B, scene.sim.vbd_solver.n_vertices, 3), **args)
         self._vel = gs.zeros((scene.sim._B, scene.sim.vbd_solver.n_vertices, 3), **args)
+        self.attachment_multiplier = None
+        self.attachment_stiffness = None
+        self.muscle_actuation = None
 
     def serializable(self):
         self._scene = None

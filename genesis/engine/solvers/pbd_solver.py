@@ -43,6 +43,7 @@ class PBDSolver(Solver):
         self._upper_bound = np.array(options.upper_bound)
         self._lower_bound = np.array(options.lower_bound)
         self._particle_size = options.particle_size
+        self._cloth_mesh_size = options.particle_size * options.cloth_mesh_size_ratio
         self._max_stretch_solver_iterations = options.max_stretch_solver_iterations
         self._max_bending_solver_iterations = options.max_bending_solver_iterations
         self._max_volume_solver_iterations = options.max_volume_solver_iterations
@@ -177,6 +178,7 @@ class PBDSolver(Solver):
         # inner edges information for bending. edge: (v1, v2), adjacent faces: (v1, v2, v3) and (v1, v2, v4)
         struct_inner_edge_info = qd.types.struct(
             len_rest=gs.qd_float,
+            angle_rest=gs.qd_float,
             bending_compliance=gs.qd_float,
             bending_relaxation=gs.qd_float,
             v1=gs.qd_int,
@@ -461,7 +463,7 @@ class PBDSolver(Solver):
                     q1 = -q2 - q3 - q4
                     # eq. (29)
                     sum_wq = w1 * q1.norm_sqr() + w2 * q2.norm_sqr() + w3 * q3.norm_sqr() + w4 * q4.norm_sqr()
-                    constraint = qd.acos(d) - qd.acos(-1.0)
+                    constraint = qd.acos(d) - self.inner_edges_info[i_ie].angle_rest
 
                     # XPBD
                     alpha = self.inner_edges_info[i_ie].bending_compliance / (self._substep_dt**2)
@@ -1068,6 +1070,10 @@ class PBDSolver(Solver):
     @property
     def particle_size(self):
         return self._particle_size
+
+    @property
+    def cloth_mesh_size(self):
+        return self._cloth_mesh_size
 
     @property
     def particle_radius(self):

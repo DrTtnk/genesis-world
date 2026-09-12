@@ -121,6 +121,7 @@ class VBDEntity(Entity):
         el_start=0,
         vvert_start=0,
         vface_start=0,
+        muscle_group_start=0,
         name: str | None = None,
     ):
         super().__init__(idx, scene, morph, solver, material, surface, name=name)
@@ -129,11 +130,14 @@ class VBDEntity(Entity):
         self._el_start = el_start  # offset for element index
         self._vvert_start = vvert_start  # offset for render vertices
         self._vface_start = vface_start  # offset for render faces
+        self._muscle_group_start = muscle_group_start
         self._step_global_added = None
         self._distance_constraints = np.zeros((0, 2), dtype=gs.np_int)
         self._distance_bounds = np.zeros((0, 2), dtype=gs.np_float)
         self._angle_constraints = np.zeros((0, 4), dtype=gs.np_int)
         self._angle_bounds = np.zeros((0, 2), dtype=gs.np_float)
+        self._rigid_links = []
+        self._rigid_vertices_idx = np.empty(0, dtype=gs.np_int)
         self.sample()
 
         self.init_tgt_vars()
@@ -161,14 +165,14 @@ class VBDEntity(Entity):
         verts = verts.astype(gs.np_float, copy=False)
         elems = elems.astype(gs.np_int, copy=False)
 
-        # Compose the morph pose offset (e.g. an up-axis conversion) onto the morph orientation, rotating the verts
-        # about their COM (the pre-existing morph.quat convention), then translate by the body-frame offset position
-        # R(morph.quat) @ offset_pos.
+        # Primitives rotate about their requested origin, not the refinement-dependent vertex average.
+        # File meshes retain their existing vertex-centroid convention. Compose the local offset rotation,
+        # then translate by R(morph.quat) @ offset_pos.
         morph_quat = np.array(self._morph.quat, dtype=gs.np_float)
         init_quat = gu.transform_quat_by_quat(np.array(self._morph.offset_quat, dtype=gs.np_float), morph_quat)
         R = gu.quat_to_R(init_quat)
-        verts_COM = verts.mean(axis=0)
-        init_positions = (verts - verts_COM) @ R.T + verts_COM
+        pivot = np.asarray(self._morph.pos) if isinstance(self._morph, gs.morphs.Primitive) else verts.mean(axis=0)
+        init_positions = (verts - pivot) @ R.T + pivot
         offset_shift = gu.transform_by_quat(np.array(self._morph.offset_pos, dtype=gs.np_float), morph_quat)
         init_positions = init_positions + offset_shift
 
@@ -313,7 +317,7 @@ class VBDEntity(Entity):
             self._tgt["actu"].assert_contiguous()
             self._tgt["actu"].assert_sceneless()
             actus = tensor_to_array(self._tgt["actu"], dtype=gs.np_float)
-            self._solver._kernel_set_actuation(actus)
+            self._solver._kernel_set_actuation(self._muscle_group_start, actus)
             self._held_actu = self._tgt["actu"]
 
         self._tgt["actu"] = None
@@ -328,8 +332,9 @@ class VBDEntity(Entity):
     @qd.kernel
     def _kernel_get_actuation_grad(self, grad: qd.types.ndarray()):
         for i_g, i_b in qd.ndrange(self.material.n_groups, self._sim._B):
-            grad[i_g, i_b] = qd.cast(self._solver.muscle_actu_adj[i_g, i_b], gs.qd_float)
-            self._solver.muscle_actu_adj[i_g, i_b] = 0.0
+            i_global = self._muscle_group_start + i_g
+            grad[i_g, i_b] = qd.cast(self._solver.muscle_actu_adj[i_global, i_b], gs.qd_float)
+            self._solver.muscle_actu_adj[i_global, i_b] = 0.0
 
     def collect_output_grads(self):
         """Push the gradient of every state queried this step back into the solver's adjoint."""
@@ -363,6 +368,7 @@ class VBDEntity(Entity):
     def reset_grad(self):
         for key in self._tgt_keys:
             self._tgt_buffer[key].clear()
+            self._tgt[key] = None
         self._queried_states.clear()
         self._held_actu = None  # a new rollout must not back-propagate into the previous rollout's tensor
 
@@ -415,6 +421,29 @@ class VBDEntity(Entity):
         if np.any(np.linalg.norm(tangent[:, :2], axis=-1) < 1e-6):
             gs.raise_exception("`tangent` must have a non-zero projection on the floor plane for every vertex.")
         self._solver.set_friction_frame(self._v_start, tangent)
+
+    def add_rigid_attachments(self, vertices_idx, link):
+        """Attach vertices to rigid links with two-way augmented-Lagrangian forces.
+
+        Declare before scene.build(). Forward simulation supports a single free link or a fixed-base hinge chain,
+        using Euler integration with rigid collisions disabled. Each vertex has one attachment owner.
+        """
+        if self._scene.is_built:
+            gs.raise_exception("Declare VBD rigid attachments before scene.build().")
+        if link.entity.scene is not self._scene:
+            gs.raise_exception("The attached rigid link must belong to the same scene.")
+        if link.entity.solver is not self._sim.rigid_solver:
+            gs.raise_exception("The attachment target must belong to the rigid solver.")
+        vertices_idx = tensor_to_array(vertices_idx)
+        if vertices_idx.ndim != 1 or vertices_idx.dtype.kind not in "iu" or not len(vertices_idx):
+            gs.raise_exception("vertices_idx must be a nonempty one-dimensional integer array.")
+        if (vertices_idx < 0).any() or (vertices_idx >= self.n_vertices).any():
+            gs.raise_exception("vertices_idx must index this VBD entity.")
+        combined = np.concatenate((self._rigid_vertices_idx, vertices_idx))
+        if len(np.unique(combined)) != len(combined):
+            gs.raise_exception("A vertex can have only one rigid attachment.")
+        self._rigid_links.extend([link] * len(vertices_idx))
+        self._rigid_vertices_idx = combined
 
     def add_distance_constraints(self, pairs, lo=None, hi=None):
         """
@@ -517,6 +546,8 @@ class VBDEntity(Entity):
         pinned = np.asarray(pinned)
         if pinned.shape != (self.n_vertices,):
             gs.raise_exception(f"`pinned` should have shape ({self.n_vertices},), got {pinned.shape}.")
+        if pinned[self._rigid_vertices_idx].any():
+            gs.raise_exception("A physically attached vertex must remain free to transmit force.")
         self._solver._kernel_set_pinned(self._v_start, pinned.astype(gs.np_int))
 
     def set_pin_targets(self, target):
@@ -566,6 +597,7 @@ class VBDEntity(Entity):
         if np.any(np.abs(fiber_norm - 1.0) > 1e-4):
             gs.raise_exception("`fiber` of an actuated tetrahedron must be a unit vector.")
 
+        group = np.where(actuated, group + self._muscle_group_start, group)
         self._solver.set_muscle(self._el_start, group.astype(gs.np_int), fiber.astype(gs.np_float))
 
     def set_actuation(self, actus):

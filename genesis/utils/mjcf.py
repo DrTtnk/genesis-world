@@ -588,7 +588,9 @@ def parse_geom(mj, i_g, scale, surface, xml_path):
 
     elif mj_geom.type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
         if is_col:
-            tmesh = trimesh.creation.icosphere(radius=1.0, subdivisions=2)
+            # Nonconvex contacts use this mesh's SDF, not the analytic support map.
+            # A level-2 mesh misses millimetre-scale contact on a 0.2 m ellipsoid.
+            tmesh = trimesh.creation.icosphere(radius=1.0, subdivisions=4)
         else:
             tmesh = trimesh.creation.icosphere(radius=1.0)
         tmesh.apply_transform(np.diag([*geom_size, 1]))

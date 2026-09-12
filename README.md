@@ -2,6 +2,45 @@
 
 # Genesis World
 
+Local VBD coupling spike: `tissue.add_rigid_attachments(vertices_idx, link)`
+declares two-way attachments before build. It supports one free rigid link
+at its centre of mass, or a fixed-base revolute chain with coordinate limits
+and implicit diagonal joint damping. Each tissue vertex has one link owner.
+Both paths require Euler integration, LegacyCoupler, equal timesteps, no
+joint frictionloss, and rigid collisions disabled. The free-link path also
+requires zero armature and damping.
+VBD solves its tissue and rigid pose blocks together; Genesis supplies the
+unconstrained rigid acceleration and commits the resulting pose once.
+Differentiable coupling and rigid contacts remain outside this spike.
+Muscle entities own separate activation ranges, including their input gradients;
+snapshots restore these activations for the selected environments.
+Run `python -m pytest tests/coupling/test_vbd_rigid.py tests/vbd/test_vbd_muscle_entities.py tests/vbd/test_rigid_attachment_reference.py --backend gpu -n 0`.
+Performance and swallowing acceptance are separate checks.
+
+Local physical attachment work: PBD entities now provide
+`attach_particles_to_link(link_idx, particles_idx_local, compliance=0.0)`.
+This uses a two-way implicit spring solve with the full articulated mass matrix.
+Compliance is per particle in m/N; zero is the linearized hard-attachment limit.
+Particles stay dynamic. `release_particle` detaches them; reset clears physical
+attachments. The original `fix_particles_to_link` remains one-way animation.
+This requires LegacyCoupler and equal rigid/PBD substep durations, without
+hibernation or differentiable simulation.
+The attachment solve does not make the entire contact/tissue system
+unconditionally stable. Run `python -m pytest tests/particles/test_pbd.py -n 0`
+and the rigid mass-matrix tests before using the local change.
+
+`PBDOptions.cloth_mesh_size_ratio` separates cloth remeshing edge length from
+particle collision diameter. The default 1.0 preserves the old resolution.
+For 4 mm cloth edges at 6 mm collision diameter, set `particle_size=.006` and
+`cloth_mesh_size_ratio=2/3`. Tet sampling is unchanged. The PBD test file checks
+that refinement changes particle count but preserves mass and plane-contact
+height; invalid, nonfinite and implicitly converted ratio inputs are rejected.
+
+Local snake-fixture change: MJCF ellipsoid collision meshes now use level-4
+icospheres. Nonconvex SDF contacts need this surface detail even though the
+convex support map is analytic. Use `decimate=False` to preserve it. Run the
+asset-free regression with `python -m pytest tests/rigid/test_ellipsoid_contact_mesh.py --backend cpu -n 0 -q`.
+
 [![PyPI - Version](https://img.shields.io/pypi/v/genesis-world)](https://pypi.org/project/genesis-world/)
 [![PyPI Downloads](https://static.pepy.tech/badge/genesis-world)](https://pepy.tech/projects/genesis-world)
 [![Documentation](https://app.readthedocs.org/projects/genesis-world/badge/?version=latest)](https://genesis-world.readthedocs.io/en/latest/)

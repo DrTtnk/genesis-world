@@ -1,10 +1,12 @@
-import quadrants as qd
 import numpy as np
 import trimesh
+
+import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
+from genesis.engine.couplers.pbd_attachment import kernel_set_attachment
 from genesis.engine.entities.particle_entity import ParticleEntity
 
 
@@ -95,12 +97,53 @@ class PBDBaseEntity(ParticleEntity):
 
     @gs.assert_built
     def fix_particles_to_link(self, link_idx, particles_idx_local=None, envs_idx=None):
+        """Animate particles with a link without applying reaction forces to it."""
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         particles_idx_local = self._sanitize_particles_idx_local(particles_idx_local, envs_idx)
         particles_idx = particles_idx_local + self._particle_start
         self._sim._coupler.kernel_attach_pbd_to_rigid_link(
             particles_idx, envs_idx, link_idx, self._scene.rigid_solver.dyn_state.links
         )
+        self._sim._coupler.pbd_attachment.rebuild()
+
+    @gs.assert_built
+    def attach_particles_to_link(self, link_idx, particles_idx_local=None, envs_idx=None, *, compliance=0.0):
+        """Attach particles with two-way implicit springs; compliance is per particle in m/N.
+
+        Zero compliance enforces the linearized next-substep anchor constraint. The
+        LegacyCoupler is required. Hibernation and differentiable scenes are unsupported.
+        Particles remain dynamic. Reset clears these attachments; release_particle detaches them.
+        """
+        if not isinstance(self._sim._coupler.options, gs.options.LegacyCouplerOptions):
+            gs.raise_exception("Two-way PBD attachments require LegacyCouplerOptions.")
+        if self._sim._coupler.pbd_attachment is None:
+            gs.raise_exception("Two-way PBD attachments require active rigid-PBD coupling.")
+        rigid = self._scene.rigid_solver
+        if rigid._use_hibernation or self._sim.requires_grad:
+            gs.raise_exception("Two-way PBD attachments do not support hibernation or differentiable scenes.")
+        if rigid.substep_dt != self.solver.substep_dt:
+            gs.raise_exception("Two-way PBD attachments require equal rigid and PBD substep durations.")
+        if (
+            isinstance(link_idx, (bool, np.bool_))
+            or not isinstance(link_idx, (int, np.integer))
+            or not 0 <= link_idx < rigid.n_links
+        ):
+            gs.raise_exception("link_idx must identify a rigid link in this scene.")
+        if isinstance(compliance, (bool, np.bool_)) or not np.isfinite(compliance) or compliance < 0:
+            gs.raise_exception("Attachment compliance must be finite and nonnegative.")
+        envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+        particles_idx_local = self._sanitize_particles_idx_local(particles_idx_local, envs_idx)
+        rigid.update_forward_pos()
+        kernel_set_attachment(
+            particles_idx_local + self._particle_start,
+            envs_idx,
+            link_idx,
+            compliance,
+            self.solver.particles,
+            self._sim._coupler.particle_attach_info,
+            rigid.dyn_state.links,
+        )
+        self._sim._coupler.pbd_attachment.rebuild()
 
     @gs.assert_built
     def fix_particles(self, particles_idx_local=None, envs_idx=None, zero_velocity=True):
@@ -139,7 +182,10 @@ class PBDBaseEntity(ParticleEntity):
         particles_idx_local = self._sanitize_particles_idx_local(particles_idx_local, envs_idx)
         particles_idx = particles_idx_local + self._particle_start
         self.solver._kernel_release_particle(particles_idx, envs_idx)
-        self.solver._sim._coupler.kernel_pbd_rigid_clear_animate_particles_by_link(particles_idx, envs_idx)
+        coupler = self._sim._coupler
+        if isinstance(coupler.options, gs.options.LegacyCouplerOptions) and coupler.pbd_attachment is not None:
+            coupler.kernel_pbd_rigid_clear_animate_particles_by_link(particles_idx, envs_idx)
+            coupler.pbd_attachment.rebuild()
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- naming methods -----------------------------------
@@ -279,7 +325,8 @@ class PBDTetEntity(PBDBaseEntity):
         self._vfaces = np.asarray(self._vmesh.faces, dtype=gs.np_int)
 
         self._mesh = self._vmesh.copy()
-        self._mesh.remesh(edge_len_abs=self.particle_size, fix=isinstance(self, PBD3DEntity))
+        edge_len = self.solver.cloth_mesh_size if isinstance(self, PBD2DEntity) else self.particle_size
+        self._mesh.remesh(edge_len_abs=edge_len, fix=isinstance(self, PBD3DEntity))
 
     def _reset_grad(self):
         pass
@@ -401,6 +448,10 @@ class PBD2DEntity(PBDTetEntity):
         self._inner_edges_len_rest = np.linalg.norm(
             self._particles[self._inner_edges[:, 2]] - self._particles[self._inner_edges[:, 3]], axis=1
         )
+        # Solver normals share the edge direction, unlike the outward face normals.
+        self._inner_edges_angle_rest = np.full(len(self._inner_edges), np.pi, dtype=gs.np_float)
+        if self.material.bending_reference == "mesh":
+            self._inner_edges_angle_rest -= self._mesh.trimesh.face_adjacency_angles
         self._n_particles = len(self._particles)
 
     def _add_particles_to_solver(self):
@@ -412,6 +463,7 @@ class PBD2DEntity(PBDTetEntity):
             f=self._scene.sim.cur_substep_local,
             inner_edges=self._inner_edges,
             inner_edges_len_rest=self._inner_edges_len_rest,
+            inner_edges_angle_rest=self._inner_edges_angle_rest,
         )
 
     @qd.kernel
@@ -422,13 +474,15 @@ class PBD2DEntity(PBDTetEntity):
 
     @qd.kernel
     def _kernel_add_inner_edges_to_solver(
-        self, f: qd.i32, inner_edges: qd.types.ndarray(), inner_edges_len_rest: qd.types.ndarray()
+        self, f: qd.i32, inner_edges: qd.types.ndarray(), inner_edges_len_rest: qd.types.ndarray(),
+        inner_edges_angle_rest: qd.types.ndarray()
     ):
         for i_ie_ in range(self.n_inner_edges):
             i_ie = i_ie_ + self._inner_edge_start
             self.solver.inner_edges_info[i_ie].bending_compliance = self.material.bending_compliance
             self.solver.inner_edges_info[i_ie].bending_relaxation = self.material.bending_relaxation
             self.solver.inner_edges_info[i_ie].len_rest = inner_edges_len_rest[i_ie_]
+            self.solver.inner_edges_info[i_ie].angle_rest = inner_edges_angle_rest[i_ie_]
             self.solver.inner_edges_info[i_ie].v1 = self._particle_start + inner_edges[i_ie_, 0]
             self.solver.inner_edges_info[i_ie].v2 = self._particle_start + inner_edges[i_ie_, 1]
             self.solver.inner_edges_info[i_ie].v3 = self._particle_start + inner_edges[i_ie_, 2]

@@ -5,12 +5,13 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.sdf as sdf
-
+from genesis.engine.couplers.pbd_attachment import PBDRigidAttachment, kernel_clear_physical_attachments
 from genesis.options.solvers import LegacyCouplerOptions
 from genesis.repr_base import RBC
 from genesis.utils import array_class
 from genesis.utils.array_class import LinksState
 from genesis.utils.geom import qd_inv_transform_by_trans_quat, qd_transform_by_trans_quat
+from genesis.utils.misc import sanitize_index
 
 if TYPE_CHECKING:
     from genesis.engine.simulator import Simulator
@@ -39,6 +40,7 @@ class LegacyCoupler(RBC):
         self.pbd_solver = self.sim.pbd_solver
         self.fem_solver = self.sim.fem_solver
         self.sf_solver = self.sim.sf_solver
+        self.pbd_attachment = None
 
     def build(self) -> None:
         self._rigid_mpm = self.rigid_solver.is_active and self.mpm_solver.is_active and self.options.rigid_mpm
@@ -81,13 +83,17 @@ class LegacyCoupler(RBC):
                 3, dtype=gs.qd_float, shape=(self.pbd_solver.n_particles, self.pbd_solver._B, self.rigid_solver.n_geoms)
             )
 
-            struct_particle_attach_info = qd.types.struct(link_idx=gs.qd_int, local_pos=gs.qd_vec3)
+            struct_particle_attach_info = qd.types.struct(
+                link_idx=gs.qd_int, local_pos=gs.qd_vec3, compliance=gs.qd_float
+            )
 
             self.particle_attach_info = struct_particle_attach_info.field(
                 shape=(self.pbd_solver._n_particles, self.pbd_solver._B), layout=qd.Layout.SOA
             )
             self.particle_attach_info.link_idx.fill(-1)
             self.particle_attach_info.local_pos.fill(0.0)
+            self.particle_attach_info.compliance.fill(-1.0)
+            self.pbd_attachment = PBDRigidAttachment(self.rigid_solver, self.pbd_solver, self.particle_attach_info)
 
         if self._mpm_sph:
             self.mpm_sph_stencil_size = int(np.floor(self.mpm_solver.dx / self.sph_solver.hash_grid_cell_size) + 2)
@@ -102,6 +108,11 @@ class LegacyCoupler(RBC):
         self.reset(envs_idx=self.sim.scene._envs_idx)
 
     def reset(self, envs_idx=None) -> None:
+        if self.pbd_attachment is not None:
+            kernel_clear_physical_attachments(
+                sanitize_index(envs_idx, -1, self.sim._B, 0, "envs_idx"), self.particle_attach_info
+            )
+            self.pbd_attachment.rebuild()
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
             if envs_idx is None:
                 self.mpm_rigid_normal.fill(0)
@@ -766,6 +777,7 @@ class LegacyCoupler(RBC):
             pdb.particles[i_p, i_b].free = False
             self.particle_attach_info[i_p, i_b].link_idx = link_idx
             self.particle_attach_info[i_p, i_b].local_pos = local_pos
+            self.particle_attach_info[i_p, i_b].compliance = -1.0
 
     @qd.kernel
     def kernel_pbd_rigid_clear_animate_particles_by_link(
@@ -778,6 +790,7 @@ class LegacyCoupler(RBC):
             i_b = envs_idx[i_b_]
             pdb.particles[i_p, i_b].free = True
             self.particle_attach_info[i_p, i_b].link_idx = -1
+            self.particle_attach_info[i_p, i_b].compliance = -1.0
             self.particle_attach_info[i_p, i_b].local_pos = qd.math.vec3([0.0, 0.0, 0.0])
 
     @qd.kernel
@@ -795,7 +808,10 @@ class LegacyCoupler(RBC):
         """
         pdb = self.pbd_solver
         for i_p, i_env in qd.ndrange(pdb._n_particles, pdb._B):
-            if self.particle_attach_info[i_p, i_env].link_idx >= 0:
+            if (
+                self.particle_attach_info[i_p, i_env].link_idx >= 0
+                and self.particle_attach_info[i_p, i_env].compliance < 0
+            ):
                 # read link state
                 link_idx = self.particle_attach_info[i_p, i_env].link_idx
                 link_pos = links_state.pos[link_idx, i_env]
@@ -880,6 +896,8 @@ class LegacyCoupler(RBC):
         return new_pos, new_vel, contact_normal
 
     def preprocess(self, f):
+        if self.pbd_attachment is not None:
+            self.pbd_attachment.solve()
         # preprocess for MPM CPIC
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
             self.mpm_surface_to_particle(
