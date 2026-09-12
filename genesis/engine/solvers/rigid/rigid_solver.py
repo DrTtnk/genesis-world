@@ -1438,9 +1438,9 @@ class RigidSolver(KinematicSolver):
         is_articulated = self.n_dofs > 0 and all(
             joint.type in (gs.JOINT_TYPE.FIXED, gs.JOINT_TYPE.REVOLUTE) for joint in self.joints
         )
-        if not is_articulated and not (
-            self.n_links == 1 and self.n_dofs == 6 and self.n_qs == 7 and self.joints[0].type == gs.JOINT_TYPE.FREE
-        ):
+        free_joints = [joint for joint in self.joints if joint.type == gs.JOINT_TYPE.FREE]
+        is_free = len(free_joints) == 1 and self.n_dofs == 6 and self.n_qs == 7
+        if not is_articulated and not is_free:
             gs.raise_exception("VBD rigid coupling requires one free link or fixed-base revolute joints.")
         if self._requires_grad or self._use_hibernation or self.n_equalities:
             gs.raise_exception("VBD rigid ownership requires forward dynamics without hibernation or equalities.")
@@ -1451,7 +1451,7 @@ class RigidSolver(KinematicSolver):
         if (self.get_dofs_frictionloss() != 0).any():
             gs.raise_exception("VBD rigid ownership does not support joint frictionloss.")
         if not is_articulated:
-            if np.linalg.norm(self.links[0].inertial_pos) > gs.EPS:
+            if np.linalg.norm(free_joints[0].link.inertial_pos) > gs.EPS:
                 gs.raise_exception("VBD free-link ownership requires the link origin at its centre of mass.")
             if (self.get_dofs_armature() != 0).any() or (self.get_dofs_damping() != 0).any():
                 gs.raise_exception("The VBD free-link spike requires zero armature and joint damping.")

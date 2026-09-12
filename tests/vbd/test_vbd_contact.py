@@ -1,10 +1,11 @@
+import numpy as np
 import pytest
 import quadrants as qd
 import torch
 
 import genesis as gs
 from genesis.engine.solvers.vbd_contact import func_point_triangle_weights, func_segment_parameters
-from genesis.utils.misc import qd_to_torch
+from genesis.utils.misc import qd_to_torch, tensor_to_array
 
 from ..utils.assertions import assert_allclose
 
@@ -159,7 +160,6 @@ def test_prescribed_ellipsoid_compresses_tissue_and_a_blocked_command_is_rejecte
             n_iterations=4,
             floor_height=-10.0,
             damping=2e-3,
-            contact_vertex_cap=256,
         ),
         viewer_options=gs.options.ViewerOptions(
             camera_pos=(0.3, -0.4, 0.2),
@@ -229,3 +229,165 @@ def test_prescribed_ellipsoid_compresses_tissue_and_a_blocked_command_is_rejecte
             target[..., 2] = 0.05 - 0.06 * (i + 1) / 40
             scene.vbd_solver.set_prescribed_targets(target, quat)
             scene.step()
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_prescribed_meal_rotates_hinge_bone_through_wall_and_direct_contact(n_envs, show_viewer, hinge_bone_xml):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+            batch_links_info=True,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-10.0,
+            damping=2e-3,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.05, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    skeleton = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=hinge_bone_xml,
+        ),
+        material=gs.materials.Rigid(),
+    )
+    bone = skeleton.get_link("bone")
+    meal = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file='<mujoco><worldbody><body pos="0.07 0 0.06"><geom type="ellipsoid" size="0.03 0.02 0.02"/></body></worldbody></mujoco>',
+            decimate=False,
+        ),
+        material=gs.materials.Rigid(),
+    )
+    # a wall of tissue lying on the far half of the bone, its lower face attached to the bone
+    wall = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.02, 0.01),
+            pos=(0.08, 0.0, 0.0101),
+            nobisect=False,
+            maxvolume=2e-6,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=1e5,
+            nu=0.3,
+            collision_group=1,
+        ),
+    )
+    rest = tensor_to_array(wall.init_positions)
+    wall.add_rigid_attachments(np.flatnonzero(rest[:, 2] < rest[:, 2].min() + 1e-5), bone)
+    scene.vbd_solver.add_rigid_collider(bone, collision_group=0)
+    scene.vbd_solver.add_prescribed_collider(meal, collision_group=2, link=meal.links[1])
+    scene.vbd_solver.add_contact_rule(1, 2, stiffness=1e5, friction=0.3, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(0, 2, stiffness=1e5, friction=0.3, thickness=1e-3)
+    scene.build(n_envs=n_envs)
+    B = max(n_envs, 1)
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=gs.device).expand(B, 1, 4).clone()
+    target = torch.tensor([0.07, 0.0, 0.06], device=gs.device).expand(B, 1, 3).clone()
+    # the meal descends 40 mm: it meets the wall top (z = 0.0202) after 19.8 mm and presses the bone down
+    peak_reaction = torch.zeros(B, device=gs.device)
+    for i in range(80):
+        target[..., 2] = 0.06 - 0.04 * (i + 1) / 80
+        scene.vbd_solver.set_prescribed_targets(target, quat)
+        scene.step()
+        reactions = scene.vbd_solver.collider_reactions()
+        assert reactions.shape == (B, 2, 6)
+        peak_reaction = torch.maximum(peak_reaction, reactions[:, 1, 2])
+    angle = skeleton.get_dofs_position().reshape(B, 1)
+    # pressing the far end down rotates about +y by the right-hand rule: positive angle, inside the limit
+    assert (angle[:, 0] > 0.05).all()
+    assert (angle[:, 0] < 0.6).all()
+    # the wall pushed the meal up while it was loaded; once the bone swings away the meal is unloaded
+    assert (peak_reaction > 0.1).all()
+    positions = wall.get_positions()
+    assert torch.isfinite(positions).all()
+    anchors = bone.get_pos().reshape(B, 3)
+    assert torch.isfinite(anchors).all()
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_free_bone_with_attached_tissue_rests_on_table_through_rigid_and_tissue_contact(n_envs, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-10.0,
+            damping=2e-3,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.02, 0.0, 0.02),
+        ),
+        show_viewer=show_viewer,
+    )
+    table = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.3, 0.3, 0.02),
+            pos=(0.0, 0.0, -0.01),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(),
+    )
+    bone = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.04, 0.0, 0.0211),
+        ),
+        material=gs.materials.Rigid(
+            rho=500.0,
+        ),
+    )
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.0, 0.0, 0.0211),
+            nobisect=False,
+            maxvolume=1e-5,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=1e5,
+            nu=0.3,
+            collision_group=1,
+        ),
+    )
+    rest = tensor_to_array(tissue.init_positions)
+    tissue.add_rigid_attachments(np.flatnonzero(rest[:, 0] > rest[:, 0].max() - 1e-5), bone.links[0])
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0)
+    scene.vbd_solver.add_rigid_collider(bone.links[0], collision_group=2)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(0, 2, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.build(n_envs=n_envs)
+    B = max(n_envs, 1)
+    for _ in range(100):
+        scene.step()
+    positions = tissue.get_positions()
+    bone_pos = bone.get_pos().reshape(B, 3)
+    # both rest on the table inside the layer, and the bone kept its height above its own bottom face
+    assert (positions[..., 2].min() > -1e-4).all()
+    assert (positions[..., 2].min() < 1e-3).all()
+    assert (bone_pos[:, 2] > 0.02 - 1e-4).all() and (bone_pos[:, 2] < 0.0211).all()
+    assert torch.linalg.vector_norm(tissue.get_state().vel, dim=-1).max() < 5e-3
+    assert torch.linalg.vector_norm(bone.get_vel().reshape(B, 3), dim=-1).max() < 5e-3
+    weight = (tissue.material.rho + bone.material.rho) * 0.04**3 * 9.81
+    reactions = scene.vbd_solver.collider_reactions()
+    assert reactions.shape == (B, 2, 6)
+    assert_allclose(reactions[:, 0, 2], -weight, rtol=0.03, atol=0.0)
+    # the bone's own contact carries the bone's weight; the tissue's carries the tissue's, both act on the table
+    assert (reactions[:, 1, 2] > 0.9 * bone.material.rho * 0.04**3 * 9.81).all()

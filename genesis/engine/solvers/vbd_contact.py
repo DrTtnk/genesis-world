@@ -18,6 +18,8 @@ geometry, so there is no persistent identity to transport them along. The grid i
 list is fixed for its sweeps and symmetric by construction.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 import torch
 
@@ -34,6 +36,17 @@ ROLE_POINT = 0
 ROLE_TRIANGLE = 1  # roles 1..3: triangle vertex role - 1
 ROLE_EDGE_A = 4  # roles 4..5: endpoint of the first edge
 ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
+
+
+class ContactDiagnostics(NamedTuple):
+    """Per-environment contact state of the last substep: candidate pair counts, the largest motion of a tissue
+    and of a rigid contact vertex over the substep (m), and the raw error word."""
+
+    n_point_pairs: torch.Tensor
+    n_edge_pairs: torch.Tensor
+    max_tissue_motion: torch.Tensor
+    max_rigid_motion: torch.Tensor
+    errno: torch.Tensor
 
 
 class VBDContact:
@@ -106,9 +119,34 @@ class VBDContact:
         self.vertex_cv.from_numpy(lookup)
         self.rv_link = qd.field(dtype=gs.qd_int, shape=max(self.n_rv, 1))
         self.rv_local = qd.Vector.field(3, dtype=gs.qd_float, shape=max(self.n_rv, 1))
+        self.rv_cv = qd.field(dtype=gs.qd_int, shape=max(self.n_rv, 1))
         if self.n_rv:
             self.rv_link.from_numpy(np.array(rv_link, dtype=gs.np_int))
             self.rv_local.from_numpy(np.concatenate(rv_local).astype(gs.np_float))
+            self.rv_cv.from_numpy(np.flatnonzero(np.array(cv_kind) == 1).astype(gs.np_int))
+        # rigid contact vertices grouped per link, for the rigid blocks of the coupled solve
+        rigid = solver.sim.rigid_solver
+        order = (
+            np.argsort(np.array(rv_link, dtype=np.int64), kind="stable") if self.n_rv else np.zeros(0, dtype=np.int64)
+        )
+        self.link_rv_offset = qd.field(dtype=gs.qd_int, shape=rigid.n_links + 1)
+        self.link_rv_offset.from_numpy(
+            np.searchsorted(np.array(rv_link, dtype=np.int64)[order], np.arange(rigid.n_links + 1)).astype(gs.np_int)
+        )
+        self.link_rv = qd.field(dtype=gs.qd_int, shape=max(self.n_rv, 1))
+        if self.n_rv:
+            self.link_rv.from_numpy(order.astype(gs.np_int))
+        # dof_moves_link[i_d, i_l]: the hinge coordinate i_d lies between link i_l and the root
+        moves = np.zeros((max(rigid.n_dofs, 1), rigid.n_links), dtype=gs.np_int)
+        for link in rigid.links:
+            i_l = link.idx
+            while True:
+                moves[link.dof_start : link.dof_end, i_l] = 1
+                if link.parent_idx < 0:
+                    break
+                link = rigid.links[link.parent_idx]
+        self.dof_moves_link = qd.field(dtype=gs.qd_int, shape=moves.shape)
+        self.dof_moves_link.from_numpy(moves)
         # world positions of the rigid vertices at the current pose and at the start of the substep
         self.rv_pos = qd.Vector.field(3, dtype=gs.qd_float, shape=(max(self.n_rv, 1), solver._B))
         self.rv_pos_prev = qd.Vector.field(3, dtype=gs.qd_float, shape=(max(self.n_rv, 1), solver._B))
@@ -148,11 +186,14 @@ class VBDContact:
         self.ee_pairs = pair_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
         self.n_pt = qd.field(dtype=gs.qd_int, shape=solver._B)
         self.n_ee = qd.field(dtype=gs.qd_int, shape=solver._B)
-        self.slot_cap = solver._contact_vertex_cap
+        # The pairs each contact vertex takes part in, as a CSR rebuilt every substep: a count per vertex, its
+        # exclusive prefix sum, and the flat list of slots (8 * pair + role, pairs of the edge list offset by
+        # pair_cap). Every pair registers at most four vertices, which bounds the flat list by the pair caps.
         self.cv_slot_n = qd.field(dtype=gs.qd_int, shape=(self.n_cv, solver._B))
-        # slot = 8 * pair + role, pairs of the edge list offset by pair_cap
-        self.cv_slot = qd.field(dtype=gs.qd_int, shape=(self.n_cv, self.slot_cap, solver._B))
+        self.cv_slot_offset = qd.field(dtype=gs.qd_int, shape=(self.n_cv + 1, solver._B))
+        self.cv_slot = qd.field(dtype=gs.qd_int, shape=(8 * self.pair_cap, solver._B))
         self.errno = qd.field(dtype=gs.qd_int, shape=solver._B)
+        self.max_motion = qd.field(dtype=gs.qd_float, shape=(2, solver._B))
         # Prescribed collider links follow a pose interpolant from the pose at the start of the step to the target
         # set for its end, sampled at every substep; both ends are state.
         # The targets refer to a reference link of the entity; the base link pose that realizes them follows from
@@ -202,6 +243,12 @@ class VBDContact:
     def _unique_edges(faces):
         edges = np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1)
         return np.unique(edges, axis=0)
+
+    def diagnostics(self):
+        motion = qd_to_torch(self.max_motion, transpose=True)
+        return ContactDiagnostics(
+            qd_to_torch(self.n_pt), qd_to_torch(self.n_ee), motion[:, 0], motion[:, 1], qd_to_torch(self.errno)
+        )
 
     def reactions(self):
         """Wrench on each registered collider, shape (B, n_colliders, 6): world force then world torque about the
@@ -440,11 +487,19 @@ def func_contact_vertex_terms(f, i_v, i_b, solver: qd.template(), contact: qd.te
     hessian = qd.Matrix.zero(gs.qd_float, 3, 3)
     cv = contact.vertex_cv[i_v]
     if cv >= 0:
-        x = solver.verts[f + 1, i_v, i_b].pos
-        x_prev = solver.verts[f, i_v, i_b].pos
+        force, hessian = func_contact_cv_terms(f, cv, i_b, solver, contact)
+    return force, hessian
+
+
+@qd.func
+def func_contact_cv_terms(f, cv, i_b, solver: qd.template(), contact: qd.template()):
+    """Force and Gauss-Newton block of the contact pairs of contact vertex cv at the current iterate."""
+    force = gs.qd_vec3(0.0, 0.0, 0.0)
+    hessian = qd.Matrix.zero(gs.qd_float, 3, 3)
+    if cv >= 0:
         eps = solver._friction_eps_v * solver._substep_dt
-        for slot in range(qd.min(contact.cv_slot_n[cv, i_b], contact.slot_cap)):
-            code = contact.cv_slot[cv, slot, i_b]
+        for slot in range(contact.cv_slot_offset[cv, i_b], contact.cv_slot_offset[cv + 1, i_b]):
+            code = contact.cv_slot[slot, i_b]
             role = code % 8
             i_p = code // 8
             weight = gs.qd_float(0.0)  # dd/dx = weight * n for this participant
@@ -512,6 +567,66 @@ def func_contact_vertex_terms(f, i_v, i_b, solver: qd.template(), contact: qd.te
                     force -= scale * weight * slide
                     hessian += scale * weight * weight * (qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n))
     return force, hessian
+
+
+@qd.func
+def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact: qd.template()):
+    """Wrench (force, torque about `origin`) and 6x6 Gauss-Newton block of the contact pairs of every rigid contact
+    vertex of link i_l, for a free link with the world-frame rotation increment of the attachment block."""
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
+    for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
+        i_r = contact.link_rv[c]
+        cv = contact.rv_cv[i_r]
+        force, hessian = func_contact_cv_terms(f, cv, i_b, solver, contact)
+        r = contact.rv_pos[i_r, i_b] - origin
+        jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
+        for row in qd.static(range(3)):
+            jacobian[row, row] = 1.0
+        jacobian[0, 4] = r[2]
+        jacobian[0, 5] = -r[1]
+        jacobian[1, 3] = -r[2]
+        jacobian[1, 5] = r[0]
+        jacobian[2, 3] = r[1]
+        jacobian[2, 4] = -r[0]
+        force6 += jacobian.transpose() @ force
+        hessian6 += jacobian.transpose() @ hessian @ jacobian
+    return force6, hessian6
+
+
+@qd.func
+def func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver: qd.template(), contact: qd.template()):
+    """Generalized force and Gauss-Newton curvature of the contact pairs of every rigid contact vertex that hinge
+    coordinate i_d moves: the vertex Jacobian is axis x (p - pivot)."""
+    force = gs.qd_float(0.0)
+    curvature = gs.qd_float(0.0)
+    for i_l in range(contact.dof_moves_link.shape[1]):
+        if contact.dof_moves_link[i_d, i_l]:
+            for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
+                i_r = contact.link_rv[c]
+                force_v, hessian_v = func_contact_cv_terms(f, contact.rv_cv[i_r], i_b, solver, contact)
+                jacobian = axis.cross(contact.rv_pos[i_r, i_b] - pivot)
+                force += jacobian.dot(force_v)
+                curvature += jacobian.dot(hessian_v @ jacobian)
+    return force, curvature
+
+
+@qd.func
+def func_refresh_rigid_vertices(i_b, contact: qd.template(), dyn_state: DynState):
+    """Rigid contact vertex positions from the current link poses of the rigid state, after a block moved them."""
+    for i_r in range(contact.n_rv):
+        i_l = contact.rv_link[i_r]
+        contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(
+            contact.rv_local[i_r], dyn_state.links.pos[i_l, i_b], dyn_state.links.quat[i_l, i_b]
+        )
+
+
+@qd.func
+def func_refresh_link_vertices(i_l, i_b, pos, quat, contact: qd.template()):
+    """Rigid contact vertex positions of one link from a given pose."""
+    for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
+        i_r = contact.link_rv[c]
+        contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(contact.rv_local[i_r], pos, quat)
 
 
 @qd.func
@@ -660,6 +775,26 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                                 ]
                                             else:
                                                 qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS)
+    # count the pairs of every contact vertex, prefix-sum the counts, then fill the flat slot list
+    for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
+        if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
+            qd.atomic_add(contact.cv_slot_n[contact.pt_pairs[i_p, i_b].a, i_b], 1)
+            tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+            for j in qd.static(range(3)):
+                qd.atomic_add(contact.cv_slot_n[tri[j], i_b], 1)
+        if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
+            ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
+            eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
+            for j in qd.static(range(2)):
+                qd.atomic_add(contact.cv_slot_n[ea[j], i_b], 1)
+                qd.atomic_add(contact.cv_slot_n[eb[j], i_b], 1)
+    for i_b in range(solver._B):
+        run = 0
+        for cv in range(contact.n_cv):
+            contact.cv_slot_offset[cv, i_b] = run
+            run += contact.cv_slot_n[cv, i_b]
+            contact.cv_slot_n[cv, i_b] = 0
+        contact.cv_slot_offset[contact.n_cv, i_b] = run
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
         if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
             func_register_slot(contact.pt_pairs[i_p, i_b].a, 8 * i_p + ROLE_POINT, i_b, contact)
@@ -676,11 +811,8 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
 
 @qd.func
 def func_register_slot(cv, code, i_b, contact: qd.template()):
-    slot = qd.atomic_add(contact.cv_slot_n[cv, i_b], 1)
-    if slot < contact.slot_cap:
-        contact.cv_slot[cv, slot, i_b] = code
-    else:
-        qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_SLOTS)
+    slot = contact.cv_slot_offset[cv, i_b] + qd.atomic_add(contact.cv_slot_n[cv, i_b], 1)
+    contact.cv_slot[slot, i_b] = code
 
 
 @qd.func
@@ -797,9 +929,12 @@ def kernel_end_contact(f: int, solver: qd.template(), contact: qd.template(), dy
                 func_accumulate_reaction(f, ea[1], -y * s * n, i_b, solver, contact, dyn_state)
                 func_accumulate_reaction(f, eb[0], y * (1.0 - t) * n, i_b, solver, contact, dyn_state)
                 func_accumulate_reaction(f, eb[1], y * t * n, i_b, solver, contact, dyn_state)
+    for kind, i_b in qd.ndrange(2, solver._B):
+        contact.max_motion[kind, i_b] = 0.0
     for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
-        motion = func_cv_pos(f, cv, i_b, solver, contact) - func_cv_pos_prev(f, cv, i_b, solver, contact)
-        if motion.norm() > contact.margin:
+        motion = (func_cv_pos(f, cv, i_b, solver, contact) - func_cv_pos_prev(f, cv, i_b, solver, contact)).norm()
+        qd.atomic_max(contact.max_motion[contact.cv_info[cv].kind, i_b], motion)
+        if motion > contact.margin:
             qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_MOTION_BOUND)
 
 

@@ -6,6 +6,7 @@ import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.engine.solvers.vbd_contact import func_contact_link_terms, func_refresh_link_vertices
 from genesis.engine.solvers.vbd_rigid import func_attachment_blocks, func_ldlt6_solve
 from genesis.engine.solvers.vbd_rigid import func_quaternion_difference, func_quaternion_update
 from genesis.utils.array_class import DynState, RigidInfo
@@ -33,6 +34,10 @@ class VBDRigidAttachment:
             gs.raise_exception("VBD rigid attachments support scenes containing rigid and VBD solvers only.")
         self.is_articulated = self.rigid.claim_vbd_links()
         links = [link for entity in entities for link in entity._rigid_links]
+        # the one link the free path integrates; fixed links of other entities may share the scene
+        self.free_link_idx = -1 if self.is_articulated else links[0].idx
+        if not self.is_articulated and any(link.idx != self.free_link_idx for link in links):
+            gs.raise_exception("Free-link ownership attaches tissue to that one free link only.")
         links_idx = np.array([link.idx for link in links], dtype=gs.np_int)
         indices = np.concatenate([entity.v_start + entity._rigid_vertices_idx for entity in entities])
         positions = np.concatenate(
@@ -174,9 +179,23 @@ def func_solve_attachment_link(f, i_b, solver: qd.template(), attachment: qd.tem
         )
         force += rigid_force
         hessian += rigid_hessian
+    if qd.static(solver.has_contact):
+        force_c, hessian_c = func_contact_link_terms(
+            f, attachment.free_link_idx, i_b, state.pos, solver, solver.contact
+        )
+        force += force_c
+        hessian += hessian_c
     increment = func_ldlt6_solve(hessian, force)
     attachment.link_state[i_b].pos += increment[:3]
     attachment.link_state[i_b].quat = func_quaternion_update(state.quat, increment[3:6])
+    if qd.static(solver.has_contact):
+        func_refresh_link_vertices(
+            attachment.free_link_idx,
+            i_b,
+            attachment.link_state[i_b].pos,
+            attachment.link_state[i_b].quat,
+            solver.contact,
+        )
 
 
 @qd.func

@@ -8,7 +8,11 @@ import quadrants as qd
 
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.abd.forward_kinematics import func_forward_kinematics_batch
-from genesis.engine.solvers.vbd_contact import func_contact_dual_update
+from genesis.engine.solvers.vbd_contact import (
+    func_contact_dof_terms,
+    func_contact_dual_update,
+    func_refresh_rigid_vertices,
+)
 from genesis.engine.solvers.vbd_rigid_attachment import func_update_attachment_dual
 from genesis.utils.array_class import DynInfo, DynState, RigidInfo
 
@@ -127,6 +131,10 @@ def func_solve_articulation_batch(
                 jacobian = axis.cross(anchor - pivot)
                 force += jacobian.dot(force_scale)
                 curvature += stiffness * jacobian.norm_sqr() + qd.abs(force_scale.dot(axis.cross(jacobian)))
+        if qd.static(solver.has_contact):
+            force_c, curvature_c = func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver, solver.contact)
+            force += force_c
+            curvature += curvature_c
         position += force / curvature
         if qd.static(rigid_config.enable_joint_limit):
             limits = dyn_info.dofs.limit[I_d]
@@ -140,6 +148,8 @@ def func_solve_articulation_batch(
             rigid_config,
             is_backward=False,
         )
+        if qd.static(solver.has_contact):
+            func_refresh_rigid_vertices(i_b, solver.contact, dyn_state)
 
 
 @qd.kernel

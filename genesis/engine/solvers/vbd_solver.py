@@ -100,7 +100,6 @@ class VBDSolver(Solver):
         self._rigid_colliders = []
         self._prescribed_colliders = []
         self._contact_pair_cap = options.contact_pair_cap
-        self._contact_vertex_cap = options.contact_vertex_cap
         self._contact_cell_cap = options.contact_cell_cap
 
     @property
@@ -176,6 +175,11 @@ class VBDSolver(Solver):
             gs.raise_exception("A contact rule needs stiffness > 0, thickness > 0 and friction >= 0.")
         self._contact_rules.append((int(group_a), int(group_b), float(stiffness), float(friction), float(thickness)))
 
+    def contact_diagnostics(self):
+        """Candidate pair counts, largest tissue and rigid contact-vertex motion of the last substep, and the raw
+        error word, each of shape (B,). See `ContactDiagnostics`."""
+        return self.contact.diagnostics()
+
     def collider_reactions(self):
         """Wrench the tissue applies to each declared collider link, shape (B, n_colliders, 6): world force then
         world torque about the link origin, from the last substep."""
@@ -199,8 +203,6 @@ class VBDSolver(Solver):
             messages.append("More contact vertices in one hash cell than VBDOptions.contact_cell_cap allows.")
         if errno & ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS:
             messages.append("More candidate contact pairs than VBDOptions.contact_pair_cap allows.")
-        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_SLOTS:
-            messages.append("A contact vertex takes part in more pairs than VBDOptions.contact_vertex_cap allows.")
         if messages:
             gs.raise_exception(" ".join(messages))
 
