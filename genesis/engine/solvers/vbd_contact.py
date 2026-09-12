@@ -19,14 +19,16 @@ list is fixed for its sweeps and symmetric by construction.
 """
 
 import numpy as np
+import torch
 
 import igl
 import quadrants as qd
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.array_class import DynState, ErrorCode
-from genesis.utils.misc import qd_to_torch
+from genesis.engine.solvers.rigid.abd.forward_kinematics import func_update_cartesian_space_entity
+from genesis.utils.array_class import DynInfo, DynState, ErrorCode, RigidInfo
+from genesis.utils.misc import qd_to_torch, tensor_to_array
 
 ROLE_POINT = 0
 ROLE_TRIANGLE = 1  # roles 1..3: triangle vertex role - 1
@@ -35,8 +37,11 @@ ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
 
 
 class VBDContact:
-    def __init__(self, solver, entities, colliders, rules):
+    def __init__(self, solver, entities, colliders, prescribed, rules):
         self.solver = solver
+        self.colliders = [link for link, _ in colliders]
+        # a prescribed collider is a fixed-base rigid entity: every link's geoms collide, the base pose is driven
+        colliders = list(colliders) + [(link, group) for entity, group, _ in prescribed for link in entity.links]
         n_groups = 1 + max(
             [entity.material.collision_group for entity in entities]
             + [group for _, group in colliders]
@@ -67,8 +72,9 @@ class VBDContact:
             cv_owner.extend([-1 - entity.idx] * len(boundary))
             triangles.append(base + faces_local.reshape(-1, 3))
             edges.append(base + self._unique_edges(faces_local.reshape(-1, 3)))
-        self.colliders = [link for link, _ in colliders]
         for link, group in colliders:
+            if not link.geoms and not any(link is other for entity, _, _ in prescribed for other in entity.links):
+                gs.raise_exception(f"Collider link {link.name} has no collision geometry.")
             for geom in link.geoms:
                 local = gu.transform_by_trans_quat(geom.init_verts, geom.init_pos, geom.init_quat)
                 base = len(cv_kind)
@@ -147,8 +153,50 @@ class VBDContact:
         # slot = 8 * pair + role, pairs of the edge list offset by pair_cap
         self.cv_slot = qd.field(dtype=gs.qd_int, shape=(self.n_cv, self.slot_cap, solver._B))
         self.errno = qd.field(dtype=gs.qd_int, shape=solver._B)
+        # Prescribed collider links follow a pose interpolant from the pose at the start of the step to the target
+        # set for its end, sampled at every substep; both ends are state.
+        # The targets refer to a reference link of the entity; the base link pose that realizes them follows from
+        # the constant transform of the reference link in the base frame, read at build.
+        self.prescribed_entities = [entity for entity, _, _ in prescribed]
+        self.prescribed_links = [link for _, _, link in prescribed]
+        self.n_prescribed = len(prescribed)
+        pose_type = qd.types.struct(pos=gs.qd_vec3, quat=gs.qd_vec4)
+        self.prescribed_link = qd.field(dtype=gs.qd_int, shape=max(self.n_prescribed, 1))
+        self.prescribed_base = qd.field(dtype=gs.qd_int, shape=max(self.n_prescribed, 1))
+        self.prescribed_entity = qd.field(dtype=gs.qd_int, shape=max(self.n_prescribed, 1))
+        self.prescribed_rel = pose_type.field(shape=max(self.n_prescribed, 1), layout=qd.Layout.SOA)
+        if self.n_prescribed:
+            self.prescribed_link.from_numpy(np.array([link.idx for link in self.prescribed_links], dtype=gs.np_int))
+            self.prescribed_base.from_numpy(
+                np.array([entity.base_link.idx for entity in self.prescribed_entities], dtype=gs.np_int)
+            )
+            self.prescribed_entity.from_numpy(
+                np.array([entity.idx for entity in self.prescribed_entities], dtype=gs.np_int)
+            )
+            # link poses are not final while the solvers build, so the fixed chain from the base to the reference
+            # link is composed from the links' initial parent-relative poses
+            rel = [
+                self._relative_pose(entity, link)
+                for entity, link in zip(self.prescribed_entities, self.prescribed_links)
+            ]
+            self.prescribed_rel.pos.from_numpy(np.stack([pos for pos, _ in rel]).astype(gs.np_float))
+            self.prescribed_rel.quat.from_numpy(np.stack([quat for _, quat in rel]).astype(gs.np_float))
+        self.prescribed_start = pose_type.field(shape=(max(self.n_prescribed, 1), solver._B), layout=qd.Layout.SOA)
+        self.prescribed_target = pose_type.field(shape=(max(self.n_prescribed, 1), solver._B), layout=qd.Layout.SOA)
         # wrench (world force, world torque about the link origin) the tissue applies to each collider link
         self.link_reaction = qd.Vector.field(6, dtype=qd.f64, shape=(solver.sim.rigid_solver.n_links, solver._B))
+
+    @staticmethod
+    def _relative_pose(entity, link):
+        """Pose of `link` in the frame of the entity's base link, composed along the fixed parent chain."""
+        pos = np.zeros(3)
+        quat = np.array([1.0, 0.0, 0.0, 0.0])
+        links = link.entity.solver.links
+        while link is not entity.base_link:
+            pos = np.asarray(link.pos) + gu.transform_by_quat(pos, np.asarray(link.quat))
+            quat = gu.transform_quat_by_quat(quat, np.asarray(link.quat))
+            link = links[link.parent_idx]
+        return pos, quat
 
     @staticmethod
     def _unique_edges(faces):
@@ -156,10 +204,88 @@ class VBDContact:
         return np.unique(edges, axis=0)
 
     def reactions(self):
-        """Wrench on each registered collider link, shape (B, n_colliders, 6): world force then world torque about
-        the link origin, from the pair state at the end of the last substep."""
-        links_idx = [link.idx for link in self.colliders]
-        return qd_to_torch(self.link_reaction, transpose=True)[:, links_idx].to(gs.tc_float)
+        """Wrench on each registered collider, shape (B, n_colliders, 6): world force then world torque about the
+        collider's origin (the link origin, or the base link origin of a prescribed entity), from the pair state at
+        the end of the last substep. Rigid colliders come first, then prescribed entities, in declaration order."""
+        wrenches = qd_to_torch(self.link_reaction, transpose=True).to(gs.tc_float)
+        links_pos = qd_to_torch(self.solver.sim.rigid_solver.dyn_state.links.pos, transpose=True).to(gs.tc_float)
+        parts = [wrenches[:, [link.idx for link in self.colliders]]]
+        for entity, reference in zip(self.prescribed_entities, self.prescribed_links):
+            links_idx = [link.idx for link in entity.links]
+            force = wrenches[:, links_idx, :3]
+            lever = links_pos[:, links_idx] - links_pos[:, [reference.idx]]
+            torque = wrenches[:, links_idx, 3:] + torch.linalg.cross(lever, force)
+            parts.append(torch.cat((force.sum(dim=1), torque.sum(dim=1)), dim=-1)[:, None])
+        return torch.cat(parts, dim=1)
+
+
+@qd.func
+def func_slerp(q0, q1, t):
+    """Shortest-arc spherical interpolation between two unit quaternions."""
+    dot = q0.dot(q1)
+    q1_aligned = q1
+    if dot < 0.0:
+        q1_aligned = -q1
+        dot = -dot
+    result = (q0 + t * (q1_aligned - q0)).normalized()
+    if dot < 0.9995:
+        theta = qd.acos(dot)
+        result = (qd.sin((1.0 - t) * theta) * q0 + qd.sin(t * theta) * q1_aligned) / qd.sin(theta)
+    return result
+
+
+@qd.kernel
+def kernel_prescribe_links(
+    fraction: float,
+    contact: qd.template(),
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    rigid_config: qd.template(),
+):
+    """Pose of every prescribed entity at the given fraction of the step: the base link pose is written where the
+    rigid solver reads a fixed root link's pose (its info) and where the current pose lives (its state), then the
+    entity's forward kinematics places its other links and geoms."""
+    for i_p, i_b in qd.ndrange(contact.n_prescribed, dyn_state.links.pos.shape[1]):
+        i_l = contact.prescribed_base[i_p]
+        link_pos = contact.prescribed_start[i_p, i_b].pos + fraction * (
+            contact.prescribed_target[i_p, i_b].pos - contact.prescribed_start[i_p, i_b].pos
+        )
+        link_quat = func_slerp(
+            contact.prescribed_start[i_p, i_b].quat, contact.prescribed_target[i_p, i_b].quat, fraction
+        )
+        quat = gu.qd_transform_quat_by_quat(link_quat, gu.qd_inv_quat(contact.prescribed_rel[i_p].quat))
+        pos = link_pos - gu.qd_transform_by_quat(contact.prescribed_rel[i_p].pos, quat)
+        I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
+        dyn_info.links.pos[I_l] = pos
+        dyn_info.links.quat[I_l] = quat
+        dyn_state.links.pos[i_l, i_b] = pos
+        dyn_state.links.quat[i_l, i_b] = quat
+        func_update_cartesian_space_entity(
+            contact.prescribed_entity[i_p],
+            i_b,
+            dyn_state,
+            dyn_info,
+            rigid_info,
+            rigid_config,
+            force_update_fixed_geoms=True,
+            is_backward=False,
+        )
+
+
+@qd.kernel
+def kernel_set_prescribed_targets(
+    pos: qd.types.ndarray(), quat: qd.types.ndarray(), contact: qd.template(), dyn_state: DynState
+):
+    """Targets for the end of the next step; the interpolant starts from the current pose of each link."""
+    for i_p, i_b in qd.ndrange(contact.n_prescribed, dyn_state.links.pos.shape[1]):
+        i_l = contact.prescribed_link[i_p]
+        contact.prescribed_start[i_p, i_b].pos = dyn_state.links.pos[i_l, i_b]
+        contact.prescribed_start[i_p, i_b].quat = dyn_state.links.quat[i_l, i_b]
+        for j in qd.static(range(3)):
+            contact.prescribed_target[i_p, i_b].pos[j] = pos[i_b, i_p, j]
+        for j in qd.static(range(4)):
+            contact.prescribed_target[i_p, i_b].quat[j] = quat[i_b, i_p, j]
 
 
 @qd.func
@@ -690,3 +816,10 @@ def kernel_reset_contact(envs_idx: qd.types.ndarray(), contact: qd.template(), d
         contact.rv_pos_prev[i_r, i_b] = contact.rv_pos[i_r, i_b]
     for i_b_ in range(envs_idx.shape[0]):
         contact.errno[envs_idx[i_b_]] = 0
+    for i_p, i_b_ in qd.ndrange(contact.n_prescribed, envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        i_l = contact.prescribed_link[i_p]
+        contact.prescribed_start[i_p, i_b].pos = dyn_state.links.pos[i_l, i_b]
+        contact.prescribed_start[i_p, i_b].quat = dyn_state.links.quat[i_l, i_b]
+        contact.prescribed_target[i_p, i_b].pos = dyn_state.links.pos[i_l, i_b]
+        contact.prescribed_target[i_p, i_b].quat = dyn_state.links.quat[i_l, i_b]

@@ -39,7 +39,9 @@ from genesis.engine.solvers.vbd_contact import (
     func_contact_vertex_terms,
     kernel_begin_contact,
     kernel_end_contact,
+    kernel_prescribe_links,
     kernel_reset_contact,
+    kernel_set_prescribed_targets,
 )
 from genesis.engine.solvers.vbd_rigid import func_attachment_soft_system
 from genesis.engine.solvers.vbd_rigid_attachment import (
@@ -96,6 +98,7 @@ class VBDSolver(Solver):
         self.contact = None
         self._contact_rules = []
         self._rigid_colliders = []
+        self._prescribed_colliders = []
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_vertex_cap = options.contact_vertex_cap
         self._contact_cell_cap = options.contact_cell_cap
@@ -114,9 +117,54 @@ class VBDSolver(Solver):
         substep, so a fixed link, a link the tissue drives, or a prescribed link all work."""
         if self._scene.is_built:
             gs.raise_exception("Rigid colliders must be declared before scene.build().")
-        if any(link is other for other, _ in self._rigid_colliders):
+        if any(link is other for other, _ in self._rigid_colliders) or any(
+            link is other for entity, _, _ in self._prescribed_colliders for other in entity.links
+        ):
             gs.raise_exception(f"Link {link.name} is already a collider.")
+        if not link.geoms:
+            gs.raise_exception(f"Collider link {link.name} has no collision geometry.")
         self._rigid_colliders.append((link, int(collision_group)))
+
+    def add_prescribed_collider(self, entity, collision_group, link=None):
+        """Let the collision geometry of a fixed rigid entity collide with the tissue while the pose of `link` (its
+        base link by default) follows the targets given to `set_prescribed_targets`, sampled at every substep.
+        Declare before `scene.build()`. Batched scenes need `RigidOptions.batch_links_info=True` so each
+        environment can hold its own pose."""
+        if self._scene.is_built:
+            gs.raise_exception("Prescribed colliders must be declared before scene.build().")
+        if not all(link.is_fixed for link in entity.links) or entity.n_dofs > 0:
+            gs.raise_exception("A prescribed collider must be a rigid entity whose links are all fixed.")
+        if not any(link.geoms for link in entity.links):
+            gs.raise_exception("A prescribed collider needs collision geometry.")
+        if any(link is other for link in entity.links for other, _ in self._rigid_colliders):
+            gs.raise_exception("A link of the prescribed entity is already a collider.")
+        if any(entity is other for other, _, _ in self._prescribed_colliders):
+            gs.raise_exception("The entity is already a prescribed collider.")
+        if link is None:
+            link = entity.base_link
+        if not any(link is other for other in entity.links):
+            gs.raise_exception("The reference link must belong to the prescribed entity.")
+        self._prescribed_colliders.append((entity, int(collision_group), link))
+
+    def set_prescribed_targets(self, pos, quat):
+        """Poses the prescribed colliders reach at the end of the next `scene.step()`, in declaration order:
+        `pos` of shape (B, C, 3) and unit `quat` of shape (B, C, 4) in (w, x, y, z), on the simulation device. The
+        interpolant is linear in position and shortest-arc in orientation from the current pose."""
+        n_prescribed = len(self._prescribed_colliders)
+        pos = torch.as_tensor(pos, dtype=gs.tc_float, device=gs.device)
+        quat = torch.as_tensor(quat, dtype=gs.tc_float, device=gs.device)
+        if pos.shape != (self._B, n_prescribed, 3) or quat.shape != (self._B, n_prescribed, 4):
+            gs.raise_exception(
+                f"Prescribed targets need shapes ({self._B}, {n_prescribed}, 3) and ({self._B}, {n_prescribed}, 4), "
+                f"got {tuple(pos.shape)} and {tuple(quat.shape)}."
+            )
+        if not bool(torch.isfinite(pos).all()) or not bool(torch.isfinite(quat).all()):
+            gs.raise_exception("Prescribed targets must be finite.")
+        if bool((torch.linalg.vector_norm(quat, dim=-1) - 1.0).abs().max() > 1e-4):
+            gs.raise_exception("Prescribed target quaternions must have unit norm.")
+        kernel_set_prescribed_targets(
+            pos.contiguous(), quat.contiguous(), self.contact, self._sim.rigid_solver.dyn_state
+        )
 
     def add_contact_rule(self, group_a, group_b, stiffness, friction, thickness):
         """Declare that two collision groups collide, with the penalty stiffness (N/m) of a pair, the isotropic
@@ -134,22 +182,27 @@ class VBDSolver(Solver):
         return self.contact.reactions()
 
     def check_errno(self):
+        """Raise with every contact failure recorded since the last check, physical failures first: a batch that
+        crossed a surface and overflowed a buffer in the same window reports both."""
         errno = int(qd_to_torch(self.contact.errno).max())
-        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_CELL:
-            gs.raise_exception("More contact vertices in one hash cell than VBDOptions.contact_cell_cap allows.")
-        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS:
-            gs.raise_exception("More candidate contact pairs than VBDOptions.contact_pair_cap allows.")
-        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_SLOTS:
-            gs.raise_exception("A contact vertex takes part in more pairs than VBDOptions.contact_vertex_cap allows.")
-        if errno & ErrorCode.INVALID_VBD_CONTACT_NAN:
-            gs.raise_exception("A contact pair has a non-finite distance.")
+        messages = []
         if errno & ErrorCode.VBD_CONTACT_CROSSING:
-            gs.raise_exception("A contact pair crossed its surface within one substep: the penalty did not hold it.")
+            messages.append("A contact pair crossed its surface within one substep: the penalty did not hold it.")
         if errno & ErrorCode.VBD_CONTACT_MOTION_BOUND:
-            gs.raise_exception(
-                "A contact vertex moved further than the contact margin in one substep, so a collision may have been "
-                "missed. Use more substeps or a larger thickness."
+            messages.append(
+                "A contact vertex moved further than the contact margin in one substep, so a collision may have "
+                "been missed. Use more substeps or a larger thickness."
             )
+        if errno & ErrorCode.INVALID_VBD_CONTACT_NAN:
+            messages.append("A contact pair has a non-finite distance.")
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_CELL:
+            messages.append("More contact vertices in one hash cell than VBDOptions.contact_cell_cap allows.")
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS:
+            messages.append("More candidate contact pairs than VBDOptions.contact_pair_cap allows.")
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_SLOTS:
+            messages.append("A contact vertex takes part in more pairs than VBDOptions.contact_vertex_cap allows.")
+        if messages:
+            gs.raise_exception(" ".join(messages))
 
     # ------------------------------------------------------------------------------------
     # --------------------------------- initialization -----------------------------------
@@ -449,11 +502,17 @@ class VBDSolver(Solver):
             if self._contact_rules:
                 if self._sim.requires_grad:
                     gs.raise_exception("Mesh contact has no adjoint, so it cannot be used with requires_grad.")
-                self.contact = VBDContact(self, self._entities, self._rigid_colliders, self._contact_rules)
                 rigid = self._sim.rigid_solver
+                if self._prescribed_colliders and self._B > 1 and not rigid._options.batch_links_info:
+                    gs.raise_exception(
+                        "Prescribed colliders in a batched scene need RigidOptions.batch_links_info=True."
+                    )
+                self.contact = VBDContact(
+                    self, self._entities, self._rigid_colliders, self._prescribed_colliders, self._contact_rules
+                )
                 kernel_reset_contact(torch.arange(self._B, dtype=torch.int32), self.contact, rigid.dyn_state)
-            elif self._rigid_colliders:
-                gs.raise_exception("Rigid colliders were declared without any contact rule.")
+            elif self._rigid_colliders or self._prescribed_colliders:
+                gs.raise_exception("Colliders were declared without any contact rule.")
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
     def _init_self_collision(self, elems):
@@ -2733,7 +2792,17 @@ class VBDSolver(Solver):
                 self._kernel_warm_start()
             self._kernel_predict(f)
             if self.contact is not None:
-                kernel_begin_contact(f, self, self.contact, self._sim.rigid_solver.dyn_state)
+                rigid = self._sim.rigid_solver
+                if self.contact.n_prescribed:
+                    kernel_prescribe_links(
+                        (f + 1) / self._sim.substeps,
+                        self.contact,
+                        rigid.dyn_state,
+                        rigid.dyn_info,
+                        rigid.rigid_info,
+                        rigid.rigid_config,
+                    )
+                kernel_begin_contact(f, self, self.contact, rigid.dyn_state)
             if self._self_thickness > 0.0:
                 self._kernel_build_hash(f)
                 # Reading the flag waits for the device, so it is read once a step, not once a substep. An
