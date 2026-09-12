@@ -211,11 +211,12 @@ def test_prescribed_ellipsoid_compresses_tissue_and_a_blocked_command_is_rejecte
         scene.vbd_solver.set_prescribed_targets(target, quat)
         scene.step()
     # hold the meal so the tissue settles and the force balance is static
-    for _ in range(20):
+    for _ in range(60):
         scene.step()
     positions = tissue.get_positions()
     top = positions[..., 2].max()
     assert top < 0.0411 - 0.004  # the tissue is compressed by the meal
+    assert torch.linalg.vector_norm(tissue.get_state().vel, dim=-1).max() < 5e-3
     reactions = scene.vbd_solver.collider_reactions()
     assert reactions.shape == (B, 2, 6)
     # the meal pushes down on the tissue, so the tissue pushes up on the meal, and the table carries the same load
@@ -391,3 +392,356 @@ def test_free_bone_with_attached_tissue_rests_on_table_through_rigid_and_tissue_
     assert_allclose(reactions[:, 0, 2], -weight, rtol=0.03, atol=0.0)
     # the bone's own contact carries the bone's weight; the tissue's carries the tissue's, both act on the table
     assert (reactions[:, 1, 2] > 0.9 * bone.material.rho * 0.04**3 * 9.81).all()
+
+
+def _prescribed_box_xml(pos, half_size):
+    return (
+        f'<mujoco><worldbody><body pos="{pos[0]} {pos[1]} {pos[2]}">'
+        f'<geom type="box" size="{half_size[0]} {half_size[1]} {half_size[2]}"/></body></worldbody></mujoco>'
+    )
+
+
+def _prescribed_cylinder_xml(pos, radius, half_height):
+    return (
+        f'<mujoco><worldbody><body pos="{pos[0]} {pos[1]} {pos[2]}">'
+        f'<geom type="cylinder" size="{radius} {half_height}"/></body></worldbody></mujoco>'
+    )
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_rotating_collider_drags_tissue_only_through_friction(n_envs, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+            batch_links_info=True,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-10.0,
+            damping=2e-3,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.4, -0.5, 0.3),
+            camera_lookat=(0.1, 0.0, 0.02),
+        ),
+        show_viewer=show_viewer,
+    )
+    tissues, boxes = [], []
+    for x, group in ((0.0, 1), (0.2, 3)):
+        tissues.append(
+            scene.add_entity(
+                morph=gs.morphs.Box(
+                    size=(0.04, 0.04, 0.02),
+                    pos=(x, 0.0, 0.01),
+                    nobisect=False,
+                    maxvolume=1e-5,
+                ),
+                material=gs.materials.VBD.Muscle(
+                    E=1e5,
+                    nu=0.3,
+                    collision_group=group,
+                ),
+            )
+        )
+        # a cylinder keeps its footprint while it spins, so only friction can move the tissue
+        boxes.append(
+            scene.add_entity(
+                morph=gs.morphs.MJCF(
+                    file=_prescribed_cylinder_xml((x, 0.0, 0.031), 0.012, 0.01),
+                ),
+                material=gs.materials.Rigid(),
+            )
+        )
+    scene.vbd_solver.add_prescribed_collider(boxes[0], collision_group=2, link=boxes[0].links[1])
+    scene.vbd_solver.add_prescribed_collider(boxes[1], collision_group=4, link=boxes[1].links[1])
+    scene.vbd_solver.add_contact_rule(1, 2, stiffness=1e5, friction=0.6, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(3, 4, stiffness=1e5, friction=0.0, thickness=1e-3)
+    scene.build(n_envs=n_envs)
+    # the lower faces are held so the blocks cannot spin as a whole
+    for tissue in tissues:
+        rest = tensor_to_array(tissue.init_positions)
+        tissue.set_pinned(rest[:, 2] < rest[:, 2].min() + 1e-5)
+    B = max(n_envs, 1)
+    pos = torch.tensor([[0.0, 0.0, 0.031], [0.2, 0.0, 0.031]], device=gs.device).expand(B, 2, 3).clone()
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=gs.device).expand(B, 2, 4).clone()
+    # press 0.8 mm into the tissue tops (less than the layer, so the footprint may sweep over unloaded
+    # vertices), then rotate a quarter turn about z over 0.2 s
+    for i in range(20):
+        pos[..., 2] = 0.031 - 0.0008 * (i + 1) / 20
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    reactions = scene.vbd_solver.collider_reactions()
+    assert (reactions[:, :, 2] > 0.5).all()
+    before = [tissue.get_positions().clone() for tissue in tissues]
+    torque_sign = torch.zeros(B, device=gs.device)
+    for i in range(80):
+        angle = 0.5 * torch.pi * (i + 1) / 80
+        quat[..., 0] = torch.cos(torch.tensor(angle / 2))
+        quat[..., 3] = torch.sin(torch.tensor(angle / 2))
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+        reactions = scene.vbd_solver.collider_reactions()
+        torque_sign = torque_sign + reactions[:, 0, 5]
+    after = [tissue.get_positions() for tissue in tissues]
+    swirls = []
+    for tissue, x0, x1 in zip(tissues, before, after):
+        rest = tensor_to_array(tissue.init_positions)
+        top = torch.as_tensor(rest[:, 2] > rest[:, 2].max() - 1e-5, device=gs.device)
+        centre = torch.as_tensor(rest.mean(axis=0), device=gs.device)
+        radial = (x0[:, top] - centre)[..., :2]
+        displacement = (x1[:, top] - x0[:, top])[..., :2]
+        # tangential motion in the sense of a positive rotation about z: r x d along +z
+        swirls.append((radial[..., 0] * displacement[..., 1] - radial[..., 1] * displacement[..., 0]).mean(dim=-1))
+    # the frictional top follows the spin; the frictionless one shows only the faceting of its collider
+    assert (swirls[0] > 1e-7).all()
+    assert (swirls[1].abs() < 0.01 * swirls[0]).all()
+    # the dragged tissue resists the rotation: the torque on the frictional collider about +z is negative, and the
+    # frictionless one feels only the faceting of its mesh
+    assert (torque_sign < 0.0).all()
+    assert (reactions[:, 1, 5].abs() < 0.01 * reactions[:, 0, 5].abs()).all()
+    assert all(torch.isfinite(tissue.get_positions()).all() for tissue in tissues)
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_sliding_collider_obeys_the_friction_cone_and_an_off_axis_approach_pushes_back(n_envs, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+            batch_links_info=True,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-10.0,
+            damping=2e-3,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.0, 0.0, 0.02),
+        ),
+        show_viewer=show_viewer,
+    )
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.08, 0.04, 0.02),
+            pos=(0.0, 0.0, 0.01),
+            nobisect=False,
+            maxvolume=1e-5,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=1e5,
+            nu=0.3,
+            collision_group=1,
+        ),
+    )
+    box = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=_prescribed_box_xml((-0.03, 0.0, 0.05), (0.01, 0.01, 0.01)),
+        ),
+        material=gs.materials.Rigid(),
+    )
+    mu = 0.4
+    scene.vbd_solver.add_prescribed_collider(box, collision_group=2, link=box.links[1])
+    scene.vbd_solver.add_contact_rule(1, 2, stiffness=1e5, friction=mu, thickness=1e-3)
+    scene.build(n_envs=n_envs)
+    rest = tensor_to_array(tissue.init_positions)
+    tissue.set_pinned(rest[:, 2] < rest[:, 2].min() + 1e-5)
+    B = max(n_envs, 1)
+    pos = torch.tensor([-0.03, 0.0, 0.05], device=gs.device).expand(B, 1, 3).clone()
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=gs.device).expand(B, 1, 4).clone()
+    # off-axis approach at 45 degrees in the xz plane: 20.8 mm down and along +x over 0.1 s; the box bottom
+    # (z = 0.04) meets the tissue top (z = 0.02) after 20 mm, so the last 0.8 mm compresses inside the layer
+    for i in range(40):
+        pos[..., 0] = -0.03 + 0.0208 * (i + 1) / 40
+        pos[..., 2] = 0.05 - 0.0208 * (i + 1) / 40
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    reactions = scene.vbd_solver.collider_reactions()
+    assert (reactions[:, 0, 2] > 0.0).all()
+    # the tangential reaction opposes the +x motion and stays inside the Coulomb cone
+    assert (reactions[:, 0, 0] < 0.0).all()
+    assert (reactions[:, 0, 0].abs() <= mu * reactions[:, 0, 2] * 1.05).all()
+    # hold, then slide along +x at 0.1 m/s: the tangential reaction sits on the cone
+    for i in range(20):
+        scene.step()
+    ratios = []
+    for i in range(40):
+        pos[..., 0] = -0.0092 + 0.1 * 2.5e-3 * (i + 1)
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+        reactions = scene.vbd_solver.collider_reactions()
+        if i >= 20:
+            ratios.append(-reactions[:, 0, 0] / reactions[:, 0, 2])
+    ratio = torch.stack(ratios).mean(dim=0)
+    assert_allclose(ratio, mu, rtol=0.1, atol=0.0)
+    assert torch.isfinite(tissue.get_positions()).all()
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_thin_wall_holds_a_pressing_collider_and_refuses_to_be_crossed(n_envs, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+            batch_links_info=True,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-10.0,
+            damping=2e-3,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    table = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.2, 0.2, 0.02),
+            pos=(0.0, 0.0, -0.01),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(),
+    )
+    # a 3 mm sheet just above the table's layer, one tetrahedron thick
+    wall = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.04, 0.003),
+            pos=(0.0, 0.0, 0.0026),
+            nobisect=False,
+            maxvolume=2e-8,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=2e5,
+            nu=0.3,
+            collision_group=1,
+        ),
+    )
+    box = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=_prescribed_box_xml((0.0, 0.0, 0.03), (0.01, 0.01, 0.01)),
+        ),
+        material=gs.materials.Rigid(),
+    )
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0)
+    scene.vbd_solver.add_prescribed_collider(box, collision_group=2, link=box.links[1])
+    # the sheet's vertices weigh micrograms: a pair stiffness far above their inertia over h^2 (about 10 N/m here)
+    # makes the per-sweep dual update overshoot, so the sheet's rules stay within three decades of it
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e4, friction=0.5, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(1, 2, stiffness=1e4, friction=0.5, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(0, 2, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.build(n_envs=n_envs)
+    B = max(n_envs, 1)
+    pos = torch.tensor([0.0, 0.0, 0.03], device=gs.device).expand(B, 1, 3).clone()
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=gs.device).expand(B, 1, 4).clone()
+    # the box bottom (z = 0.02) reaches the sheet top (z = 0.0041) after 15.9 mm; the sheet then closes its 0.1 mm
+    # of clearance to the table layer and takes the remaining travel as compression. Each 1 mm layer holds the
+    # sheet's vertices a millimetre off the surface it touches, so the 3 mm sheet ends about 1.6 mm thick
+    for i in range(60):
+        pos[..., 2] = 0.03 - 0.0164 * (i + 1) / 60
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    # hold so the sheet settles and the force balance is static
+    for _ in range(20):
+        scene.step()
+    reactions = scene.vbd_solver.collider_reactions()
+    assert (reactions[:, 1, 2] > 1.0).all()
+    assert_allclose(reactions[:, 0, 2], -reactions[:, 1, 2], rtol=0.1, atol=0.0)
+    positions = wall.get_positions()
+    assert (positions[..., 2].min() > -1e-4).all()
+    assert torch.isfinite(positions).all()
+    # driving the box to the table would crush the sheet to nothing: the engine refuses
+    with pytest.raises(gs.GenesisException, match="crossed|margin|finite"):
+        for i in range(40):
+            pos[..., 2] = 0.0136 - 0.02 * (i + 1) / 40
+            scene.vbd_solver.set_prescribed_targets(pos, quat)
+            scene.step()
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_opposed_colliders_squeeze_tissue_symmetrically(n_envs, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+            batch_links_info=True,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-10.0,
+            damping=2e-3,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.0, 0.0, 0.0),
+            nobisect=False,
+            maxvolume=1e-5,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=1e5,
+            nu=0.3,
+            collision_group=1,
+        ),
+    )
+    left = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=_prescribed_box_xml((-0.04, 0.0, 0.0), (0.01, 0.03, 0.03)),
+        ),
+        material=gs.materials.Rigid(),
+    )
+    right = scene.add_entity(
+        morph=gs.morphs.MJCF(
+            file=_prescribed_box_xml((0.04, 0.0, 0.0), (0.01, 0.03, 0.03)),
+        ),
+        material=gs.materials.Rigid(),
+    )
+    scene.vbd_solver.add_prescribed_collider(left, collision_group=2, link=left.links[1])
+    scene.vbd_solver.add_prescribed_collider(right, collision_group=2, link=right.links[1])
+    scene.vbd_solver.add_contact_rule(1, 2, stiffness=1e5, friction=0.3, thickness=1e-3)
+    scene.build(n_envs=n_envs)
+    B = max(n_envs, 1)
+    pos = torch.tensor([[-0.04, 0.0, 0.0], [0.04, 0.0, 0.0]], device=gs.device).expand(B, 2, 3).clone()
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=gs.device).expand(B, 2, 4).clone()
+    # each plate travels 14 mm: 9 mm of clearance and 5 mm of squeeze per side
+    for i in range(60):
+        travel = 0.014 * (i + 1) / 60
+        pos[..., 0, 0] = -0.04 + travel
+        pos[..., 1, 0] = 0.04 - travel
+        scene.vbd_solver.set_prescribed_targets(pos, quat)
+        scene.step()
+    reactions = scene.vbd_solver.collider_reactions()
+    assert (reactions[:, 0, 0] < -2.0).all()
+    assert_allclose(reactions[:, 0, 0], -reactions[:, 1, 0], rtol=0.05, atol=0.0)
+    positions = tissue.get_positions()
+    assert (positions[..., 0].mean(dim=-1).abs() < 5e-4).all()
+    assert (positions[..., 0].max(dim=-1).values < 0.02 - 0.004).all()
+    assert torch.isfinite(positions).all()

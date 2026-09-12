@@ -12,6 +12,11 @@ Friction is the smoothed Coulomb dissipation of the VBD paper (Eq. 15) on the re
 participants over the substep, with the normal force, the normal and the closest-point weights frozen at the current
 iterate; the block is mu lam_n g P, which is at least the exact Hessian because g' <= 0.
 
+Boundary triangles are wound outward at build (tissue faces away from their tetrahedron, closed rigid meshes to
+positive volume), and over the face the point-triangle distance is signed by that normal: a point that got behind
+the surface within a substep is pushed back out instead of further in, and a point a whole layer behind fails the
+step. Edge-edge pairs are unsigned; their crossing is the sign change of the edges' triple product.
+
 Candidate pairs are collected once per substep from a uniform hash grid of the predicted positions, within one
 margin of the thickness, and the multipliers start from zero every substep: the pair set changes with the
 geometry, so there is no persistent identity to transport them along. The grid is rebuilt per substep, the pair
@@ -76,7 +81,8 @@ class VBDContact:
         rv_link, rv_local = [], []
         for entity in entities:
             elems = entity.elems.astype(np.int64)
-            faces, *_ = igl.boundary_facets(elems)
+            faces, tets_idx, _ = igl.boundary_facets(elems)
+            faces = self._oriented_outward(faces, elems[tets_idx], tensor_to_array(entity.init_positions))
             boundary, faces_local = np.unique(faces.reshape(-1), return_inverse=True)
             base = len(cv_kind)
             cv_kind.extend([0] * len(boundary))
@@ -97,8 +103,9 @@ class VBDContact:
                 cv_owner.extend([link.idx] * len(local))
                 rv_link.extend([link.idx] * len(local))
                 rv_local.append(local)
-                triangles.append(base + geom.init_faces.astype(np.int64))
-                edges.append(base + self._unique_edges(geom.init_faces.astype(np.int64)))
+                faces = self._faces_with_positive_volume(geom.init_faces.astype(np.int64), local)
+                triangles.append(base + faces)
+                edges.append(base + self._unique_edges(faces))
         triangles = np.concatenate(triangles)
         edges = np.concatenate(edges)
         self.n_cv = len(cv_kind)
@@ -212,7 +219,7 @@ class VBDContact:
                 np.array([entity.base_link.idx for entity in self.prescribed_entities], dtype=gs.np_int)
             )
             self.prescribed_entity.from_numpy(
-                np.array([entity.idx for entity in self.prescribed_entities], dtype=gs.np_int)
+                np.array([entity._idx_in_solver for entity in self.prescribed_entities], dtype=gs.np_int)
             )
             # link poses are not final while the solvers build, so the fixed chain from the base to the reference
             # link is composed from the links' initial parent-relative poses
@@ -238,6 +245,26 @@ class VBDContact:
             quat = gu.transform_quat_by_quat(quat, np.asarray(link.quat))
             link = links[link.parent_idx]
         return pos, quat
+
+    @staticmethod
+    def _oriented_outward(faces, tets, positions):
+        """Boundary faces wound so their normal points away from the tetrahedron each one belongs to."""
+        opposite = np.array([[v for v in tet if v not in face][0] for face, tet in zip(faces, tets)])
+        a, b, c = (positions[faces[:, i]] for i in range(3))
+        inward = np.einsum("ij,ij->i", np.cross(b - a, c - a), positions[opposite] - a) > 0.0
+        faces = faces.copy()
+        faces[inward] = faces[inward][:, [0, 2, 1]]
+        return faces
+
+    @staticmethod
+    def _faces_with_positive_volume(faces, positions):
+        """Faces of a closed mesh wound so the enclosed signed volume is positive (normals outward). An open mesh
+        keeps its authored winding."""
+        a, b, c = (positions[faces[:, i]] for i in range(3))
+        volume = np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0
+        if volume < 0.0:
+            return faces[:, [0, 2, 1]]
+        return faces
 
     @staticmethod
     def _unique_edges(faces):
@@ -284,6 +311,7 @@ def func_slerp(q0, q1, t):
 @qd.kernel
 def kernel_prescribe_links(
     fraction: float,
+    is_step_start: qd.template(),
     contact: qd.template(),
     dyn_state: DynState,
     dyn_info: DynInfo,
@@ -292,7 +320,13 @@ def kernel_prescribe_links(
 ):
     """Pose of every prescribed entity at the given fraction of the step: the base link pose is written where the
     rigid solver reads a fixed root link's pose (its info) and where the current pose lives (its state), then the
-    entity's forward kinematics places its other links and geoms."""
+    entity's forward kinematics places its other links and geoms. At the first substep of a step the interpolant
+    restarts from the pose the reference link holds, so a step without a new target holds the previous one."""
+    if qd.static(is_step_start):
+        for i_p, i_b in qd.ndrange(contact.n_prescribed, dyn_state.links.pos.shape[1]):
+            i_l = contact.prescribed_link[i_p]
+            contact.prescribed_start[i_p, i_b].pos = dyn_state.links.pos[i_l, i_b]
+            contact.prescribed_start[i_p, i_b].quat = dyn_state.links.quat[i_l, i_b]
     for i_p, i_b in qd.ndrange(contact.n_prescribed, dyn_state.links.pos.shape[1]):
         i_l = contact.prescribed_base[i_p]
         link_pos = contact.prescribed_start[i_p, i_b].pos + fraction * (
@@ -324,11 +358,8 @@ def kernel_prescribe_links(
 def kernel_set_prescribed_targets(
     pos: qd.types.ndarray(), quat: qd.types.ndarray(), contact: qd.template(), dyn_state: DynState
 ):
-    """Targets for the end of the next step; the interpolant starts from the current pose of each link."""
+    """Targets for the end of the next step."""
     for i_p, i_b in qd.ndrange(contact.n_prescribed, dyn_state.links.pos.shape[1]):
-        i_l = contact.prescribed_link[i_p]
-        contact.prescribed_start[i_p, i_b].pos = dyn_state.links.pos[i_l, i_b]
-        contact.prescribed_start[i_p, i_b].quat = dyn_state.links.quat[i_l, i_b]
         for j in qd.static(range(3)):
             contact.prescribed_target[i_p, i_b].pos[j] = pos[i_b, i_p, j]
         for j in qd.static(range(4)):
@@ -432,8 +463,11 @@ def func_segment_parameters(a, b, c, d):
 
 @qd.func
 def func_pt_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
-    """Current distance, unit normal (from the triangle towards the point) and closest-point weights of a
-    point-triangle pair, with the rule thickness."""
+    """Current distance, unit normal and closest-point weights of a point-triangle pair, with the rule thickness.
+    Over the face the distance is signed by the outward triangle normal, so a point behind the surface is pushed
+    back out. At an edge or a vertex it is the unsigned distance with the normal from the feature to the point: a
+    point outside a convex body near one of its edges lies behind the plane of an adjacent face, and pushing it
+    towards that plane's front would push it into the body."""
     cv_x = contact.pt_pairs[i_p, i_b].a
     tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
     x = func_cv_pos(f, cv_x, i_b, solver, contact)
@@ -444,6 +478,9 @@ def func_pt_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template())
     rel = x - w[0] * a - w[1] * b - w[2] * c
     d = rel.norm()
     n = rel / d
+    if w[0] > 0.0 and w[1] > 0.0 and w[2] > 0.0:
+        n = (b - a).cross(c - a).normalized()
+        d = rel.dot(n)
     h = contact.rule_thickness[contact.cv_info[cv_x].group, contact.cv_info[tri[0]].group]
     return d, n, w, h
 
@@ -472,6 +509,51 @@ def func_multiplier(lam, k, gap):
 
 
 @qd.func
+def func_pt_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
+    """Multiplier y, normal n, closest-point weights w, friction scale and tangential slide of a point-triangle
+    pair at the current iterate. The force on the point is -y n - scale * slide and the triangle vertices take
+    -w_j of it; scale is mu lam_n g, zero when the pair is inactive."""
+    d, n, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
+    y = func_multiplier(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, d - h)
+    cv_x = contact.pt_pairs[i_p, i_b].a
+    tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+    mu = contact.rule_friction[contact.cv_info[cv_x].group, contact.cv_info[tri[0]].group]
+    slide = func_cv_pos(f, cv_x, i_b, solver, contact) - func_cv_pos_prev(f, cv_x, i_b, solver, contact)
+    for j in qd.static(range(3)):
+        slide -= w[j] * (
+            func_cv_pos(f, tri[j], i_b, solver, contact) - func_cv_pos_prev(f, tri[j], i_b, solver, contact)
+        )
+    slide -= slide.dot(n) * n
+    scale = gs.qd_float(0.0)
+    if y < 0.0 and mu > 0.0:
+        scale = -y * mu * func_friction_scale(slide.norm(), solver._friction_eps_v * solver._substep_dt)
+    return y, n, w, scale, slide
+
+
+@qd.func
+def func_ee_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
+    """Multiplier y, normal n, closest-point parameters s, t, friction scale and tangential slide of an edge-edge
+    pair. The force on the first edge's closest point is -y n - scale * slide, split (1 - s, s) over its endpoints;
+    the second edge takes the opposite, split (1 - t, t)."""
+    d, n, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
+    y = func_multiplier(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, d - h)
+    ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
+    eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
+    mu = contact.rule_friction[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
+    slide = (1.0 - s) * (func_cv_pos(f, ea[0], i_b, solver, contact) - func_cv_pos_prev(f, ea[0], i_b, solver, contact))
+    slide += s * (func_cv_pos(f, ea[1], i_b, solver, contact) - func_cv_pos_prev(f, ea[1], i_b, solver, contact))
+    slide -= (1.0 - t) * (
+        func_cv_pos(f, eb[0], i_b, solver, contact) - func_cv_pos_prev(f, eb[0], i_b, solver, contact)
+    )
+    slide -= t * (func_cv_pos(f, eb[1], i_b, solver, contact) - func_cv_pos_prev(f, eb[1], i_b, solver, contact))
+    slide -= slide.dot(n) * n
+    scale = gs.qd_float(0.0)
+    if y < 0.0 and mu > 0.0:
+        scale = -y * mu * func_friction_scale(slide.norm(), solver._friction_eps_v * solver._substep_dt)
+    return y, n, s, t, scale, slide
+
+
+@qd.func
 def func_friction_scale(u_norm, eps):
     g = 1.0 / u_norm
     if u_norm < eps:
@@ -497,75 +579,38 @@ def func_contact_cv_terms(f, cv, i_b, solver: qd.template(), contact: qd.templat
     force = gs.qd_vec3(0.0, 0.0, 0.0)
     hessian = qd.Matrix.zero(gs.qd_float, 3, 3)
     if cv >= 0:
-        eps = solver._friction_eps_v * solver._substep_dt
         for slot in range(contact.cv_slot_offset[cv, i_b], contact.cv_slot_offset[cv + 1, i_b]):
             code = contact.cv_slot[slot, i_b]
             role = code % 8
             i_p = code // 8
             weight = gs.qd_float(0.0)  # dd/dx = weight * n for this participant
-            gap = gs.qd_float(0.0)
+            y = gs.qd_float(0.0)
             n = gs.qd_vec3(0.0, 0.0, 1.0)
-            lam = gs.qd_float(0.0)
             k = gs.qd_float(0.0)
-            mu = gs.qd_float(0.0)
-            slide = gs.qd_vec3(0.0, 0.0, 0.0)  # relative motion of the point side against the triangle or edge side
+            scale = gs.qd_float(0.0)
+            slide = gs.qd_vec3(0.0, 0.0, 0.0)
             if role < ROLE_EDGE_A:
-                d, n_pt, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
-                n = n_pt
-                gap = d - h
-                lam = contact.pt_pairs[i_p, i_b].lam
+                y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
                 k = contact.pt_pairs[i_p, i_b].k
-                cv_x = contact.pt_pairs[i_p, i_b].a
-                tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
-                mu = contact.rule_friction[contact.cv_info[cv_x].group, contact.cv_info[tri[0]].group]
                 weight = 1.0
                 if role >= ROLE_TRIANGLE:
                     weight = -w[role - ROLE_TRIANGLE]
-                slide = func_cv_pos(f, cv_x, i_b, solver, contact) - func_cv_pos_prev(f, cv_x, i_b, solver, contact)
-                for j in qd.static(range(3)):
-                    slide -= w[j] * (
-                        func_cv_pos(f, tri[j], i_b, solver, contact) - func_cv_pos_prev(f, tri[j], i_b, solver, contact)
-                    )
             else:
                 i_p = i_p - contact.pair_cap
-                d, n_ee, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
-                n = n_ee
-                gap = d - h
-                lam = contact.ee_pairs[i_p, i_b].lam
+                y, n, s_, t_, scale, slide = func_ee_forces(f, i_p, i_b, solver, contact)
                 k = contact.ee_pairs[i_p, i_b].k
-                ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
-                eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
-                mu = contact.rule_friction[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
                 if role == ROLE_EDGE_A:
-                    weight = 1.0 - s
+                    weight = 1.0 - s_
                 elif role == ROLE_EDGE_A + 1:
-                    weight = s
+                    weight = s_
                 elif role == ROLE_EDGE_B:
-                    weight = -(1.0 - t)
+                    weight = -(1.0 - t_)
                 else:
-                    weight = -t
-                slide = (1.0 - s) * (
-                    func_cv_pos(f, ea[0], i_b, solver, contact) - func_cv_pos_prev(f, ea[0], i_b, solver, contact)
-                )
-                slide += s * (
-                    func_cv_pos(f, ea[1], i_b, solver, contact) - func_cv_pos_prev(f, ea[1], i_b, solver, contact)
-                )
-                slide -= (1.0 - t) * (
-                    func_cv_pos(f, eb[0], i_b, solver, contact) - func_cv_pos_prev(f, eb[0], i_b, solver, contact)
-                )
-                slide -= t * (
-                    func_cv_pos(f, eb[1], i_b, solver, contact) - func_cv_pos_prev(f, eb[1], i_b, solver, contact)
-                )
-            y = func_multiplier(lam, k, gap)
+                    weight = -t_
             if y < 0.0:
-                force -= y * weight * n
+                force -= weight * (y * n + scale * slide)
                 hessian += k * weight * weight * n.outer_product(n)
-                if mu > 0.0:
-                    slide -= slide.dot(n) * n
-                    g = func_friction_scale(slide.norm(), eps)
-                    scale = -y * mu * g
-                    force -= scale * weight * slide
-                    hessian += scale * weight * weight * (qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n))
+                hessian += scale * weight * weight * (qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n))
     return force, hessian
 
 
@@ -857,26 +902,6 @@ def func_accumulate_reaction(f, cv, force, i_b, solver: qd.template(), contact: 
 
 
 @qd.func
-def func_point_crossed_triangle(f, i_b, cv, tri, w, solver: qd.template(), contact: qd.template()):
-    """Whether a point whose closest feature is the face changed side of the triangle plane over the substep: the
-    sign of its height above the plane is compared at the start and at the end of the substep."""
-    crossed = False
-    if w[0] > 0.0 and w[1] > 0.0 and w[2] > 0.0:
-        a0 = func_cv_pos_prev(f, tri[0], i_b, solver, contact)
-        b0 = func_cv_pos_prev(f, tri[1], i_b, solver, contact)
-        c0 = func_cv_pos_prev(f, tri[2], i_b, solver, contact)
-        x0 = func_cv_pos_prev(f, cv, i_b, solver, contact)
-        a1 = func_cv_pos(f, tri[0], i_b, solver, contact)
-        b1 = func_cv_pos(f, tri[1], i_b, solver, contact)
-        c1 = func_cv_pos(f, tri[2], i_b, solver, contact)
-        x1 = func_cv_pos(f, cv, i_b, solver, contact)
-        height0 = (x0 - a0).dot((b0 - a0).cross(c0 - a0))
-        height1 = (x1 - a1).dot((b1 - a1).cross(c1 - a1))
-        crossed = height0 * height1 < 0.0
-    return crossed
-
-
-@qd.func
 def func_edges_crossed(f, i_b, ea, eb, s, t, solver: qd.template(), contact: qd.template()):
     """Whether two edges whose closest points are interior swapped sides over the substep: the sign of the
     triple product (b - a) x (d - c) . (a - c) is compared at the start and at the end of the substep."""
@@ -905,30 +930,32 @@ def kernel_end_contact(f: int, solver: qd.template(), contact: qd.template(), dy
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
         if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
             d, n, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
-            y = func_multiplier(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, d - h)
             if not (d == d):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
-            tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
-            if func_point_crossed_triangle(f, i_b, contact.pt_pairs[i_p, i_b].a, tri, w, solver, contact):
+            # signed over the face: a point a whole layer behind the surface has passed through it
+            if d < -h:
                 qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
+            y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
             if y < 0.0:
-                func_accumulate_reaction(f, contact.pt_pairs[i_p, i_b].a, -y * n, i_b, solver, contact, dyn_state)
+                force = -(y * n + scale * slide)
+                tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+                func_accumulate_reaction(f, contact.pt_pairs[i_p, i_b].a, force, i_b, solver, contact, dyn_state)
                 for j in qd.static(range(3)):
-                    func_accumulate_reaction(f, tri[j], y * w[j] * n, i_b, solver, contact, dyn_state)
+                    func_accumulate_reaction(f, tri[j], -w[j] * force, i_b, solver, contact, dyn_state)
         if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
-            d, n, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
-            y = func_multiplier(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, d - h)
-            if not (d == d):
+            y, n, s, t, scale, slide = func_ee_forces(f, i_p, i_b, solver, contact)
+            if not (n[0] == n[0]):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
             ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
             eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
             if func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
             if y < 0.0:
-                func_accumulate_reaction(f, ea[0], -y * (1.0 - s) * n, i_b, solver, contact, dyn_state)
-                func_accumulate_reaction(f, ea[1], -y * s * n, i_b, solver, contact, dyn_state)
-                func_accumulate_reaction(f, eb[0], y * (1.0 - t) * n, i_b, solver, contact, dyn_state)
-                func_accumulate_reaction(f, eb[1], y * t * n, i_b, solver, contact, dyn_state)
+                force = -(y * n + scale * slide)
+                func_accumulate_reaction(f, ea[0], (1.0 - s) * force, i_b, solver, contact, dyn_state)
+                func_accumulate_reaction(f, ea[1], s * force, i_b, solver, contact, dyn_state)
+                func_accumulate_reaction(f, eb[0], -(1.0 - t) * force, i_b, solver, contact, dyn_state)
+                func_accumulate_reaction(f, eb[1], -t * force, i_b, solver, contact, dyn_state)
     for kind, i_b in qd.ndrange(2, solver._B):
         contact.max_motion[kind, i_b] = 0.0
     for cv, i_b in qd.ndrange(contact.n_cv, solver._B):

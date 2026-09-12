@@ -2796,8 +2796,12 @@ class VBDSolver(Solver):
             if self.contact is not None:
                 rigid = self._sim.rigid_solver
                 if self.contact.n_prescribed:
+                    # f indexes the two-frame buffer without gradients, so the position within the step comes
+                    # from the global substep counter
+                    substep_in_step = self._sim.cur_substep_global % self._sim.substeps
                     kernel_prescribe_links(
-                        (f + 1) / self._sim.substeps,
+                        (substep_in_step + 1) / self._sim.substeps,
+                        substep_in_step == 0,
                         self.contact,
                         rigid.dyn_state,
                         rigid.dyn_info,
