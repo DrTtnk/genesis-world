@@ -524,6 +524,7 @@ from .engine.mesh import Mesh
 from .engine.scene import Scene
 
 from . import recorders
+from . import avbd
 
 for name, member in _gs_backend.__members__.items():
     globals()[name] = member
