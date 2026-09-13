@@ -20,6 +20,8 @@ Muscle actuation changes the rest shape, not the energy: a tet with fiber `m` an
 uses `B_a = B A`, `A = (1/s) m m^T + sqrt(s) (I - m m^T)`, `s = 1 - a gain`, `det A = 1`.
 """
 
+from typing import NamedTuple
+
 import networkx as nx
 import numpy as np
 import torch
@@ -77,6 +79,15 @@ from genesis.utils.misc import qd_to_torch, sanitize_index
 from .base_solver import Solver
 
 
+class TissueDiagnostics(NamedTuple):
+    """Per-environment tissue validity of the last substep: the minimum `J / J0` over all tets (signed volume now
+    over signed rest volume, so an uninverted tet is near +1 and an inverted one is negative or zero) and how many
+    tets are inverted (`J / J0 <= 0`)."""
+
+    min_j_ratio: torch.Tensor
+    n_inverted: torch.Tensor
+
+
 @qd.kernel
 def kernel_set_muscle_state(envs_idx: qd.types.ndarray(), state: qd.types.ndarray(), actuation: qd.template()):
     for i_g, i_b_ in qd.ndrange(actuation.shape[0], envs_idx.shape[0]):
@@ -118,6 +129,7 @@ class VBDSolver(Solver):
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_cell_cap = options.contact_cell_cap
         self._raise_on_env_failure = options.raise_on_env_failure
+        self._max_inverted_substeps = options.max_consecutive_inverted_substeps
         self.mtu = None
         self._mtu_units = []
         self._mtu_restraints = []
@@ -271,9 +283,11 @@ class VBDSolver(Solver):
 
     def env_status(self):
         """Per-environment failure latch: `is_failed` (bool, shape (B,)), the global substep index at which the
-        environment failed (`failed_substep`, -1 while it runs) and the raw contact error word. A failed environment
-        keeps the state of its failed attempt for diagnosis and advances again only after a reset."""
+        environment failed (`failed_substep`, -1 while it runs) and the raw error word (contact and tissue bits
+        combined). A failed environment keeps the state of its failed attempt for diagnosis and advances again only
+        after a reset."""
         errno = qd_to_torch(self.contact.errno) if self.contact is not None else torch.zeros(self._B, dtype=torch.int32)
+        errno = errno | qd_to_torch(self.tissue_errno)
         return EnvStatus(qd_to_torch(self.env_failed) != 0, qd_to_torch(self.failed_substep), errno)
 
     def contact_diagnostics(self):
@@ -295,10 +309,17 @@ class VBDSolver(Solver):
         return self.contact.reactions()
 
     def check_errno(self):
-        """Raise with every contact failure recorded since the last check, physical failures first: a batch that
-        crossed a surface and overflowed a buffer in the same window reports both."""
-        errno = int(qd_to_torch(self.contact.errno).max())
+        """Raise with every contact and tissue failure recorded since the last check, physical failures first: a
+        batch that crossed a surface and overflowed a buffer in the same window reports both."""
+        errno = int(qd_to_torch(self.tissue_errno).max())
+        if self.contact is not None:
+            errno |= int(qd_to_torch(self.contact.errno).max())
         messages = []
+        if errno & ErrorCode.VBD_TISSUE_PERSISTENT_INVERSION:
+            messages.append(
+                "A tet stayed inverted (J/J0 <= 0) for more consecutive substeps than "
+                "VBDOptions.max_consecutive_inverted_substeps allows: the inversion did not recover."
+            )
         if errno & ErrorCode.VBD_CONTACT_CROSSING:
             messages.append("A contact pair crossed its surface within one substep: the penalty did not hold it.")
         if errno & ErrorCode.VBD_CONTACT_MOTION_BOUND:
@@ -410,6 +431,17 @@ class VBDSolver(Solver):
         self.bolus_force = qd.Vector.field(3, dtype=qd.f64, shape=(self._B,))
         self.muscle_actu_adj = qd.field(dtype=qd.f64, shape=(max(self._n_muscle_groups, 1), self._B))
         self.energy = qd.field(dtype=qd.f64, shape=(self._B,))
+        # Tissue validity: the smallest J/J0 (signed tet volume over signed rest volume) and the inverted tet count
+        # of the last substep, per env, plus the persistent-inversion latch: a streak of consecutive substeps that
+        # each held at least one inverted tet, and the raw error word this latch sets.
+        self.min_j_ratio = qd.field(dtype=gs.qd_float, shape=(self._B,))
+        self.n_inverted_tets = qd.field(dtype=gs.qd_int, shape=(self._B,))
+        self.inverted_streak = qd.field(dtype=gs.qd_int, shape=(self._B,))
+        self.tissue_errno = qd.field(dtype=gs.qd_int, shape=(self._B,))
+        self.min_j_ratio.fill(1.0)
+        self.n_inverted_tets.fill(0)
+        self.inverted_streak.fill(0)
+        self.tissue_errno.fill(0)
 
     def init_constraint_fields(self):
         # Hard distance constraints |x_a - x_b| = rest between two vertices, augmented Lagrangian (Giles, Diaz,
@@ -1637,6 +1669,39 @@ class VBDSolver(Solver):
                 self.verts[f + 1, i_v, i_b].vel = (
                     self.verts[f + 1, i_v, i_b].pos - self.verts[f, i_v, i_b].pos
                 ) / self._substep_dt
+
+    @qd.kernel
+    def _kernel_tissue_diagnostics(self, f: qd.i32, substep_global: qd.i32):
+        """Minimum `J / J0` and inverted tet count of substep `f`, per env, at the post-sweep state (frame `f+1`).
+        `J / J0` is the current signed tet volume over its signed rest volume, which is exactly `det(F)`: muscle
+        actuation leaves it unchanged, because its contraction of the rest shape has `det(A) = 1`. An env whose
+        streak of consecutive substeps with any inverted tet passes the configured limit latches, through the
+        same failure fields the contact checks use."""
+        for i_b in range(self._B):
+            if not self.env_failed[i_b]:
+                self.min_j_ratio[i_b] = 1e30
+                self.n_inverted_tets[i_b] = 0
+        for i_e, i_b in qd.ndrange(self._n_elements, self._B):
+            if not self.env_failed[i_b]:
+                F, _ = self._func_deformation(f + 1, i_e, i_b)
+                ratio = F.determinant()
+                qd.atomic_min(self.min_j_ratio[i_b], ratio)
+                if ratio <= 0.0:
+                    qd.atomic_add(self.n_inverted_tets[i_b], 1)
+        for i_b in range(self._B):
+            if not self.env_failed[i_b]:
+                if self.n_inverted_tets[i_b] > 0:
+                    self.inverted_streak[i_b] += 1
+                else:
+                    self.inverted_streak[i_b] = 0
+                if self.inverted_streak[i_b] > self._max_inverted_substeps:
+                    qd.atomic_or(self.tissue_errno[i_b], ErrorCode.VBD_TISSUE_PERSISTENT_INVERSION)
+                    self.env_failed[i_b] = 1
+                    self.failed_substep[i_b] = substep_global
+
+    def tissue_diagnostics(self):
+        """Minimum `J / J0` and inverted tet count of the last substep, each of shape (B,). See `TissueDiagnostics`."""
+        return TissueDiagnostics(qd_to_torch(self.min_j_ratio), qd_to_torch(self.n_inverted_tets))
 
     @qd.kernel
     def _kernel_residual(self, f: qd.i32):
@@ -2958,6 +3023,7 @@ class VBDSolver(Solver):
                     )
             self.solve(f)
             self._kernel_update_velocity(f)
+            self._kernel_tissue_diagnostics(f, self._sim.cur_substep_global)
             if self.contact is not None:
                 kernel_end_contact(
                     f, self._sim.cur_substep_global, self, self.contact, self._sim.rigid_solver.dyn_state
@@ -3097,7 +3163,9 @@ class VBDSolver(Solver):
                 kernel_set_attachment_state(
                     envs_idx, state.attachment_multiplier, state.attachment_stiffness, self.rigid_attachment.state
                 )
-            kernel_clear_env_failure(envs_idx, self.env_failed, self.failed_substep)
+            kernel_clear_env_failure(
+                envs_idx, self.env_failed, self.failed_substep, self.inverted_streak, self.tissue_errno
+            )
             if self.contact is not None:
                 kernel_reset_contact(envs_idx, self.contact, self._sim.rigid_solver.dyn_state)
             if self.mtu is not None:
@@ -3197,7 +3265,15 @@ class VBDSolver(Solver):
 
 
 @qd.kernel
-def kernel_clear_env_failure(envs_idx: qd.types.ndarray(), env_failed: qd.template(), failed_substep: qd.template()):
+def kernel_clear_env_failure(
+    envs_idx: qd.types.ndarray(),
+    env_failed: qd.template(),
+    failed_substep: qd.template(),
+    inverted_streak: qd.template(),
+    tissue_errno: qd.template(),
+):
     for i_b_ in range(envs_idx.shape[0]):
         env_failed[envs_idx[i_b_]] = 0
         failed_substep[envs_idx[i_b_]] = -1
+        inverted_streak[envs_idx[i_b_]] = 0
+        tissue_errno[envs_idx[i_b_]] = 0

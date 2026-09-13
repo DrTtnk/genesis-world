@@ -288,7 +288,6 @@ class Simulator(RBC):
             self.rigid_solver.check_errno()
         if (
             self.vbd_solver.is_active
-            and self.vbd_solver.has_contact
             and self.vbd_solver._raise_on_env_failure
             and self._cur_substep_global % RATE_CHECK_ERRNO == 0
         ):
