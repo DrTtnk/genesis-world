@@ -56,6 +56,20 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     kernel_set_vertex_state,
 )
 from genesis.engine.solvers.vbd_contact import EnvStatus
+from genesis.engine.solvers.vbd_mtu import (
+    HillParameters,
+    LinkAnchor,
+    TissueAnchor,
+    UNIT_HILL,
+    UNIT_LIGAMENT,
+    VBDMTU,
+    WorldAnchor,
+    func_mtu_vertex_terms,
+    kernel_begin_mtu,
+    kernel_end_mtu,
+    kernel_reset_mtu,
+    kernel_set_excitation,
+)
 from genesis.engine.states.solvers import VBDSolverState
 from genesis.utils.array_class import ErrorCode
 from genesis.utils.misc import qd_to_torch, sanitize_index
@@ -104,6 +118,9 @@ class VBDSolver(Solver):
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_cell_cap = options.contact_cell_cap
         self._raise_on_env_failure = options.raise_on_env_failure
+        self.mtu = None
+        self._mtu_units = []
+        self._mtu_restraints = []
 
     @property
     def has_rigid_attachment(self):
@@ -112,6 +129,10 @@ class VBDSolver(Solver):
     @property
     def has_contact(self):
         return self.contact is not None
+
+    @property
+    def has_mtu(self):
+        return self.mtu is not None
 
     def add_rigid_collider(self, link, collision_group):
         """Let the collision meshes of a rigid link take part in mesh contact with the tissue, in the given
@@ -177,6 +198,76 @@ class VBDSolver(Solver):
         if not stiffness > 0.0 or not thickness > 0.0 or friction < 0.0:
             gs.raise_exception("A contact rule needs stiffness > 0, thickness > 0 and friction >= 0.")
         self._contact_rules.append((int(group_a), int(group_b), float(stiffness), float(friction), float(thickness)))
+
+    def _add_routed_unit(self, kind, anchors, parameters):
+        if self._scene.is_built:
+            gs.raise_exception("Muscle-tendon units must be declared before scene.build().")
+        if len(anchors) < 2:
+            gs.raise_exception("A route needs at least two anchors.")
+        for anchor in anchors:
+            if isinstance(anchor, TissueAnchor):
+                if len(anchor.vertices) != 4 or len(anchor.weights) != 4:
+                    gs.raise_exception("A tissue anchor needs four vertices and four barycentric weights.")
+                if abs(sum(anchor.weights) - 1.0) > 1e-6:
+                    gs.raise_exception(f"The barycentric weights of a tissue anchor sum to {sum(anchor.weights)}.")
+            elif not isinstance(anchor, (WorldAnchor, LinkAnchor)):
+                gs.raise_exception(f"Unknown route anchor {anchor!r}.")
+        self._mtu_units.append((kind, list(anchors), parameters))
+        return len(self._mtu_units) - 1
+
+    def add_mtu(self, anchors, parameters):
+        """Declare one routed Hill muscle-tendon unit and return its index. `anchors` is an ordered list of
+        `WorldAnchor`, `LinkAnchor` and `TissueAnchor`; `parameters` is a `HillParameters`. Declare before
+        `scene.build()`."""
+        if not isinstance(parameters, HillParameters):
+            gs.raise_exception("A muscle-tendon unit needs HillParameters.")
+        if not parameters.f_max > 0.0 or not parameters.l_opt > 0.0 or not parameters.l_slack > 0.0:
+            gs.raise_exception("A muscle-tendon unit needs f_max, l_opt and l_slack above zero.")
+        if not parameters.v_max > 0.0:
+            gs.raise_exception("A muscle-tendon unit needs v_max above zero.")
+        return self._add_routed_unit(UNIT_HILL, anchors, parameters)
+
+    def add_ligament(self, anchors, stiffness, slack_length):
+        """Declare one tension-only linear element on the same routing and return its index. It carries
+        `stiffness` (N/m) times the extension past `slack_length` (m), and nothing while it is slack."""
+        if not stiffness > 0.0 or not slack_length > 0.0:
+            gs.raise_exception("A ligament needs stiffness > 0 and slack_length > 0.")
+        return self._add_routed_unit(UNIT_LIGAMENT, anchors, (float(stiffness), float(slack_length)))
+
+    def add_rotary_restraint(self, dof, stiffness, rest_angle):
+        """Declare a passive torque -stiffness (q - rest_angle) on one joint coordinate. Declare before
+        `scene.build()`."""
+        if self._scene.is_built:
+            gs.raise_exception("Rotary restraints must be declared before scene.build().")
+        if not stiffness > 0.0:
+            gs.raise_exception("A rotary restraint needs stiffness > 0.")
+        self._mtu_restraints.append((int(dof), float(stiffness), float(rest_angle)))
+        return len(self._mtu_restraints) - 1
+
+    def set_excitation(self, excitation):
+        """Neural excitation in [0, 1] of every muscle-tendon unit, shape (B, M) or (M,). Held for the whole
+        step; the activation follows it with the first-order lag of the Hill model."""
+        if self.mtu is None:
+            gs.raise_exception("No muscle-tendon unit was declared.")
+        excitation = torch.as_tensor(excitation, dtype=gs.tc_float, device=gs.device)
+        if excitation.ndim == 1:
+            excitation = excitation.expand(self._B, -1)
+        if excitation.shape != (self._B, self.mtu.n_units):
+            gs.raise_exception(
+                f"The excitation needs shape ({self._B}, {self.mtu.n_units}), got {tuple(excitation.shape)}."
+            )
+        if not torch.isfinite(excitation).all() or float(excitation.min()) < 0.0 or float(excitation.max()) > 1.0:
+            gs.raise_exception("Every excitation must be finite and within [0, 1].")
+        kernel_set_excitation(excitation.contiguous(), self.mtu)
+
+    def mtu_state(self):
+        """Activation, fibre length (m), route length (m), fibre velocity (m/s) and tension (N) of every unit,
+        each (B, M)."""
+        return self.mtu.state_readback()
+
+    def mtu_anchor_forces(self):
+        """World pull on every anchor of every unit at the last substep, (B, M, A_max, 3)."""
+        return self.mtu.anchor_forces()
 
     def env_status(self):
         """Per-environment failure latch: `is_failed` (bool, shape (B,)), the global substep index at which the
@@ -538,6 +629,13 @@ class VBDSolver(Solver):
                 kernel_reset_contact(torch.arange(self._B, dtype=torch.int32), self.contact, rigid.dyn_state)
             elif self._rigid_colliders or self._prescribed_colliders:
                 gs.raise_exception("Colliders were declared without any contact rule.")
+            if self._mtu_units:
+                if self._sim.requires_grad:
+                    gs.raise_exception("Muscle-tendon units have no adjoint, so they cannot be used with requires_grad.")
+                self.mtu = VBDMTU(self, self._mtu_units, self._mtu_restraints)
+                kernel_reset_mtu(torch.arange(self._B, dtype=torch.int32), self.mtu)
+            elif self._mtu_restraints:
+                gs.raise_exception("Rotary restraints were declared without any muscle-tendon unit.")
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
     def _init_self_collision(self, elems):
@@ -1125,6 +1223,10 @@ class VBDSolver(Solver):
             force_c, hessian_c = func_contact_vertex_terms(f, i_v, i_b, self, self.contact)
             force += qd.cast(force_c, self._acc)
             H += qd.cast(hessian_c, self._acc)
+        if qd.static(self.has_mtu):
+            force_m, hessian_m = func_mtu_vertex_terms(f, i_v, i_b, self, self.mtu)
+            force += qd.cast(force_m, self._acc)
+            H += qd.cast(hessian_m, self._acc)
         return force, H, K0
 
     @qd.func
@@ -2842,6 +2944,8 @@ class VBDSolver(Solver):
                         rigid.rigid_config,
                     )
                 kernel_begin_contact(f, self, self.contact, rigid.dyn_state)
+            if self.mtu is not None:
+                kernel_begin_mtu(f, self, self.mtu, self._sim.rigid_solver.dyn_state)
             if self._self_thickness > 0.0:
                 self._kernel_build_hash(f)
                 # Reading the flag waits for the device, so it is read once a step, not once a substep. An
@@ -2858,6 +2962,8 @@ class VBDSolver(Solver):
                 kernel_end_contact(
                     f, self._sim.cur_substep_global, self, self.contact, self._sim.rigid_solver.dyn_state
                 )
+            if self.mtu is not None:
+                kernel_end_mtu(f, self, self.mtu, self._sim.rigid_solver.dyn_state)
             if self.rigid_attachment is not None:
                 if self.rigid_attachment.is_articulated:
                     kernel_end_articulation(
@@ -2994,6 +3100,8 @@ class VBDSolver(Solver):
             kernel_clear_env_failure(envs_idx, self.env_failed, self.failed_substep)
             if self.contact is not None:
                 kernel_reset_contact(envs_idx, self.contact, self._sim.rigid_solver.dyn_state)
+            if self.mtu is not None:
+                kernel_reset_mtu(envs_idx, self.mtu)
                 if state.prescribed_start_pos is not None:
                     kernel_set_prescribed_state(
                         envs_idx,

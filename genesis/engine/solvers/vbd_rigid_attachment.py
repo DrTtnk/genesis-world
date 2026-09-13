@@ -7,6 +7,7 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.vbd_contact import func_contact_link_terms, func_refresh_link_vertices
+from genesis.engine.solvers.vbd_mtu import func_mtu_link_terms, func_refresh_mtu_link_anchors
 from genesis.engine.solvers.vbd_rigid import func_attachment_blocks, func_ldlt6_solve
 from genesis.engine.solvers.vbd_rigid import func_quaternion_difference, func_quaternion_update
 from genesis.utils.array_class import DynState, RigidInfo
@@ -187,6 +188,12 @@ def func_solve_attachment_link(f, i_b, solver: qd.template(), attachment: qd.tem
         )
         force += force_c
         hessian += hessian_c
+    if qd.static(solver.has_mtu):
+        force_m, hessian_m = func_mtu_link_terms(
+            f, attachment.free_link_idx, i_b, state.pos, solver, solver.mtu
+        )
+        force += force_m
+        hessian += hessian_m
     increment = func_ldlt6_solve(hessian, force)
     attachment.link_state[i_b].pos += increment[:3]
     attachment.link_state[i_b].quat = func_quaternion_update(state.quat, increment[3:6])
@@ -197,6 +204,14 @@ def func_solve_attachment_link(f, i_b, solver: qd.template(), attachment: qd.tem
             attachment.link_state[i_b].pos,
             attachment.link_state[i_b].quat,
             solver.contact,
+        )
+    if qd.static(solver.has_mtu):
+        func_refresh_mtu_link_anchors(
+            attachment.free_link_idx,
+            i_b,
+            attachment.link_state[i_b].pos,
+            attachment.link_state[i_b].quat,
+            solver.mtu,
         )
 
 

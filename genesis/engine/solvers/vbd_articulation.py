@@ -13,6 +13,7 @@ from genesis.engine.solvers.vbd_contact import (
     func_contact_dual_update,
     func_refresh_rigid_vertices,
 )
+from genesis.engine.solvers.vbd_mtu import func_mtu_dof_terms, func_refresh_mtu_anchors
 from genesis.engine.solvers.vbd_rigid_attachment import func_update_attachment_dual
 from genesis.utils.array_class import DynInfo, DynState, RigidInfo
 
@@ -140,6 +141,12 @@ def func_solve_articulation_batch(
             force_c, curvature_c = func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver, solver.contact)
             force += force_c
             curvature += curvature_c
+        if qd.static(solver.has_mtu):
+            force_m, curvature_m = func_mtu_dof_terms(
+                f, i_d, i_b, axis, pivot, position, solver, solver.mtu
+            )
+            force += force_m
+            curvature += curvature_m
         position += force / curvature
         if qd.static(rigid_config.enable_joint_limit):
             limits = dyn_info.dofs.limit[I_d]
@@ -155,6 +162,8 @@ def func_solve_articulation_batch(
         )
         if qd.static(solver.has_contact):
             func_refresh_rigid_vertices(i_b, solver.contact, dyn_state)
+        if qd.static(solver.has_mtu):
+            func_refresh_mtu_anchors(i_b, solver.mtu, dyn_state)
 
 
 @qd.kernel
