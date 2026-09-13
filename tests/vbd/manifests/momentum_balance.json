@@ -1,33 +1,126 @@
 {
-  "description": "Frozen acceptance budgets of the momentum-balance fixtures. A tolerance is atol + rtol * scale; scales are fixed from the fixture's mass and motion. Floors measured 2026-09-13 on CPU float64 and GPU float32 (equal to three digits: the error is the finite-sweep coupling error, not rounding); budgets are 1.5 to 2 times the floor, values in {1, 2, 5}e-X.",
+  "description": "Frozen acceptance budgets of the momentum-balance fixtures. A tolerance is atol + rtol * scale; scales are fixed from the fixture's mass and motion. Floors measured 2026-09-13 on CPU float64 and GPU float32 (equal to three digits: the error is the finite-sweep coupling error, not rounding); budgets are 1.5 to 2 times the floor, values in {1, 2, 5}e-X. Sign and shape fields record what a norm cannot show: whether momentum is created or removed, and whether the error persists or decays.",
   "closed_actuated": {
-    "scales": {"total_mass_kg": 0.448, "speed_m_s": 1.65, "lever_m": 0.2},
+    "scales": {
+      "total_mass_kg": 0.448,
+      "speed_m_s": 1.65,
+      "lever_m": 0.2
+    },
     "4": {
-      "linear_momentum": {"unit": "kg m/s", "scale": 0.74, "atol": 0.0, "rtol": 0.2, "floor": 0.097},
-      "angular_momentum": {"unit": "kg m^2/s", "scale": 0.148, "atol": 0.0, "rtol": 0.05, "floor": 0.0037}
+      "linear_momentum": {
+        "unit": "kg m/s",
+        "scale": 0.74,
+        "atol": 0.0,
+        "rtol": 0.2,
+        "floor": 0.097
+      },
+      "angular_momentum": {
+        "unit": "kg m^2/s",
+        "scale": 0.148,
+        "atol": 0.0,
+        "rtol": 0.05,
+        "floor": 0.0037
+      },
+      "momentum_sign": {
+        "note": "the closed fixture starts at exactly zero momentum, so its drift is momentum created and never momentum damped away. It is a startup transient: it peaks in the first quarter of the run and decays afterwards. late_over_peak bounds the last quarter against that peak.",
+        "late_over_peak": 0.5,
+        "floor": 0.243
+      }
     },
     "8": {
-      "linear_momentum": {"unit": "kg m/s", "scale": 0.74, "atol": 0.0, "rtol": 0.1, "floor": 0.048},
-      "angular_momentum": {"unit": "kg m^2/s", "scale": 0.148, "atol": 0.0, "rtol": 0.02, "floor": 0.0020}
+      "linear_momentum": {
+        "unit": "kg m/s",
+        "scale": 0.74,
+        "atol": 0.0,
+        "rtol": 0.1,
+        "floor": 0.048
+      },
+      "angular_momentum": {
+        "unit": "kg m^2/s",
+        "scale": 0.148,
+        "atol": 0.0,
+        "rtol": 0.02,
+        "floor": 0.002
+      },
+      "momentum_sign": {
+        "note": "the closed fixture starts at exactly zero momentum, so its drift is momentum created and never momentum damped away. It is a startup transient: it peaks in the first quarter of the run and decays afterwards. late_over_peak bounds the last quarter against that peak.",
+        "late_over_peak": 0.5,
+        "floor": 0.276
+      }
     }
   },
   "reaction_on_table": {
-    "scales": {"total_mass_kg": 0.096, "duration_s": 0.25, "lever_m": 0.05},
+    "scales": {
+      "total_mass_kg": 0.096,
+      "duration_s": 0.25,
+      "lever_m": 0.05
+    },
     "4": {
-      "linear_momentum": {"unit": "kg m/s", "scale": 0.235, "atol": 0.0, "rtol": 0.1, "floor": 0.0111},
-      "angular_momentum": {"unit": "kg m^2/s", "scale": 0.0118, "atol": 0.0, "rtol": 0.05, "floor": 0.000325},
-      "reaction_impulse": {"unit": "N s", "scale": 0.235, "atol": 0.0, "rtol": 0.1, "floor": 0.0093}
+      "linear_momentum": {
+        "unit": "kg m/s",
+        "scale": 0.235,
+        "atol": 0.0,
+        "rtol": 0.1,
+        "floor": 0.0111
+      },
+      "angular_momentum": {
+        "unit": "kg m^2/s",
+        "scale": 0.0118,
+        "atol": 0.0,
+        "rtol": 0.05,
+        "floor": 0.000325
+      },
+      "reaction_impulse": {
+        "unit": "N s",
+        "scale": 0.235,
+        "atol": 0.0,
+        "rtol": 0.1,
+        "floor": 0.0093,
+        "observed_signed_fraction_of_weight": -0.0391
+      }
     },
     "8": {
-      "linear_momentum": {"unit": "kg m/s", "scale": 0.235, "atol": 0.0, "rtol": 0.02, "floor": 0.0024},
-      "angular_momentum": {"unit": "kg m^2/s", "scale": 0.0118, "atol": 0.0, "rtol": 0.02, "floor": 0.000115},
-      "reaction_impulse": {"unit": "N s", "scale": 0.235, "atol": 0.0, "rtol": 0.02, "floor": 0.0011}
-    }
+      "linear_momentum": {
+        "unit": "kg m/s",
+        "scale": 0.235,
+        "atol": 0.0,
+        "rtol": 0.02,
+        "floor": 0.0024
+      },
+      "angular_momentum": {
+        "unit": "kg m^2/s",
+        "scale": 0.0118,
+        "atol": 0.0,
+        "rtol": 0.02,
+        "floor": 0.000115
+      },
+      "reaction_impulse": {
+        "unit": "N s",
+        "scale": 0.235,
+        "atol": 0.0,
+        "rtol": 0.02,
+        "floor": 0.0011,
+        "observed_signed_fraction_of_weight": 0.0049
+      }
+    },
+    "note": "The signed residual of the reaction impulse changes direction with the sweep count (-3.91 percent of the weight at 4 sweeps, +0.49 percent at 8), so no sign is asserted: only the magnitude is a stable property."
   },
   "pending": {
-    "force_residual": {"unit": "N", "note": "stationarity residual of the fixed-sweep path is not exposed as a per-environment diagnostic yet"},
-    "generalized_torque": {"unit": "N m", "note": "hinge residual pending with force_residual"},
-    "work": {"unit": "J", "note": "external work of prescribed colliders pending the coupled energy report"},
-    "volume": {"unit": "m^3", "note": "per-material volume response pending the tissue material tests of stage 3"}
+    "force_residual": {
+      "unit": "N",
+      "note": "stationarity residual of the fixed-sweep path is not exposed as a per-environment diagnostic yet"
+    },
+    "generalized_torque": {
+      "unit": "N m",
+      "note": "hinge residual pending with force_residual"
+    },
+    "work": {
+      "unit": "J",
+      "note": "external work of prescribed colliders pending the coupled energy report"
+    },
+    "volume": {
+      "unit": "m^3",
+      "note": "per-material volume response pending the tissue material tests of stage 3"
+    }
   }
 }

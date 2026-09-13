@@ -285,12 +285,18 @@ def test_closed_actuated_system_keeps_its_momentum_within_the_frozen_budget(n_it
     tissue.set_muscle(np.zeros(tissue.n_elements), np.tile([1.0, 0.0, 0.0], (tissue.n_elements, 1)))
     tissue.set_actuation([0.4])
     linear0, angular0, *_ = _system_momentum(tissue, bone, masses)
+    # the system starts at rest, so its momentum must stay exactly zero. There is nothing here for a numerical
+    # damping to remove: whatever momentum appears was created by the solver.
+    assert float(linear0.norm()) == 0.0
+    assert float(angular0.norm()) == 0.0
     worst_linear = worst_angular = 0.0
+    history = []
     for _ in range(60):
         scene.step()
         linear, angular, *_ = _system_momentum(tissue, bone, masses)
         worst_linear = max(worst_linear, float((linear - linear0).norm()))
         worst_angular = max(worst_angular, float((angular - angular0).norm()))
+        history.append(float((linear - linear0).norm()))
     # internal forces only: the drift is the finite-sweep error of the coupling, bounded by the frozen budget of
     # this sweep count (the 8-sweep budget is the tighter one, so the pair also records the reduction)
     assert (
@@ -301,4 +307,12 @@ def test_closed_actuated_system_keeps_its_momentum_within_the_frozen_budget(n_it
         worst_angular
         <= budget["angular_momentum"]["atol"] + budget["angular_momentum"]["rtol"] * budget["angular_momentum"]["scale"]
     )
+    # the shape the norms above cannot show. The system starts at exactly zero momentum, so the drift is momentum
+    # created, never momentum damped away: that is the injection AVBD section 5.6 describes for position-based
+    # error correction. It is a startup transient, though, not a sustained gain: it peaks while the actuation
+    # switches on and the constraint error is largest, then decays as the multipliers catch up.
+    quarter = len(history) // 4
+    peak = max(history[:quarter])
+    assert peak > 0.0
+    assert max(history[3 * quarter :]) <= budget["momentum_sign"]["late_over_peak"] * peak
     assert torch.isfinite(tissue.get_positions()).all()

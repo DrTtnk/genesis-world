@@ -987,8 +987,12 @@ def test_momentum_balances_gravity_and_the_reported_table_impulse(n_iterations, 
     )
     # at rest on the table the accumulated impulse is the weight over the run
     weight_impulse = total_mass * 9.81 * 100 * scene.dt
+    residual = float(impulse[2]) + weight_impulse
     assert (
-        abs(float(impulse[2]) + weight_impulse)
+        abs(residual)
         <= budget["reaction_impulse"]["atol"] + budget["reaction_impulse"]["rtol"] * budget["reaction_impulse"]["scale"]
     )
+    # No sign is asserted here. Unlike the closed fixture this one carries real momentum and gravity, and the
+    # residual measured -3.91 percent of the weight at 4 sweeps against +0.49 percent at 8: the direction is not
+    # stable across sweep counts, so only the magnitude is a property of the solver worth freezing.
     assert torch.isfinite(tissue.get_positions()).all()
