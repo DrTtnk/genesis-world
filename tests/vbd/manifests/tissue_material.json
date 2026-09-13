@@ -1,5 +1,5 @@
 {
-  "description": "Frozen acceptance budgets of the A5 tissue material fixtures (tests/vbd/test_vbd_tissue.py). A tolerance is atol + rtol * scale; every entry also records the measured floor it was set from. Floors measured 2026-09-13 on CPU float64. Budgets are 1.5 to 2 times the measured floor except where noted (the volume_response section is set far looser than its floor for a documented reason: see its _note). The bending fixture's own docstring records a finding: a force-driven (gravity self-weight) version of the bending test was tried first and gave a tip sag tens of centimetres larger than Euler-Bernoulli theory, essentially unchanged across two decades of Young's modulus - physically impossible for an elastic beam, whose sag must scale as 1/E. That version was abandoned rather than fitted to the observed number; the shape-only, displacement-controlled fixture kept here does not depend on getting a force magnitude right and passes with a small, mesh-resolution-scale error.",
+  "description": "Frozen acceptance budgets of the A5 tissue material fixtures (tests/vbd/test_vbd_tissue.py). A tolerance is atol + rtol * scale; every entry also records the measured floor it was set from. Most entries here hold on both backends as a single float64-shaped budget: floors measured 2026-09-13 on CPU float64, but loose enough (a locking/discretization/discretization-refinement check, not a tight numeric-parity one) that GPU float32 clears them too. The three entries that did not - axial_force.modulus_ratio, volume_response.interior_position, hollow_tube.rest_kick - are nested by precision, '64' and '32', each measured on its own backend on 2026-09-13; the float64 side is unchanged from before and is never relaxed, only the float32 side is new. Budgets are 1.5 to 2 times the measured floor except where noted (the volume_response section is set far looser than its floor for a documented reason: see its _note). The bending fixture's own docstring records a finding: a force-driven (gravity self-weight) version of the bending test was tried first and gave a tip sag tens of centimetres larger than Euler-Bernoulli theory, essentially unchanged across two decades of Young's modulus - physically impossible for an elastic beam, whose sag must scale as 1/E. That version was abandoned rather than fitted to the observed number; the shape-only, displacement-controlled fixture kept here does not depend on getting a force magnitude right and passes with a small, mesh-resolution-scale error.",
   "uniaxial_extension": {
     "lateral_stretch": {"unit": "dimensionless stretch ratio", "atol": 0.0, "rtol": 1.8e-3, "scale": 1.0, "floor": 9.98e-4},
     "volume_ratio": {"unit": "dimensionless volume ratio J", "atol": 0.0, "rtol": 3.0e-3, "scale": 1.0, "floor": 1.71e-3}
@@ -14,7 +14,11 @@
       "100000.0": {"unit": "relative to analytic P_xx * A0 (N)", "atol": 0.0, "rtol": 0.06, "scale": 1.0, "floor": 0.034905},
       "1000000.0": {"unit": "relative to analytic P_xx * A0 (N)", "atol": 0.0, "rtol": 0.06, "scale": 1.0, "floor": 0.034905}
     },
-    "modulus_ratio": {"unit": "dimensionless force ratio vs modulus ratio 10.0", "atol": 1e-5, "rtol": 0.0, "scale": 1.0, "floor": 3.43e-7}
+    "modulus_ratio": {
+      "unit": "dimensionless force ratio vs modulus ratio 10.0",
+      "64": {"atol": 1e-5, "rtol": 0.0, "scale": 1.0, "floor": 3.43e-7},
+      "32": {"atol": 3e-4, "rtol": 0.0, "scale": 1.0, "floor": 1.567e-4, "note": "measured on GPU float32, 2026-09-13; budget is 1.9x the measured floor"}
+    }
   },
   "bending": {
     "shape_ratio": {"unit": "dimensionless y/delta ratio", "atol": 0.0, "rtol": 0.035, "scale": 1.0, "floor": 0.0191}
@@ -22,10 +26,18 @@
   "volume_response": {
     "_note": "Full-boundary affine Dirichlet data forces the affine field as the unique equilibrium of any convex, homogeneous hyperelastic energy, independent of its specific mu/lam' values: the measured floor here is machine epsilon (~1e-16), not a material-dependent number. This fixture is retained as a no-inversion/no-locking/mass-bookkeeping regression check at a near-incompressible Poisson ratio, not as a quantitative constitutive-law validation - that role is filled by the uniaxial fixtures, whose closed form depends on both mu and lam'. Budgets are set far above the measured floor for exactly this reason.",
     "volume_ratio": {"unit": "dimensionless volume ratio J", "atol": 1e-9, "rtol": 0.0, "scale": 1.0, "floor": 1.1e-16},
-    "interior_position": {"unit": "m", "atol": 1e-9, "rtol": 0.0, "scale": 1.0, "floor": 1.77e-16}
+    "interior_position": {
+      "unit": "m",
+      "64": {"atol": 1e-9, "rtol": 0.0, "scale": 1.0, "floor": 1.77e-16},
+      "32": {"atol": 1.4e-7, "rtol": 0.0, "scale": 1.0, "floor": 6.89e-8, "note": "measured on GPU float32 at s=0.88 (the tighter of the two dilation parameters, s=1.12 measured 6.05e-8), 2026-09-13; budget is 2.0x the measured floor"}
+    }
   },
   "hollow_tube": {
-    "rest_kick": {"unit": "m", "atol": 5e-15, "rtol": 0.0, "scale": 1.0, "floor": 1.3e-18},
+    "rest_kick": {
+      "unit": "m",
+      "64": {"atol": 5e-15, "rtol": 0.0, "scale": 1.0, "floor": 1.3e-18},
+      "32": {"atol": 1e-9, "rtol": 0.0, "scale": 1.0, "floor": 4.94e-10, "note": "measured on GPU float32, 2026-09-13; budget is 2.0x the measured floor"}
+    },
     "mass": {
       "coarse": {"unit": "kg", "atol": 0.0, "rtol": 7.5e-3, "scale": 1.0, "floor": 4.25e-3},
       "fine": {"unit": "kg", "atol": 0.0, "rtol": 7e-4, "scale": 1.0, "floor": 3.87e-4}

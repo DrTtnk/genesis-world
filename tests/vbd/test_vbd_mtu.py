@@ -131,9 +131,16 @@ def tissue_only_scene(n_iterations=4, substeps=4, dt=2.5e-3):
 
 
 @pytest.mark.parametrize("stretch", [1.02, 1.15, 0.98])
-def test_the_engine_law_matches_the_independent_reference_through_a_rise_and_a_fall(stretch):
+def test_the_engine_law_matches_the_independent_reference_through_a_rise_and_a_fall(stretch, precision):
     """Gate A4 parity, both activation branches and the slack transition. The route is two world anchors, so
-    its length is exactly known and the only state that moves is the muscle's own."""
+    its length is exactly known and the only state that moves is the muscle's own.
+
+    The float64 budget below is the accepted A4 requirement and is never relaxed. Float32 accumulates the
+    same law through hundreds of substeps of fibre Newton iterations; measured on the GPU float32 backend
+    (2026-09-13) the worst relative tension error across these three stretches is 2.74e-5, at stretch=0.98
+    (measured 1.98e-4 N against an expected 7.23 N). The float32 budget is 1.75 times that measured floor.
+    """
+    atol, rtol = (1e-8, 1e-6) if precision == "64" else (1e-6, 5e-5)
     scene, _ = tissue_only_scene()
     length = stretch * (L_OPT + L_SLACK)
     scene.vbd_solver.add_mtu(
@@ -152,7 +159,7 @@ def test_the_engine_law_matches_the_independent_reference_through_a_rise_and_a_f
     activation, _, reference_tensions = reference_run(length, excitations, substep_dt)
     assert_allclose(scene.vbd_solver.mtu_state().activation[0, 0], activation, tol=1e-6)
     for measured, expected in zip(tensions, reference_tensions[scene.sim.substeps - 1 :: scene.sim.substeps]):
-        assert abs(measured - expected) <= 1e-8 + 1e-6 * abs(expected)
+        assert abs(measured - expected) <= atol + rtol * abs(expected)
     # The tendon carries no compression, so the fibre may never be longer than the route leaves for it. A
     # route shorter than l_opt + l_slack does not make the tendon slack: the fibre shortens instead and the
     # unit still pulls. Storing an inadmissible fibre length is what made the first version of this solver

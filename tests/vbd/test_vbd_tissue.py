@@ -207,7 +207,7 @@ def _grip_axial_reaction_force(scene, bar, pos0, right_mask):
 
 
 @pytest.mark.required
-def test_uniaxial_extension_axial_force_pins_the_absolute_stiffness_scale(show_viewer):
+def test_uniaxial_extension_axial_force_pins_the_absolute_stiffness_scale(show_viewer, precision):
     """The lateral-stretch fixtures above are displacement-controlled and their closed form is a
     function of mu/lam' (Poisson's ratio) alone: multiplying every element's E by a constant
     leaves `uniaxial_lateral_stretch` and the settled shape unchanged, so a bug that scaled all
@@ -255,7 +255,7 @@ def test_uniaxial_extension_axial_force_pins_the_absolute_stiffness_scale(show_v
 
     measured_ratio = forces[E_values[1]][0] / forces[E_values[0]][0]
     expected_ratio = E_values[1] / E_values[0]
-    ratio_budget = budget["modulus_ratio"]
+    ratio_budget = budget["modulus_ratio"][precision]
     ratio_err = abs(measured_ratio - expected_ratio)
     print(f"modulus ratio: measured={measured_ratio:.7f} expected={expected_ratio:.1f} err={ratio_err:.3e}", flush=True)
     assert ratio_err <= ratio_budget["atol"] + ratio_budget["rtol"] * ratio_budget["scale"]
@@ -325,7 +325,7 @@ def test_bending_shape_matches_the_clamped_guided_beam_reference(show_viewer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("s", [1.12, 0.88])
-def test_isotropic_dilation_tracks_the_imposed_volumetric_target(show_viewer, s):
+def test_isotropic_dilation_tracks_the_imposed_volumetric_target(show_viewer, s, precision):
     """A cube whose entire boundary is driven to a uniform isotropic scale s must reach that
     exact volumetric ratio s^3 in its interior too: a locking or discretization defect would
     show up as the free interior nodes failing to track the affine target, most visibly at
@@ -373,7 +373,7 @@ def test_isotropic_dilation_tracks_the_imposed_volumetric_target(show_viewer, s)
 
     budget = MANIFEST["volume_response"]
     vol_budget = budget["volume_ratio"]
-    pos_budget = budget["interior_position"]
+    pos_budget = budget["interior_position"][precision]
     err_vol = abs(volume_ratio - expected_ratio)
     print(
         f"dilation s={s}: volume_ratio={volume_ratio:.5f} expected={expected_ratio:.5f} err={err_vol:.2e}, "
@@ -389,7 +389,7 @@ def _hollow_tube_mesh(path, r_in, r_out, height, sections):
 
 
 @pytest.mark.required
-def test_hollow_tube_rest_shape_holds_and_mass_survives_refinement(show_viewer, asset_tmp_path):
+def test_hollow_tube_rest_shape_holds_and_mass_survives_refinement(show_viewer, asset_tmp_path, precision):
     """A tube stand-in for the digestive wall: (1) built at rest it must not move under its own
     tetrahedralization, an initialization kick; (2) every tet Jacobian must be positive; (3) the
     tetrahedralized mass must match the analytic hollow-cylinder mass; (4) a finer surface
@@ -439,7 +439,7 @@ def test_hollow_tube_rest_shape_holds_and_mass_survives_refinement(show_viewer, 
         print(f"{label}: mass={mass:.6f} kg (analytic {rho * expected_volume:.6f}), min radial={min_radial:.4f} m (r_in={r_in})", flush=True)
 
     budget = MANIFEST["hollow_tube"]
-    kick_budget = budget["rest_kick"]
+    kick_budget = budget["rest_kick"][precision]
     assert results["kick"] <= kick_budget["atol"] + kick_budget["rtol"] * kick_budget["scale"]
 
     analytic_mass = rho * expected_volume
