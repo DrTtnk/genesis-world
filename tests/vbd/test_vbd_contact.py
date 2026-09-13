@@ -4,6 +4,7 @@ import quadrants as qd
 import torch
 
 import genesis as gs
+import genesis.utils.geom as gu
 from genesis.engine.solvers.vbd_contact import func_point_triangle_weights, func_segment_parameters
 from genesis.utils.misc import qd_to_torch, tensor_to_array
 
@@ -866,3 +867,128 @@ def test_failed_environment_latches_while_its_peer_continues_and_snapshots_repla
     scene.vbd_solver.set_prescribed_targets(pos, quat)
     scene.step()
     assert not bool(scene.vbd_solver.env_status().is_failed.any())
+
+
+def _system_momentum(tissue, bone, masses):
+    state = tissue.get_state()
+    x = state.pos.reshape(-1, 3).double()
+    v = state.vel.reshape(-1, 3).double()
+    m = masses.double()[:, None]
+    x_bone = bone.get_pos().reshape(3).double()
+    v_bone = bone.get_vel().reshape(3).double()
+    w_bone = bone.get_links_ang().reshape(3).double()
+    rotation = torch.as_tensor(
+        gu.quat_to_R(tensor_to_array(bone.get_quat().reshape(4))), dtype=torch.float64, device=x.device
+    )
+    inertia = torch.as_tensor(np.asarray(bone.links[0].inertial_i), dtype=torch.float64, device=x.device)
+    mass_bone = float(bone.links[0].inertial_mass)
+    linear = (m * v).sum(0) + mass_bone * v_bone
+    angular = torch.linalg.cross(x, m * v).sum(0) + torch.linalg.cross(x_bone, mass_bone * v_bone)
+    angular = angular + rotation @ inertia @ rotation.T @ w_bone
+    return linear, angular, x, m, x_bone
+
+
+@pytest.mark.parametrize("n_iterations", [4, 8])
+def test_momentum_balances_gravity_and_the_reported_table_impulse(n_iterations, show_viewer, momentum_budget):
+    budget = momentum_budget["reaction_on_table"][str(n_iterations)]
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=2.5e-3,
+            substeps=4,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=n_iterations,
+            floor_height=-10.0,
+            damping=2e-3,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.3, -0.4, 0.2),
+            camera_lookat=(0.02, 0.0, 0.02),
+        ),
+        show_viewer=show_viewer,
+    )
+    table = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.3, 0.3, 0.02),
+            pos=(0.0, 0.0, -0.01),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(),
+    )
+    bone = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.04, 0.0, 0.0231),
+        ),
+        material=gs.materials.Rigid(
+            rho=500.0,
+        ),
+    )
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.04, 0.04),
+            pos=(0.0, 0.0, 0.0231),
+            nobisect=False,
+            maxvolume=1e-5,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=1e5,
+            nu=0.3,
+            collision_group=1,
+        ),
+    )
+    rest = tensor_to_array(tissue.init_positions)
+    tissue.add_rigid_attachments(np.flatnonzero(rest[:, 0] > rest[:, 0].max() - 1e-5), bone.links[0])
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0)
+    scene.vbd_solver.add_rigid_collider(bone.links[0], collision_group=2)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.vbd_solver.add_contact_rule(0, 2, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.build()
+    masses = qd_to_torch(scene.vbd_solver.verts_info.mass)
+    mass_bone = float(bone.links[0].inertial_mass)
+    total_mass = float(masses.sum()) + mass_bone
+    gravity = torch.tensor([0.0, 0.0, -9.81], dtype=torch.float64, device=masses.device)
+    table_origin = torch.tensor([0.0, 0.0, -0.01], dtype=torch.float64, device=masses.device)
+    linear0, angular0, x_prev, m, x_bone_prev = _system_momentum(tissue, bone, masses)
+    gravity_torque = torch.zeros(3, dtype=torch.float64, device=masses.device)
+    worst_linear = worst_angular = 0.0
+    scene.vbd_solver.clear_collider_impulses()
+    for i in range(100):
+        scene.step()
+        linear, angular, x, m, x_bone = _system_momentum(tissue, bone, masses)
+        # gravity torque about the origin, trapezoid over the step
+        torque = 0.5 * (torch.linalg.cross(x_prev, m * gravity).sum(0) + torch.linalg.cross(x, m * gravity).sum(0))
+        torque = torque + 0.5 * mass_bone * (
+            torch.linalg.cross(x_bone_prev, gravity) + torch.linalg.cross(x_bone, gravity)
+        )
+        gravity_torque = gravity_torque + torque * scene.dt
+        x_prev, x_bone_prev = x, x_bone
+        # the table's impulse is the force on the table; the system receives its opposite, transported to the origin
+        impulse = scene.vbd_solver.collider_impulses()[0, 0].double()
+        on_system_force = -impulse[:3]
+        on_system_torque = -(impulse[3:] + torch.linalg.cross(table_origin, impulse[:3]))
+        expected_linear = linear0 + total_mass * gravity * ((i + 1) * scene.dt) + on_system_force
+        expected_angular = angular0 + gravity_torque + on_system_torque
+        worst_linear = max(worst_linear, float((linear - expected_linear).norm()))
+        worst_angular = max(worst_angular, float((angular - expected_angular).norm()))
+    # a duplicated integration step adds a step of gravity that no impulse accounts for, and fails this bound
+    assert (
+        worst_linear
+        <= budget["linear_momentum"]["atol"] + budget["linear_momentum"]["rtol"] * budget["linear_momentum"]["scale"]
+    )
+    assert (
+        worst_angular
+        <= budget["angular_momentum"]["atol"] + budget["angular_momentum"]["rtol"] * budget["angular_momentum"]["scale"]
+    )
+    # at rest on the table the accumulated impulse is the weight over the run
+    weight_impulse = total_mass * 9.81 * 100 * scene.dt
+    assert (
+        abs(float(impulse[2]) + weight_impulse)
+        <= budget["reaction_impulse"]["atol"] + budget["reaction_impulse"]["rtol"] * budget["reaction_impulse"]["scale"]
+    )
+    assert torch.isfinite(tissue.get_positions()).all()

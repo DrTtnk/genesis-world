@@ -240,8 +240,10 @@ class VBDContact:
             self.prescribed_rel.quat.from_numpy(np.stack([quat for _, quat in rel]).astype(gs.np_float))
         self.prescribed_start = pose_type.field(shape=(max(self.n_prescribed, 1), solver._B), layout=qd.Layout.SOA)
         self.prescribed_target = pose_type.field(shape=(max(self.n_prescribed, 1), solver._B), layout=qd.Layout.SOA)
-        # wrench (world force, world torque about the link origin) the tissue applies to each collider link
+        # wrench (world force, world torque about the link origin) the tissue applies to each collider link, and its
+        # time integral since the last clear, accumulated every substep so a caller can balance momentum
         self.link_reaction = qd.Vector.field(6, dtype=qd.f64, shape=(solver.sim.rigid_solver.n_links, solver._B))
+        self.link_impulse = qd.Vector.field(6, dtype=qd.f64, shape=(solver.sim.rigid_solver.n_links, solver._B))
 
     @staticmethod
     def _relative_pose(entity, link):
@@ -288,9 +290,19 @@ class VBDContact:
 
     def reactions(self):
         """Wrench on each registered collider, shape (B, n_colliders, 6): world force then world torque about the
-        collider's origin (the link origin, or the base link origin of a prescribed entity), from the pair state at
-        the end of the last substep. Rigid colliders come first, then prescribed entities, in declaration order."""
-        wrenches = qd_to_torch(self.link_reaction, transpose=True).to(gs.tc_float)
+        collider's origin (the link origin, or the reference link origin of a prescribed entity), from the pair state
+        at the end of the last substep. Rigid colliders come first, then prescribed entities, in declaration order."""
+        return self._per_collider(qd_to_torch(self.link_reaction, transpose=True).to(gs.tc_float))
+
+    def impulses(self):
+        """Time integral of `reactions()` over every substep since the last `clear_impulses()`, same layout, in N s
+        and N m s. The torque is transported to the collider origin at the time of each substep."""
+        return self._per_collider(qd_to_torch(self.link_impulse, transpose=True).to(gs.tc_float))
+
+    def clear_impulses(self):
+        self.link_impulse.fill(0.0)
+
+    def _per_collider(self, wrenches):
         links_pos = qd_to_torch(self.solver.sim.rigid_solver.dyn_state.links.pos, transpose=True).to(gs.tc_float)
         parts = [wrenches[:, [link.idx for link in self.colliders]]]
         for entity, reference in zip(self.prescribed_entities, self.prescribed_links):
@@ -987,6 +999,9 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
         if contact.errno[i_b] != 0 and not solver.env_failed[i_b]:
             solver.env_failed[i_b] = 1
             solver.failed_substep[i_b] = substep_global
+    for i_l, i_b in qd.ndrange(contact.link_impulse.shape[0], solver._B):
+        if not solver.env_failed[i_b]:
+            contact.link_impulse[i_l, i_b] += contact.link_reaction[i_l, i_b] * solver._substep_dt
 
 
 @qd.kernel

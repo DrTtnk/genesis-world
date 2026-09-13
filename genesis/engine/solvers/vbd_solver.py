@@ -190,6 +190,14 @@ class VBDSolver(Solver):
         error word, each of shape (B,). See `ContactDiagnostics`."""
         return self.contact.diagnostics()
 
+    def collider_impulses(self):
+        """Time integral of `collider_reactions()` over every substep since the last `clear_collider_impulses()`,
+        shape (B, n_colliders, 6) in N s and N m s."""
+        return self.contact.impulses()
+
+    def clear_collider_impulses(self):
+        self.contact.clear_impulses()
+
     def collider_reactions(self):
         """Wrench the tissue applies to each declared collider link, shape (B, n_colliders, 6): world force then
         world torque about the link origin, from the last substep."""

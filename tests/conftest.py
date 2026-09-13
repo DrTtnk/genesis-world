@@ -998,3 +998,12 @@ def png_snapshot(request, snapshot):
         )
 
     return snapshot_obj
+
+
+@pytest.fixture(scope="session")
+def momentum_budget():
+    import json
+    from pathlib import Path
+
+    with open(Path(__file__).parent / "vbd" / "manifests" / "momentum_balance.json") as file:
+        return json.load(file)

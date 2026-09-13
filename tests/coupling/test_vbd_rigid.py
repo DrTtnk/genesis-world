@@ -6,7 +6,7 @@ import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import qd_to_torch, tensor_to_array
 from tests.utils.assertions import assert_allclose
 
 
@@ -213,3 +213,92 @@ def test_articulated_muscle_attachments_preserve_joint_limits_and_reset(n_envs, 
     assert_allclose(skeleton.get_dofs_position().reshape(-1, 2)[0], expected[0], atol=2e-6)
     for tissue, positions in zip(tissues, expected_vertices):
         assert_allclose(tissue.get_positions()[0], positions[0], atol=2e-6)
+
+
+def _system_momentum(tissue, bone, masses):
+    state = tissue.get_state()
+    x = state.pos.reshape(-1, 3).double()
+    v = state.vel.reshape(-1, 3).double()
+    m = masses.double()[:, None]
+    x_bone = bone.get_pos().reshape(3).double()
+    v_bone = bone.get_vel().reshape(3).double()
+    w_bone = bone.get_links_ang().reshape(3).double()
+    rotation = torch.as_tensor(
+        gu.quat_to_R(tensor_to_array(bone.get_quat().reshape(4))), dtype=torch.float64, device=x.device
+    )
+    inertia = torch.as_tensor(np.asarray(bone.links[0].inertial_i), dtype=torch.float64, device=x.device)
+    mass_bone = float(bone.links[0].inertial_mass)
+    linear = (m * v).sum(0) + mass_bone * v_bone
+    angular = torch.linalg.cross(x, m * v).sum(0) + torch.linalg.cross(x_bone, mass_bone * v_bone)
+    angular = angular + rotation @ inertia @ rotation.T @ w_bone
+    return linear, angular, x, m, x_bone
+
+
+@pytest.mark.parametrize("n_iterations", [4, 8])
+def test_closed_actuated_system_keeps_its_momentum_within_the_frozen_budget(n_iterations, show_viewer, momentum_budget):
+    budget = momentum_budget["closed_actuated"][str(n_iterations)]
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.005,
+            substeps=4,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+            integrator=gs.integrator.Euler,
+        ),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=n_iterations,
+            floor_height=-10.0,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(0.6, -0.8, 0.4),
+            camera_lookat=(0.0, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    bone = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.04, 0.08, 0.08),
+            pos=(0.12, 0.0, 0.0),
+        ),
+        material=gs.materials.Rigid(
+            rho=500.0,
+        ),
+    )
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(
+            size=(0.2, 0.04, 0.04),
+            pos=(0.0, 0.0, 0.03),
+            nobisect=False,
+            maxvolume=2e-5,
+        ),
+        material=gs.materials.VBD.Muscle(
+            E=1e5,
+            nu=0.3,
+        ),
+    )
+    rest = tensor_to_array(tissue.init_positions)
+    tissue.add_rigid_attachments(np.flatnonzero(rest[:, 0] > rest[:, 0].max() - 1e-5), bone.links[0])
+    scene.build()
+    masses = qd_to_torch(scene.vbd_solver.verts_info.mass)
+    tissue.set_muscle(np.zeros(tissue.n_elements), np.tile([1.0, 0.0, 0.0], (tissue.n_elements, 1)))
+    tissue.set_actuation([0.4])
+    linear0, angular0, *_ = _system_momentum(tissue, bone, masses)
+    worst_linear = worst_angular = 0.0
+    for _ in range(60):
+        scene.step()
+        linear, angular, *_ = _system_momentum(tissue, bone, masses)
+        worst_linear = max(worst_linear, float((linear - linear0).norm()))
+        worst_angular = max(worst_angular, float((angular - angular0).norm()))
+    # internal forces only: the drift is the finite-sweep error of the coupling, bounded by the frozen budget of
+    # this sweep count (the 8-sweep budget is the tighter one, so the pair also records the reduction)
+    assert (
+        worst_linear
+        <= budget["linear_momentum"]["atol"] + budget["linear_momentum"]["rtol"] * budget["linear_momentum"]["scale"]
+    )
+    assert (
+        worst_angular
+        <= budget["angular_momentum"]["atol"] + budget["angular_momentum"]["rtol"] * budget["angular_momentum"]["scale"]
+    )
+    assert torch.isfinite(tissue.get_positions()).all()
