@@ -106,7 +106,7 @@ class VBDMTU:
 
         anchor_kind, anchor_link, anchor_local, anchor_verts, anchor_weights, anchor_unit = [], [], [], [], [], []
         offsets = [0]
-        for i_m, (_, anchors, _) in enumerate(units):
+        for i_m, (_, anchors, _, _) in enumerate(units):
             for anchor in anchors:
                 anchor_unit.append(i_m)
                 if isinstance(anchor, WorldAnchor):
@@ -151,13 +151,18 @@ class VBDMTU:
             l_slack=gs.qd_float,
             v_max=gs.qd_float,
             k_tendon=gs.qd_float,
+            activation0=gs.qd_float,
+            fibre0=gs.qd_float,
         )
         self.unit = unit_type.field(shape=self.n_units, layout=qd.Layout.SOA)
         kinds, firsts, lasts, f_max, l_opt, l_slack, v_max, k_tendon = [], [], [], [], [], [], [], []
-        for i_m, (kind, _, parameters) in enumerate(units):
+        activation0, fibre0 = [], []
+        for i_m, (kind, _, parameters, initial) in enumerate(units):
             kinds.append(kind)
             firsts.append(offsets[i_m])
             lasts.append(offsets[i_m + 1])
+            activation0.append(initial[0])
+            fibre0.append(parameters.l_opt if kind == UNIT_HILL and initial[1] is None else (initial[1] or 0.0))
             if kind == UNIT_HILL:
                 f_max.append(parameters.f_max)
                 l_opt.append(parameters.l_opt)
@@ -179,6 +184,8 @@ class VBDMTU:
         self.unit.l_slack.from_numpy(np.array(l_slack, dtype=gs.np_float))
         self.unit.v_max.from_numpy(np.array(v_max, dtype=gs.np_float))
         self.unit.k_tendon.from_numpy(np.array(k_tendon, dtype=gs.np_float))
+        self.unit.activation0.from_numpy(np.array(activation0, dtype=gs.np_float))
+        self.unit.fibre0.from_numpy(np.array(fibre0, dtype=gs.np_float))
 
         state_type = qd.types.struct(
             initialised=gs.qd_int,
@@ -494,12 +501,12 @@ def kernel_begin_mtu(f: int, solver: qd.template(), mtu: qd.template(), dyn_stat
     for i_m, i_b in qd.ndrange(mtu.n_units, solver._B):
         if not solver.env_failed[i_b] and mtu.unit[i_m].kind == UNIT_HILL:
             if not mtu.state[i_m, i_b].initialised:
-                # The fibre starts at its optimum, but a route shorter than l_opt + l_slack cannot hold a
-                # fibre that long: the tendon carries no compression. Take the taut boundary of the route the
-                # unit was built at instead, or the first substep reads a fibre velocity that is an artifact
-                # of the initial condition rather than of the motion.
+                # The fibre starts where the model asked, but a route shorter than that plus l_slack cannot
+                # hold it: the tendon carries no compression. Clamp to the taut boundary of the route the unit
+                # was built at, or the first substep reads a fibre velocity that is an artifact of the initial
+                # condition rather than of the motion.
                 taut = func_route_length(f, i_m, i_b, solver, mtu) - mtu.unit[i_m].l_slack
-                mtu.state[i_m, i_b].fibre = qd.min(mtu.unit[i_m].l_opt, taut)
+                mtu.state[i_m, i_b].fibre = qd.min(mtu.unit[i_m].fibre0, taut)
                 mtu.state[i_m, i_b].initialised = 1
             activation = mtu.state[i_m, i_b].activation
             excitation = mtu.state[i_m, i_b].excitation
@@ -551,9 +558,9 @@ def kernel_reset_mtu(envs_idx: qd.types.ndarray(), mtu: qd.template()):
     for i_m, i in qd.ndrange(mtu.n_units, envs_idx.shape[0]):
         i_b = envs_idx[i]
         mtu.state[i_m, i_b].excitation = 0.0
-        mtu.state[i_m, i_b].activation = 0.0
+        mtu.state[i_m, i_b].activation = mtu.unit[i_m].activation0
         mtu.state[i_m, i_b].initialised = 0
-        mtu.state[i_m, i_b].fibre = mtu.unit[i_m].l_opt
-        mtu.state[i_m, i_b].fibre_previous = mtu.unit[i_m].l_opt
+        mtu.state[i_m, i_b].fibre = mtu.unit[i_m].fibre0
+        mtu.state[i_m, i_b].fibre_previous = mtu.unit[i_m].fibre0
         mtu.state[i_m, i_b].length = 0.0
         mtu.state[i_m, i_b].tension = 0.0

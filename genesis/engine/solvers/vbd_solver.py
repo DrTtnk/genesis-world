@@ -211,7 +211,7 @@ class VBDSolver(Solver):
             gs.raise_exception("A contact rule needs stiffness > 0, thickness > 0 and friction >= 0.")
         self._contact_rules.append((int(group_a), int(group_b), float(stiffness), float(friction), float(thickness)))
 
-    def _add_routed_unit(self, kind, anchors, parameters):
+    def _add_routed_unit(self, kind, anchors, parameters, activation0=0.0, fibre_length0=None):
         if self._scene.is_built:
             gs.raise_exception("Muscle-tendon units must be declared before scene.build().")
         if len(anchors) < 2:
@@ -224,10 +224,10 @@ class VBDSolver(Solver):
                     gs.raise_exception(f"The barycentric weights of a tissue anchor sum to {sum(anchor.weights)}.")
             elif not isinstance(anchor, (WorldAnchor, LinkAnchor)):
                 gs.raise_exception(f"Unknown route anchor {anchor!r}.")
-        self._mtu_units.append((kind, list(anchors), parameters))
+        self._mtu_units.append((kind, list(anchors), parameters, (float(activation0), fibre_length0)))
         return len(self._mtu_units) - 1
 
-    def add_mtu(self, anchors, parameters):
+    def add_mtu(self, anchors, parameters, activation0=0.0, fibre_length0=None):
         """Declare one routed Hill muscle-tendon unit and return its index. `anchors` is an ordered list of
         `WorldAnchor`, `LinkAnchor` and `TissueAnchor`; `parameters` is a `HillParameters`. Declare before
         `scene.build()`."""
@@ -237,7 +237,11 @@ class VBDSolver(Solver):
             gs.raise_exception("A muscle-tendon unit needs f_max, l_opt and l_slack above zero.")
         if not parameters.v_max > 0.0:
             gs.raise_exception("A muscle-tendon unit needs v_max above zero.")
-        return self._add_routed_unit(UNIT_HILL, anchors, parameters)
+        if not 0.0 <= activation0 <= 1.0:
+            gs.raise_exception(f"An initial activation must be within [0, 1], got {activation0}.")
+        if fibre_length0 is not None and not fibre_length0 > 0.0:
+            gs.raise_exception(f"An initial fibre length must be above zero, got {fibre_length0}.")
+        return self._add_routed_unit(UNIT_HILL, anchors, parameters, activation0, fibre_length0)
 
     def add_ligament(self, anchors, stiffness, slack_length):
         """Declare one tension-only linear element on the same routing and return its index. It carries

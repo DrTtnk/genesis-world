@@ -696,10 +696,10 @@ def build_hinge_model_packet():
         passive_mechanics_owner="mtu_flexor",
     )
     ligament = av.Ligament(
-        id="lig_main", route_id="route_ligament", law="tension_only_linear", slack_length_m=0.05, rest_length_m=rest, stiffness_N_m=500.0, damping_Ns_m=2.0
+        id="lig_main", route_id="route_ligament", law="tension_only_linear", slack_length_m=0.05, rest_length_m=rest, stiffness_N_m=500.0, damping_Ns_m=None
     )
     restraint = av.RotaryRestraint(
-        id="restraint_bone", joint_coordinate_id="j_bone:hinge", rest_angle_rad=0.0, law="linear_torque", stiffness_Nm_rad=1.0, damping=0.001
+        id="restraint_bone", joint_coordinate_id="j_bone:hinge", rest_angle_rad=0.0, law="linear_torque", stiffness_Nm_rad=1.0, damping=None
     )
     attachment = av.Attachment(
         id="att_wall_bone",

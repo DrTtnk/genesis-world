@@ -334,3 +334,51 @@ def test_tetmesh_rejects_a_wrong_shaped_elems_array():
     verts = _tet_verts((0.0, 0.0, 0.0))
     with pytest.raises(gs.GenesisException, match="shape"):
         gs.morphs.TetMesh(verts=verts, elems=np.array([[0, 1, 2]]), faces=np.array([[0, 1, 2]]))
+
+
+# A packet may carry a field the engine cannot honour. Building it anyway would hand back a muscle nobody
+# asked for, so each of these must fail at build and name the field. A packet that leaves the field at its
+# natural value still builds: the tests above cover that case throughout.
+
+
+def test_build_model_rejects_per_unit_hill_constants():
+    """The Hill curve constants are shared by every unit, so a packet that tunes them per muscle must fail
+    rather than build a muscle it did not describe."""
+    packet = build_hinge_model_packet()
+    mtu = dataclasses.replace(packet.mtus[0], law_constants={"W": 0.5})
+    packet = dataclasses.replace(packet, mtus=(mtu,) + packet.mtus[1:])
+    with pytest.raises(gs.GenesisException, match=f"{mtu.id}.*law_constants"):
+        gs.avbd.build_model(hinge_model_scene(), packet)
+
+
+def test_the_initial_activation_and_fibre_length_of_the_packet_reach_the_solver():
+    """`activation0` and `fibre_length0_m` are carried to the unit, not ignored. The fibre is clamped to what
+    the route can hold, because the tendon carries no compression."""
+    packet = build_hinge_model_packet()
+    mtu = dataclasses.replace(packet.mtus[0], activation0=0.3, fibre_length0_m=0.5 * packet.mtus[0].l_opt_m)
+    packet = dataclasses.replace(packet, mtus=(mtu,) + packet.mtus[1:], required_capabilities=packet.required_capabilities)
+    scene = hinge_model_scene()
+    model = gs.avbd.build_model(scene, packet)
+    scene.build()
+    state = model.mtu_state()
+    index = model.ids.mtus[mtu.id]
+    assert abs(float(state.activation[0, index]) - 0.3) < 1e-6
+    assert float(state.fibre_length[0, index]) <= 0.5 * packet.mtus[0].l_opt_m + 1e-9
+
+
+def test_build_model_rejects_a_damped_ligament():
+    """`rest_length_m` is not checked: the interface calls it one field with the slack length, and only the
+    slack length carries force, so ignoring it changes nothing. Damping is a force term the engine lacks."""
+    packet = build_hinge_model_packet()
+    ligament = dataclasses.replace(packet.ligaments[0], damping_Ns_m=4.0)
+    packet = dataclasses.replace(packet, ligaments=(ligament,) + packet.ligaments[1:])
+    with pytest.raises(gs.GenesisException, match=f"{ligament.id}"):
+        gs.avbd.build_model(hinge_model_scene(), packet)
+
+
+def test_build_model_rejects_a_damped_rotary_restraint():
+    packet = build_hinge_model_packet()
+    restraint = dataclasses.replace(packet.rotary_restraints[0], damping=0.3)
+    packet = dataclasses.replace(packet, rotary_restraints=(restraint,) + packet.rotary_restraints[1:])
+    with pytest.raises(gs.GenesisException, match=f"{restraint.id}.*damping"):
+        gs.avbd.build_model(hinge_model_scene(), packet)

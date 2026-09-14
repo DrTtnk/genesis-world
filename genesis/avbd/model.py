@@ -372,13 +372,30 @@ def _build_mtus_and_ligaments(scene, packet, anchors_by_id, links_by_id, tissues
     for mtu in packet.mtus:
         if mtu.law != "hill_v1":
             gs.raise_exception(f"MTU '{mtu.id}' has law '{mtu.law}'; only 'hill_v1' is supported.")
+        # law_constants is the one the engine cannot honour: the Hill curve constants are shared by every
+        # unit. The initial activation and fibre length are carried through to the unit below.
+        if mtu.law_constants:
+            gs.raise_exception(
+                f"MTU '{mtu.id}' carries law_constants {sorted(mtu.law_constants)}; the Hill constants are "
+                f"shared by every unit in genesis/engine/solvers/vbd_mtu.py and cannot be set per unit."
+            )
         parameters = HillParameters(f_max=mtu.f_max_N, l_opt=mtu.l_opt_m, l_slack=mtu.l_slack_m, v_max=mtu.v_max_m_s)
-        mtus[mtu.id] = vbd_solver.add_mtu(anchors_of(mtu.route_id), parameters)
+        mtus[mtu.id] = vbd_solver.add_mtu(
+            anchors_of(mtu.route_id),
+            parameters,
+            activation0=mtu.activation0,
+            fibre_length0=mtu.fibre_length0_m,
+        )
 
     ligaments = {}
     for ligament in packet.ligaments:
         if ligament.law != "tension_only_linear":
             gs.raise_exception(f"Ligament '{ligament.id}' has law '{ligament.law}'; only 'tension_only_linear' is supported.")
+        if ligament.damping_Ns_m:
+            gs.raise_exception(
+                f"Ligament '{ligament.id}' asks for damping {ligament.damping_Ns_m} Ns/m; the engine's "
+                f"tension-only element has no damping term."
+            )
         ligaments[ligament.id] = vbd_solver.add_ligament(
             anchors_of(ligament.route_id), stiffness=ligament.stiffness_N_m, slack_length=ligament.slack_length_m
         )
@@ -387,6 +404,11 @@ def _build_mtus_and_ligaments(scene, packet, anchors_by_id, links_by_id, tissues
     for restraint in packet.rotary_restraints:
         if restraint.law != "linear_torque":
             gs.raise_exception(f"Rotary restraint '{restraint.id}' has law '{restraint.law}'; only 'linear_torque' is supported.")
+        if restraint.damping:
+            gs.raise_exception(
+                f"Rotary restraint '{restraint.id}' asks for damping {restraint.damping}; the engine applies "
+                f"-k (q - q_rest) with no damping term."
+            )
         dof = coordinates[restraint.joint_coordinate_id]
         rotary_restraints[restraint.id] = vbd_solver.add_rotary_restraint(
             dof=dof, stiffness=restraint.stiffness_Nm_rad, rest_angle=restraint.rest_angle_rad
