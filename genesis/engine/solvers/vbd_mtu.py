@@ -86,6 +86,25 @@ class TissueAnchor:
     weights: tuple
 
 
+@dataclass(frozen=True)
+class SurfaceAnchor:
+    """One triangle of a VBD shell entity and the barycentric weights of the anchor in it.
+
+    Kept distinct from `TissueAnchor` at the interface, because a surface anchor names a triangle and three
+    weights while a tet anchor names four vertices and four weights, and reading one as the other would put
+    load on the wrong place. Inside the solver both resolve to the same weighted-vertex form, so there is one
+    kernel path and not two: a surface anchor is the triangle's three vertices with a fourth weight of zero.
+
+    A shell carries no thickness, so an anchor lies in the surface. An offset through the thickness would
+    apply a moment the membrane cannot carry without bending, and its convention is not agreed yet, so it is
+    refused rather than guessed.
+    """
+
+    entity: object
+    triangle: int
+    weights: tuple
+
+
 class MTUState(NamedTuple):
     """Per environment and unit: activation, fibre length (m), route length (m), fibre velocity (m/s) and
     tension (N). A ligament has no fibre, so its fibre length and velocity are zero."""
@@ -121,6 +140,15 @@ class VBDMTU:
                     anchor_local.append(anchor.local_pos)
                     anchor_verts.append((0, 0, 0, 0))
                     anchor_weights.append((0.0, 0.0, 0.0, 0.0))
+                elif isinstance(anchor, SurfaceAnchor):
+                    # the triangle's three vertices, with a fourth weight of zero: the same weighted sum the
+                    # tet anchor forms, so `func_anchor_pos` and the vertex CSR need no surface-specific case
+                    triangle = anchor.entity.tris[anchor.triangle]
+                    anchor_kind.append(KIND_TISSUE)
+                    anchor_link.append(-1)
+                    anchor_local.append((0.0, 0.0, 0.0))
+                    anchor_verts.append(tuple(int(anchor.entity.v_start + v) for v in triangle) + (0,))
+                    anchor_weights.append(tuple(anchor.weights) + (0.0,))
                 else:
                     anchor_kind.append(KIND_TISSUE)
                     anchor_link.append(-1)

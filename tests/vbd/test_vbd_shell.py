@@ -383,3 +383,55 @@ def test_bending_force_stays_accurate_far_from_the_origin(show_viewer):
         errors[offset] = float(np.abs(engine_force + grad.cpu().numpy()).max())
     print(f"bending parity error at the origin {errors[0.0]:.3e} N, at 2.5 m {errors[2.5]:.3e} N")
     assert errors[2.5] < max(10.0 * errors[0.0], 1e-6)
+
+
+def test_a_muscle_anchored_to_a_triangle_pulls_all_three_of_its_vertices(show_viewer):
+    """A surface anchor names a triangle and three barycentric weights, and its pull must reach every corner
+    in proportion to its weight: the property `spikes/verify_avbd_mtu_math.py` proves for the tet form, which
+    carries over unchanged because the anchor is the same weighted sum with one fewer vertex.
+
+    The force is read directly rather than inferred from motion. A free sheet dragged upward by a muscle
+    moves mostly as a rigid body and rotates, so displacement says almost nothing about where the load went;
+    the first version of this test measured exactly that and read the weights backwards. The membrane is
+    deliberately soft so that what the residual reports is the muscle's pull and not the sheet's own
+    elasticity."""
+    from genesis.engine.solvers.vbd_mtu import HillParameters, SurfaceAnchor, WorldAnchor
+
+    rest = np.array([[0.0, 0.0, 0.0], [0.06, 0.0, 0.0], [0.0, 0.06, 0.0], [0.06, 0.06, 0.0]])
+    faces = np.array([[0, 1, 2], [1, 3, 2]])
+    material = gs.materials.VBD.Shell(E=1.0, nu=0.3, thickness=1e-3, bending_stiffness=0.0)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=1e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        vbd_options=gs.options.VBDOptions(n_iterations=10, floor_height=-1e3),
+        show_viewer=False,
+    )
+    sheet = scene.add_entity(material=material, morph=gs.morphs.TriMesh(verts=rest, faces=faces))
+
+    weights = (0.6, 0.3, 0.1)
+    l_opt = 0.05
+    scene.vbd_solver.add_mtu(
+        [SurfaceAnchor(sheet, 0, weights), WorldAnchor((0.02, 0.02, 2.4 * l_opt))],
+        HillParameters(f_max=40.0, l_opt=l_opt, l_slack=l_opt, v_max=0.3),
+    )
+    scene.build()
+    # Every vertex is held. A free sheet is simply dragged to the far anchor within a few steps, the route
+    # goes slack and the tension collapses to zero, which is what the previous version of this test measured.
+    sheet.set_pinned(np.ones(sheet.n_vertices, dtype=bool))
+    for _ in range(20):
+        scene.vbd_solver.set_excitation(torch.ones(1, 1, device=gs.device))
+        scene.step()
+    tension = float(scene.vbd_solver.mtu_state().tension[0, 0])
+    assert tension > 0.0
+
+    _set_static_state(scene.vbd_solver, rest)
+    force = _residual_force(scene.vbd_solver)[0]
+    corners = faces[0]
+    magnitude = np.linalg.norm(force[corners], axis=1)
+    print(f"surface anchor force per corner {magnitude} N at weights {weights}, tension {tension:.3f} N")
+
+    # the corner forces stand in the ratio of the weights, and the vertex outside the triangle carries none
+    for got, want in zip(magnitude / magnitude.sum(), weights):
+        assert abs(got - want) < 0.02
+    assert np.linalg.norm(force[3]) < 0.02 * magnitude.sum()
+    # and the three of them together are the route's pull
+    assert abs(np.linalg.norm(force[corners].sum(axis=0)) - tension) < 0.05 * tension

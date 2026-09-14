@@ -61,6 +61,7 @@ from genesis.engine.solvers.vbd_contact import EnvStatus
 from genesis.engine.solvers.vbd_mtu import (
     HillParameters,
     LinkAnchor,
+    SurfaceAnchor,
     TissueAnchor,
     UNIT_HILL,
     UNIT_LIGAMENT,
@@ -217,7 +218,17 @@ class VBDSolver(Solver):
         if len(anchors) < 2:
             gs.raise_exception("A route needs at least two anchors.")
         for anchor in anchors:
-            if isinstance(anchor, TissueAnchor):
+            if isinstance(anchor, SurfaceAnchor):
+                if len(anchor.weights) != 3:
+                    gs.raise_exception("A surface anchor needs three barycentric weights, one per triangle corner.")
+                if abs(sum(anchor.weights) - 1.0) > 1e-6:
+                    gs.raise_exception(f"The barycentric weights of a surface anchor sum to {sum(anchor.weights)}.")
+                if not 0 <= anchor.triangle < len(anchor.entity.tris):
+                    gs.raise_exception(
+                        f"Surface anchor triangle {anchor.triangle} is outside the entity's "
+                        f"{len(anchor.entity.tris)} triangles."
+                    )
+            elif isinstance(anchor, TissueAnchor):
                 if len(anchor.vertices) != 4 or len(anchor.weights) != 4:
                     gs.raise_exception("A tissue anchor needs four vertices and four barycentric weights.")
                 if abs(sum(anchor.weights) - 1.0) > 1e-6:
