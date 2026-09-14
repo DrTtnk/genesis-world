@@ -423,3 +423,352 @@ def build_fixture_packet() -> "gs.avbd.Packet":
         prescribed_colliders=(prescribed_collider,),
         regions=(region,),
     )
+
+
+########################## fixtures for gs.avbd.build_model ##########################
+
+# The A0 fixture above exercises the packet schema, not the model builder: several of its records
+# (a two-axis joint, an elastic attachment, a barycentric hard-point attachment, two materials on one
+# tissue, a region) are exactly the records `build_model` must refuse. The fixtures below build small,
+# focused packets instead: one that `build_model` accepts and steps, and one small addition per record
+# class `build_model` must reject, isolated from every other rejection so each test sees only the one
+# violation it names.
+
+
+def _single_tet_tissue(tissue_id, material_id, verts, collision_group=None):
+    """One tetrahedron as a tissue: the boundary is its own four faces, correctly outward-oriented by
+    the same primitive `genesis.avbd.packet._check_boundary_outward` checks against (see
+    `build_concave_tissue` above), so its correctness does not rely on a hand-derived winding."""
+    import igl
+
+    from genesis.engine.solvers.vbd_contact import VBDContact
+
+    tets = np.array([[0, 1, 2, 3]], dtype=np.int64)
+    boundary_faces, tet_of_facet, _ = igl.boundary_facets(tets)
+    boundary_faces = VBDContact._oriented_outward(boundary_faces, tets[tet_of_facet], verts).astype(np.int64)
+    return gs.avbd.Tissue(
+        id=tissue_id,
+        rest_positions_m=verts,
+        tets=tets,
+        boundary_faces=boundary_faces,
+        tet_material_ids=(material_id,),
+        collision_group=collision_group,
+        stress_free_reference="rest",
+        active=True,
+    )
+
+
+def _tet_verts(origin):
+    """A well-shaped tetrahedron (positive volume, no degenerate faces) translated to `origin`."""
+    origin = np.asarray(origin, dtype=np.float64)
+    return origin + np.array(
+        [[0.0, 0.0, 0.0], [0.02, 0.0, 0.0], [0.0, 0.02, 0.0], [0.005, 0.005, 0.02]], dtype=np.float64
+    )
+
+
+def build_minimal_packet():
+    """The smallest packet `build_model` accepts: one fixed link, one one-tet tissue, nothing else.
+
+    Every rejection test below starts from this packet and adds exactly the one record class under
+    test, so a failure names that record and not an unrelated one.
+    """
+    av = gs.avbd
+    root = av.Link(
+        id="root",
+        entity_id="e_root",
+        motion_mode="fixed",
+        rest_position_m=np.zeros(3),
+        rest_quaternion_wxyz=_quat(1.0, 0.0, 0.0, 0.0),
+        mass_kg=0.1,
+        com_link_m=np.zeros(3),
+        inertia_com_kgm2=np.diag([1.0e-4, 1.0e-4, 1.0e-4]),
+        collision_geometry_id=None,
+        collision_group=None,
+    )
+    material = av.Material(
+        id="mat_wall",
+        law="neo_hookean_v1",
+        law_params={"E_Pa": 5.0e4, "nu": 0.45},
+        density_kg_m3=1060.0,
+        thickness_m=0.002,
+        provenance="synthetic",
+    )
+    tissue = _single_tet_tissue("wall", "mat_wall", _tet_verts((0.1, 0.0, 0.0)))
+    e_root = av.Entity(id="e_root", link_ids=("root",), tissue_ids=(), role="root", integration_owner="root")
+    e_wall = av.Entity(id="e_wall", link_ids=(), tissue_ids=("wall",), role="wall", integration_owner="wall")
+    return av.Packet(
+        interface_version=av.INTERFACE_VERSION,
+        model_id="avbd_model_minimal",
+        units={"length": "m", "mass": "kg", "time": "s", "angle": "rad"},
+        world_frame={"up": "+Z", "longitudinal": "+X_toward_tail"},
+        source_hashes={},
+        parameter_provenance={"note": "synthetic build_model fixture"},
+        required_capabilities=(),
+        entities=(e_root, e_wall),
+        links=(root,),
+        joints=(),
+        materials=(material,),
+        tissues=(tissue,),
+        anchors=(),
+        routes=(),
+        mtus=(),
+        ligaments=(),
+        rotary_restraints=(),
+        attachments=(),
+        collision_groups=(),
+        collision_exclusions=(),
+        contact_materials=(),
+        contact_pairs=(),
+        prescribed_colliders=(),
+        regions=(),
+    )
+
+
+def build_hinge_model_packet():
+    """A packet exercising every record class `build_model` supports: a fixed base, a single-axis
+    hinge bone, a tissue wall hard-attached to the bone, one MTU and one ligament spanning the hinge,
+    a rotary restraint on the hinge coordinate, and a prescribed ellipsoid colliding with the wall.
+
+    The hinge and MTU geometry mirror `tests/vbd/test_vbd_mtu.py::hinge_scene` and
+    `test_the_pull_on_a_link_anchor_turns_the_hinge_the_way_the_route_shortens`: `base` and `bone`
+    share one frame origin at rest (both joint frames are the identity), so the same anchor offsets
+    produce the same qualitative pull.
+    """
+    av = gs.avbd
+    f_max, l_opt, l_slack, v_max = 250.0, 0.06, 0.06, 0.3
+    rest = l_opt + l_slack
+
+    base = av.Link(
+        id="base",
+        entity_id="e_base",
+        motion_mode="fixed",
+        rest_position_m=np.zeros(3),
+        rest_quaternion_wxyz=_quat(1.0, 0.0, 0.0, 0.0),
+        mass_kg=0.05,
+        com_link_m=np.array([-0.06, 0.0, 0.0]),
+        inertia_com_kgm2=np.diag([1.0e-4, 1.3e-4, 1.1e-4]),
+        collision_geometry_id=None,
+        collision_group=None,
+    )
+    bone = av.Link(
+        id="bone",
+        entity_id="e_bone",
+        motion_mode="dynamic",
+        rest_position_m=np.zeros(3),
+        rest_quaternion_wxyz=_quat(1.0, 0.0, 0.0, 0.0),
+        mass_kg=0.1,
+        com_link_m=np.array([0.05, 0.0, 0.0]),
+        inertia_com_kgm2=np.diag([2.0e-6, 2.6e-6, 1.4e-6]),
+        collision_geometry_id=None,
+        collision_group=None,
+    )
+    meal = av.Link(
+        id="meal",
+        entity_id="e_meal",
+        motion_mode="prescribed",
+        rest_position_m=np.array([0.11, 0.0, 0.05]),
+        rest_quaternion_wxyz=_quat(1.0, 0.0, 0.0, 0.0),
+        mass_kg=0.2,
+        com_link_m=np.zeros(3),
+        inertia_com_kgm2=np.diag([1.0e-3, 1.0e-3, 1.0e-3]),
+        collision_geometry_id="ellipsoid_meal",
+        collision_group="cg_meal",
+    )
+
+    hinge = av.Joint(
+        id="j_bone",
+        parent_link_id="base",
+        child_link_id="bone",
+        joint_type="hinge_chain",
+        parent_frame_position_m=np.zeros(3),
+        parent_frame_quaternion_wxyz=_quat(1.0, 0.0, 0.0, 0.0),
+        child_frame_position_m=np.zeros(3),
+        child_frame_quaternion_wxyz=_quat(1.0, 0.0, 0.0, 0.0),
+        axes=("hinge",),
+        coordinate_ids=("j_bone:hinge",),
+        rest_coordinates=np.array([0.0]),
+        lower_limits=np.array([-0.6]),
+        upper_limits=np.array([0.6]),
+        damping=np.array([0.002]),
+        armature=np.array([0.0]),
+        parent_world_position_m=None,
+        parent_world_quaternion_wxyz=None,
+    )
+
+    material = av.Material(
+        id="mat_wall",
+        law="neo_hookean_v1",
+        law_params={"E_Pa": 1.0e5, "nu": 0.3},
+        density_kg_m3=1000.0,
+        thickness_m=0.002,
+        provenance="synthetic",
+    )
+    tissue = _single_tet_tissue("wall", "mat_wall", _tet_verts((0.06, 0.0, 0.006)), collision_group="cg_wall")
+
+    anchor_bone_flexor = av.Anchor(
+        id="a_bone_flexor",
+        active=True,
+        kind="link",
+        position_m=None,
+        link_id="bone",
+        position_link_m=np.array([rest - 0.02, 0.0, 0.012]),
+        tissue_id=None,
+        tet_index=None,
+        barycentric_weights=None,
+    )
+    anchor_base_flexor = av.Anchor(
+        id="a_base_flexor",
+        active=True,
+        kind="link",
+        position_m=None,
+        link_id="base",
+        position_link_m=np.array([-0.02, 0.0, 0.012]),
+        tissue_id=None,
+        tet_index=None,
+        barycentric_weights=None,
+    )
+    anchor_bone_ligament = av.Anchor(
+        id="a_bone_ligament",
+        active=True,
+        kind="link",
+        position_m=None,
+        link_id="bone",
+        position_link_m=np.array([rest - 0.02, 0.0, -0.01]),
+        tissue_id=None,
+        tet_index=None,
+        barycentric_weights=None,
+    )
+    anchor_base_ligament = av.Anchor(
+        id="a_base_ligament",
+        active=True,
+        kind="link",
+        position_m=None,
+        link_id="base",
+        position_link_m=np.array([-0.02, 0.0, -0.01]),
+        tissue_id=None,
+        tet_index=None,
+        barycentric_weights=None,
+    )
+    anchor_wall_node = av.Anchor(
+        id="a_wall_node",
+        active=True,
+        kind="tissue",
+        position_m=None,
+        link_id=None,
+        position_link_m=None,
+        tissue_id="wall",
+        tet_index=0,
+        barycentric_weights=np.array([1.0, 0.0, 0.0, 0.0]),
+    )
+    anchor_bone_for_wall = av.Anchor(
+        id="a_bone_for_wall",
+        active=True,
+        kind="link",
+        position_m=None,
+        link_id="bone",
+        position_link_m=np.zeros(3),
+        tissue_id=None,
+        tet_index=None,
+        barycentric_weights=None,
+    )
+
+    route_flexor = av.Route(
+        id="route_flexor", anchor_ids=("a_base_flexor", "a_bone_flexor"), routing_policy="polyline", mechanical_owner="mtu_flexor"
+    )
+    route_ligament = av.Route(
+        id="route_ligament",
+        anchor_ids=("a_base_ligament", "a_bone_ligament"),
+        routing_policy="polyline",
+        mechanical_owner="lig_main",
+    )
+
+    mtu_flexor = av.MTU(
+        id="mtu_flexor",
+        route_id="route_flexor",
+        law="hill_v1",
+        f_max_N=f_max,
+        l_opt_m=l_opt,
+        l_slack_m=l_slack,
+        v_max_m_s=v_max,
+        activation0=0.0,
+        fibre_length0_m=l_opt,
+        law_constants={},
+        passive_mechanics_owner="mtu_flexor",
+    )
+    ligament = av.Ligament(
+        id="lig_main", route_id="route_ligament", law="tension_only_linear", slack_length_m=0.05, rest_length_m=rest, stiffness_N_m=500.0, damping_Ns_m=2.0
+    )
+    restraint = av.RotaryRestraint(
+        id="restraint_bone", joint_coordinate_id="j_bone:hinge", rest_angle_rad=0.0, law="linear_torque", stiffness_Nm_rad=1.0, damping=0.001
+    )
+    attachment = av.Attachment(
+        id="att_wall_bone",
+        tissue_anchor_id="a_wall_node",
+        other_anchor_id="a_bone_for_wall",
+        law="hard_point",
+        stiffness_N_m=None,
+        damping_Ns_m=None,
+        collision_exclusion=False,
+    )
+
+    cg_wall = av.CollisionGroup(id="cg_wall", member_ids=("wall",))
+    cg_meal = av.CollisionGroup(id="cg_meal", member_ids=("meal",))
+    contact_material = av.ContactMaterial(
+        id="cm_wall_meal",
+        normal_law="penalty",
+        normal_compliance_m_N=0.0,
+        friction_law="coulomb",
+        friction_coefficients=np.array([0.3]),
+        regularization={"stiffness_N_m": 1.0e5, "thickness_m": 1.0e-3},
+        restitution=0.0,
+    )
+    contact_pair = av.ContactPair(
+        id="pair_wall_meal", group_a="cg_wall", group_b="cg_meal", contact_material_ids=("cm_wall_meal",), required=False
+    )
+    prescribed_collider = av.PrescribedCollider(
+        id="pc_meal",
+        link_id="meal",
+        collision_geometry_id="ellipsoid_meal",
+        semiaxes_m=np.array([0.03, 0.02, 0.02]),
+        collision_group="cg_meal",
+        trajectory_source_id="traj_meal",
+    )
+
+    e_base = av.Entity(id="e_base", link_ids=("base",), tissue_ids=(), role="base", integration_owner="base")
+    e_bone = av.Entity(id="e_bone", link_ids=("bone",), tissue_ids=(), role="bone", integration_owner="bone")
+    e_meal = av.Entity(id="e_meal", link_ids=("meal",), tissue_ids=(), role="meal", integration_owner="meal")
+    e_wall = av.Entity(id="e_wall", link_ids=(), tissue_ids=("wall",), role="wall", integration_owner="wall")
+
+    return av.Packet(
+        interface_version=av.INTERFACE_VERSION,
+        model_id="avbd_model_hinge",
+        units={"length": "m", "mass": "kg", "time": "s", "angle": "rad"},
+        world_frame={"up": "+Z", "longitudinal": "+X_toward_tail"},
+        source_hashes={},
+        parameter_provenance={"note": "synthetic build_model fixture"},
+        required_capabilities=("hard_point_attachment", "fixed_base_chain", "prescribed_link", "ellipsoid_collider", "isotropic_coulomb_friction"),
+        entities=(e_base, e_bone, e_meal, e_wall),
+        links=(base, bone, meal),
+        joints=(hinge,),
+        materials=(material,),
+        tissues=(tissue,),
+        anchors=(
+            anchor_bone_flexor,
+            anchor_base_flexor,
+            anchor_bone_ligament,
+            anchor_base_ligament,
+            anchor_wall_node,
+            anchor_bone_for_wall,
+        ),
+        routes=(route_flexor, route_ligament),
+        mtus=(mtu_flexor,),
+        ligaments=(ligament,),
+        rotary_restraints=(restraint,),
+        attachments=(attachment,),
+        collision_groups=(cg_wall, cg_meal),
+        collision_exclusions=(),
+        contact_materials=(contact_material,),
+        contact_pairs=(contact_pair,),
+        prescribed_colliders=(prescribed_collider,),
+        regions=(),
+    )

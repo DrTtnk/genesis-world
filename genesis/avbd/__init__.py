@@ -1,10 +1,11 @@
-"""AVBD: model packet import for the coupled rigid/tissue/muscle solver.
+"""AVBD: model packet import and model build for the coupled rigid/tissue/muscle solver.
 
-This package currently covers gate A0 only: reading, validating and writing the
-static model packet described in `AVBD_MODEL_INTERFACE.md` section 2. It does
-not build a runtime model; `build_model` is a later gate.
+This package covers gate A0 (reading, validating and writing the static model packet described in
+`AVBD_MODEL_INTERFACE.md` section 2) and the model build of `AVBD_API_MAP.md` section 2:
+`build_model` turns a validated packet into a live Genesis scene.
 """
 
+from .model import AVBDModel, IdMaps, Pose, build_model
 from .packet import (
     CAPABILITIES,
     INTERFACE_VERSION,
@@ -32,6 +33,10 @@ from .packet import (
 )
 
 __all__ = [
+    "AVBDModel",
+    "IdMaps",
+    "Pose",
+    "build_model",
     "CAPABILITIES",
     "INTERFACE_VERSION",
     "Anchor",

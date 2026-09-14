@@ -192,7 +192,26 @@ class VBDEntity(Entity):
         single welded copy of their vertices, tracked through 'VBDVisGeom.sim_verts_idx': welding and
         tetrahedralization both keep the input vertices first and in order, so these maps remain valid indices into
         the simulated vertices.
+
+        A `TetMesh` morph carries its own tetrahedral connectivity. It skips tetrahedralization and welding: its
+        `verts`, `elems` and `faces` pass through to `instantiate` and the render mesh unchanged.
         """
+        if isinstance(self._morph, gs.options.morphs.TetMesh):
+            vmesh = gs.Mesh.from_attrs(verts=self._morph.verts, faces=self._morph.faces, surface=self._surface)
+            self._vgeoms = gs.List(
+                [
+                    VBDVisGeom(
+                        entity=self,
+                        vvert_start=self._vvert_start,
+                        vface_start=self._vface_start,
+                        vmesh=vmesh,
+                        sim_verts_idx=np.arange(len(self._morph.verts), dtype=gs.np_int),
+                    )
+                ]
+            )
+            self.instantiate(self._morph.verts, self._morph.elems)
+            return
+
         meshes = gs.Mesh.from_morph_surface(self._morph, self._surface)
         surface_verts, surface_faces, verts_maps = mu.merge_submeshes(
             [mesh.verts for mesh in meshes], [mesh.faces for mesh in meshes]

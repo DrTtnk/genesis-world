@@ -22,6 +22,7 @@ import genesis.utils.urdf as uu
 import genesis.ext.urdfpy as urdfpy
 from genesis.typing import (
     FrozenDictType,
+    NDArrayType,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
@@ -886,6 +887,58 @@ class MeshSet(Mesh):
     files: tuple[Any, ...] = Field(default=(), strict=False)
     poss: tuple[Vec3FType, ...] = Field(default=(), strict=False)
     eulers: tuple[Vec3FType, ...] = Field(default=(), strict=False)
+
+
+class TetMesh(Morph):
+    """
+    Morph built from an explicit tetrahedral mesh: no tetrahedralization, no fill.
+
+    Use this morph for a mesh whose connectivity is already fixed, such as one read from an AVBD model
+    packet. `verts`, `elems` and `faces` pass through to the solver unchanged.
+
+    Parameters
+    ----------
+    verts : array_like, shape (n_vertices, 3)
+        Rest position of each vertex, in metres.
+    elems : array_like, shape (n_tets, 4)
+        Zero-based vertex index of each tetrahedron.
+    faces : array_like, shape (n_faces, 3)
+        Zero-based vertex index of each boundary triangle, wound outward. Used for rendering only.
+    """
+
+    verts: NDArrayType
+    elems: NDArrayType
+    faces: NDArrayType
+
+    @model_validator(mode="after")
+    def _check_mesh(self) -> Self:
+        verts = np.asarray(self.verts)
+        elems = np.asarray(self.elems)
+        faces = np.asarray(self.faces)
+
+        if verts.ndim != 2 or verts.shape[1] != 3:
+            gs.raise_exception(f"`verts` must have shape (n_vertices, 3), got {verts.shape}.")
+        if not np.isfinite(verts).all():
+            gs.raise_exception("`verts` contains a non-finite value.")
+
+        if elems.ndim != 2 or elems.shape[1] != 4:
+            gs.raise_exception(f"`elems` must have shape (n_tets, 4), got {elems.shape}.")
+        if elems.dtype.kind not in "iu":
+            gs.raise_exception(f"`elems` must be an integer array, got dtype {elems.dtype}.")
+        if elems.size and ((elems < 0).any() or (elems >= len(verts)).any()):
+            gs.raise_exception("`elems` has an index out of range of `verts`.")
+
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            gs.raise_exception(f"`faces` must have shape (n_faces, 3), got {faces.shape}.")
+        if faces.dtype.kind not in "iu":
+            gs.raise_exception(f"`faces` must be an integer array, got dtype {faces.dtype}.")
+        if faces.size and ((faces < 0).any() or (faces >= len(verts)).any()):
+            gs.raise_exception("`faces` has an index out of range of `verts`.")
+
+        self.verts = verts
+        self.elems = elems
+        self.faces = faces
+        return self
 
 
 ############################ Rigid & Articulated ############################
