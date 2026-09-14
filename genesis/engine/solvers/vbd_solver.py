@@ -417,7 +417,24 @@ class VBDSolver(Solver):
             group=gs.qd_int,  # muscle group, -1 for passive
             k_fiber=gs.qd_float,  # fibre reinforcement stiffness (Pa) along `fiber` on the unactuated F; 0 disables
         )
-        self.elems_info = struct_elem_info.field(shape=(self._n_elements,), layout=qd.Layout.SOA)
+        self.elems_info = struct_elem_info.field(shape=(max(self._n_elements, 1),), layout=qd.Layout.SOA)
+
+        # Shell membrane: a triangle carries the same stable neo-Hookean law as a tet, on the 3x2 in-plane
+        # deformation gradient (`genesis/utils/shell.py`, proved in `verify_avbd_shell_math.py`). `B_rest` is
+        # the 2x2 rest edge matrix inverse, in an orthonormal frame of the rest triangle's own plane.
+        qd_mat2 = qd.types.matrix(2, 2, gs.qd_float)
+        struct_tri_info = qd.types.struct(v=gs.qd_ivec3, area_rest=gs.qd_float, B_rest=qd_mat2, mu=gs.qd_float, lam=gs.qd_float)
+        self.tri_info = struct_tri_info.field(shape=(max(self._n_triangles, 1),), layout=qd.Layout.SOA)
+
+        # Shell bending: one quadratic stencil per interior edge, `E = w/2 |K x - K x_rest|^2` with `K x =
+        # sum_i c_i x_i` (Bergou et al. 2006's quadratic model, generalised to a curved rest shape). `c` and
+        # `w` are fixed at rest and `kx_rest = K x_rest` is precomputed, so the Hessian block of vertex i is
+        # the constant scalar `stiffness * w * c_i^2` times the identity: no matrix, ever.
+        struct_bend_info = qd.types.struct(
+            v=gs.qd_ivec4, c=gs.qd_vec4, w=gs.qd_float, kx_rest=gs.qd_vec3, stiffness=gs.qd_float
+        )
+        self.bend_info = struct_bend_info.field(shape=(max(self._n_stencils, 1),), layout=qd.Layout.SOA)
+
         self.muscle_actu = qd.field(dtype=gs.qd_float, shape=(max(self._n_muscle_groups, 1), self._B))
         # Analytic bolus: a sphere with prescribed centre, radius and velocity per env, radius <= 0 disables it.
         struct_bolus = qd.types.struct(
@@ -511,18 +528,36 @@ class VBDSolver(Solver):
         self.envs_offset = qd.Vector.field(3, dtype=qd.f32, shape=self._B)
         self.envs_offset.from_numpy(self._scene.envs_offset.astype(np.float32))
 
-    def _compute_vertex_coloring_and_incidence(self, elems, cons, acons):
-        """Greedy vertex coloring of the graph of tets and constraints plus the vertex -> incident tet CSR list.
+    def _incidence_csr(self, index_array):
+        """Vertex -> incident-element CSR: for vertex `i`, `elem[offset[i]:offset[i+1]]` are the elements that
+        touch it and `role[offset[i]:offset[i+1]]` its local index (column of `index_array`) in each."""
+        n_local = index_array.shape[1]
+        inc_vert = index_array.reshape(-1)
+        inc_elem = np.repeat(np.arange(len(index_array)), n_local)
+        inc_role = np.tile(np.arange(n_local), len(index_array))
+        order = np.argsort(inc_vert, kind="stable")
+        offset = np.searchsorted(inc_vert[order], np.arange(self._n_vertices + 1))
+        return offset, inc_elem[order], inc_role[order]
 
-        Returns (perm, color_offsets, n_colors, ve_offset, ve_elem, ve_role, color): vertices sorted by color
-        (`perm[color_offsets[c]:color_offsets[c+1]]` is color `c`), and for vertex `i` the incident tets
-        `ve_elem[ve_offset[i]:ve_offset[i+1]]` with `ve_role` the local index of `i` in each tet. Two vertices
-        that share a tet or a constraint never share a color, so each color is one race-free Gauss-Seidel sweep.
+    def _compute_vertex_coloring_and_incidence(self, elems, cons, acons, tris, bends):
+        """Greedy vertex coloring of the graph of tets, triangles, bending stencils and constraints, plus the
+        vertex -> incident-element CSR list of each of the first three.
+
+        Returns (perm, color_offsets, n_colors, ve_offset, ve_elem, ve_role, vt_offset, vt_elem, vt_role,
+        vb_offset, vb_elem, vb_role, color): vertices sorted by color (`perm[color_offsets[c]:color_offsets[c+1]]`
+        is color `c`), and the CSR triples for tets, triangles and bending stencils. Two vertices that share a
+        tet, a triangle, a bending stencil or a constraint never share a color, so each color is one race-free
+        Gauss-Seidel sweep: a stencil couples all four of its vertices (`H_ij = w c_i c_j I` for every `i, j`,
+        not only `i == j`), so every pair of the four, not only edges of the stencil's two triangles, must differ.
         """
         graph = nx.Graph()
         graph.add_nodes_from(range(self._n_vertices))
         for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
             graph.add_edges_from(zip(elems[:, a].tolist(), elems[:, b].tolist()))
+        for a, b in ((0, 1), (0, 2), (1, 2)):
+            graph.add_edges_from(zip(tris[:, a].tolist(), tris[:, b].tolist()))
+        for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
+            graph.add_edges_from(zip(bends[:, a].tolist(), bends[:, b].tolist()))
         graph.add_edges_from(zip(cons[:, 0].tolist(), cons[:, 1].tolist()))
         for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
             keep = acons[:, a] != acons[:, b]  # a vertex may serve both vectors of an angle constraint
@@ -538,16 +573,33 @@ class VBDSolver(Solver):
             (color[elems[:, a]] != color[elems[:, b]]).all()
             for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
         )
+        assert all((color[tris[:, a]] != color[tris[:, b]]).all() for a, b in ((0, 1), (0, 2), (1, 2)))
+        assert all(
+            (color[bends[:, a]] != color[bends[:, b]]).all()
+            for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+        )
         n_colors = int(color.max()) + 1
         perm = np.argsort(color, kind="stable")
         color_offsets = np.searchsorted(color[perm], np.arange(n_colors + 1)).tolist()
 
-        inc_vert = elems.reshape(-1)
-        inc_elem = np.repeat(np.arange(self._n_elements), 4)
-        inc_role = np.tile(np.arange(4), self._n_elements)
-        order = np.argsort(inc_vert, kind="stable")
-        ve_offset = np.searchsorted(inc_vert[order], np.arange(self._n_vertices + 1))
-        return perm, color_offsets, n_colors, ve_offset, inc_elem[order], inc_role[order], color
+        ve_offset, ve_elem, ve_role = self._incidence_csr(elems)
+        vt_offset, vt_elem, vt_role = self._incidence_csr(tris)
+        vb_offset, vb_elem, vb_role = self._incidence_csr(bends)
+        return (
+            perm,
+            color_offsets,
+            n_colors,
+            ve_offset,
+            ve_elem,
+            ve_role,
+            vt_offset,
+            vt_elem,
+            vt_role,
+            vb_offset,
+            vb_elem,
+            vb_role,
+            color,
+        )
 
     def _owner_csr(self, verts_per_constraint, color):
         """Per-vertex CSR of the constraints it owns. The owner is the constraint's vertex of highest color: when its
@@ -572,6 +624,8 @@ class VBDSolver(Solver):
         super().build()
         self._n_vertices = self.n_vertices
         self._n_elements = self.n_elements
+        self._n_triangles = self.n_triangles
+        self._n_stencils = self.n_stencils
         self._n_vverts = self.n_vverts
         self._n_vfaces = self.n_vfaces
 
@@ -587,6 +641,14 @@ class VBDSolver(Solver):
                 entity._add_to_solver()
 
             elems = np.concatenate([entity._v_start + entity.elems for entity in self._entities]).astype(np.int64)
+            tris = np.concatenate(
+                [entity._v_start + entity.tris for entity in self._entities if entity.n_triangles]
+                + [np.zeros((0, 3), dtype=np.int64)]
+            ).astype(np.int64)
+            bends = np.concatenate(
+                [entity._v_start + entity._bend_v for entity in self._entities if entity.n_stencils]
+                + [np.zeros((0, 4), dtype=np.int64)]
+            ).astype(np.int64)
             cons = np.concatenate(
                 [entity._v_start + entity.distance_constraints for entity in self._entities]
                 + [np.zeros((0, 2), dtype=np.int64)]
@@ -602,13 +664,27 @@ class VBDSolver(Solver):
             self._n_constraints = len(cons)
             self._n_angle_constraints = len(acons)
             self.init_constraint_fields()
-            perm, self._color_offsets, self._n_colors, ve_offset, ve_elem, ve_role, color = (
-                self._compute_vertex_coloring_and_incidence(elems, cons, acons)
-            )
+            (
+                perm,
+                self._color_offsets,
+                self._n_colors,
+                ve_offset,
+                ve_elem,
+                ve_role,
+                vt_offset,
+                vt_elem,
+                vt_role,
+                vb_offset,
+                vb_elem,
+                vb_role,
+                color,
+            ) = self._compute_vertex_coloring_and_incidence(elems, cons, acons, tris, bends)
             self._init_constraints(cons, lo, hi)
             self._init_angle_constraints(acons, alo, ahi)
             if self._damping > 0.0:
                 for entity in self._entities:
+                    if isinstance(entity.material, gs.materials.VBD.Shell):
+                        gs.raise_exception("Rayleigh damping is not implemented for shell elements.")
                     # K0 (the rest Hessian) is positive semidefinite only for lam' >= mu / 3, i.e. nu >= 1/8
                     if entity.material.nu < 0.125:
                         gs.raise_exception(
@@ -620,22 +696,34 @@ class VBDSolver(Solver):
             self.color_perm.from_numpy(perm.astype(gs.np_int))
             self.ve_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
             self.ve_offset.from_numpy(ve_offset.astype(gs.np_int))
-            self.ve_elem = qd.field(dtype=gs.qd_int, shape=(len(ve_elem),))
-            self.ve_elem.from_numpy(ve_elem.astype(gs.np_int))
-            self.ve_role = qd.field(dtype=gs.qd_int, shape=(len(ve_role),))
-            self.ve_role.from_numpy(ve_role.astype(gs.np_int))
-            self._init_self_collision(elems)
+            self.ve_elem = qd.field(dtype=gs.qd_int, shape=(max(len(ve_elem), 1),))
+            self.ve_role = qd.field(dtype=gs.qd_int, shape=(max(len(ve_role), 1),))
+            if len(ve_elem):
+                self.ve_elem.from_numpy(ve_elem.astype(gs.np_int))
+                self.ve_role.from_numpy(ve_role.astype(gs.np_int))
+            self.vt_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
+            self.vt_offset.from_numpy(vt_offset.astype(gs.np_int))
+            self.vt_elem = qd.field(dtype=gs.qd_int, shape=(max(len(vt_elem), 1),))
+            self.vt_role = qd.field(dtype=gs.qd_int, shape=(max(len(vt_role), 1),))
+            if len(vt_elem):
+                self.vt_elem.from_numpy(vt_elem.astype(gs.np_int))
+                self.vt_role.from_numpy(vt_role.astype(gs.np_int))
+            self.vb_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
+            self.vb_offset.from_numpy(vb_offset.astype(gs.np_int))
+            self.vb_elem = qd.field(dtype=gs.qd_int, shape=(max(len(vb_elem), 1),))
+            self.vb_role = qd.field(dtype=gs.qd_int, shape=(max(len(vb_role), 1),))
+            if len(vb_elem):
+                self.vb_elem.from_numpy(vb_elem.astype(gs.np_int))
+                self.vb_role.from_numpy(vb_role.astype(gs.np_int))
+            self._init_self_collision(elems, tris, bends)
             # The noise floor of the force assembly: no solve can drive the residual below the rounding error of the
             # terms it sums, so the relative tolerance is floored here. m/h^2 times a tet edge is the force that moves
             # a vertex one edge in one substep, the largest term in the sum; times the relative precision of the
             # accumulator, that is the smallest residual the assembly can resolve.
-            edge = float(
-                np.linalg.norm(
-                    self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 1], 0]
-                    - self.verts.pos.to_numpy()[0, self.elems_info.v.to_numpy()[:, 0], 0],
-                    axis=1,
-                ).mean()
-            )
+            # A shell-only scene has no tets, so the edge scale falls back to its triangles.
+            edge_v = self.elems_info.v.to_numpy()[:, :2] if self._n_elements else self.tri_info.v.to_numpy()[:, :2]
+            pos0 = self.verts.pos.to_numpy()[0]
+            edge = float(np.linalg.norm(pos0[edge_v[:, 1], 0] - pos0[edge_v[:, 0], 0], axis=1).mean())
             unit = float(self.verts_info.mass.to_numpy().max()) / self._substep_dt**2 * edge
             self._force_noise = unit * (1e-13 if gs.np_float == np.float64 else 1e-6)
             # The sweep kernel inlines one copy of the whole per-vertex solve for every colour of every sweep, so the
@@ -648,6 +736,8 @@ class VBDSolver(Solver):
                     f"{self._n_colors} colours). Compiling that needs tens of gigabytes. Use fewer sweeps, or more "
                     f"substeps instead of more sweeps."
                 )
+            if (self._n_triangles or self._n_stencils) and self._sim.requires_grad:
+                gs.raise_exception("Shell elements have no adjoint yet, so they cannot be used with requires_grad.")
             attached_entities = [entity for entity in self._entities if entity._rigid_links]
             if attached_entities:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
@@ -674,19 +764,26 @@ class VBDSolver(Solver):
                 gs.raise_exception("Rotary restraints were declared without any muscle-tendon unit.")
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
-    def _init_self_collision(self, elems):
-        """Which vertices may not touch each other: those sharing a tetrahedron are held together by the
-        material and their proximity is the mesh, not a collision. Stored as a per-vertex sorted list so the
-        contact loop can skip them with a short scan. Also the uniform grid the contact loop searches:
-        cell size from the mesh itself (Teschner et al. 2005), buckets addressed by a hash of the cell so
-        that no bound on the body's extent is needed."""
-        pairs = {(a, b) for a in range(4) for b in range(4) if a != b}
-        neighbours = np.unique(np.concatenate([elems[:, [a, b]] for a, b in sorted(pairs)]), axis=0)
+    def _init_self_collision(self, elems, tris, bends):
+        """Which vertices may not touch each other: those sharing a tetrahedron, a shell triangle or a
+        bending stencil are held together by the material and their proximity is the mesh, not a collision.
+        Stored as a per-vertex sorted list so the contact loop can skip them with a short scan. Also the
+        uniform grid the contact loop searches: cell size from the mesh itself (Teschner et al. 2005),
+        buckets addressed by a hash of the cell so that no bound on the body's extent is needed."""
+        groups = [
+            (elems, {(a, b) for a in range(4) for b in range(4) if a != b}),
+            (tris, {(a, b) for a in range(3) for b in range(3) if a != b}),
+            (bends, {(a, b) for a in range(4) for b in range(4) if a != b}),
+        ]
+        pairs = [group[:, [a, b]] for group, pair_set in groups for a, b in sorted(pair_set)]
+        pairs.append(np.zeros((0, 2), dtype=np.int64))
+        neighbours = np.unique(np.concatenate(pairs), axis=0)
         offset = np.searchsorted(neighbours[:, 0], np.arange(self._n_vertices + 1))
         self.vn_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
         self.vn_offset.from_numpy(offset.astype(gs.np_int))
-        self.vn_vert = qd.field(dtype=gs.qd_int, shape=(len(neighbours),))
-        self.vn_vert.from_numpy(neighbours[:, 1].astype(gs.np_int))
+        self.vn_vert = qd.field(dtype=gs.qd_int, shape=(max(len(neighbours), 1),))
+        if len(neighbours):
+            self.vn_vert.from_numpy(neighbours[:, 1].astype(gs.np_int))
         if self._self_thickness > 0.0:
             pos = self.verts.pos.to_numpy()[0, :, 0]
             edge = float(np.linalg.norm(pos[neighbours[:, 0]] - pos[neighbours[:, 1]], axis=1).mean())
@@ -808,6 +905,8 @@ class VBDSolver(Solver):
             idx=idx,
             v_start=self.n_vertices,
             el_start=self.n_elements,
+            tri_start=self.n_triangles,
+            bend_start=self.n_stencils,
             vvert_start=self.n_vverts,
             vface_start=self.n_vfaces,
             muscle_group_start=self._n_muscle_groups,
@@ -867,6 +966,67 @@ class VBDSolver(Solver):
             self.elems_info[i_e].fiber = qd.Vector.zero(gs.qd_float, 3)
             self.elems_info[i_e].group = -1
             self.elems_info[i_e].k_fiber = 0.0
+
+    @qd.kernel
+    def _kernel_add_shell_elements(
+        self,
+        v_start: qd.i32,
+        tri_start: qd.i32,
+        bend_start: qd.i32,
+        verts: qd.types.ndarray(),
+        mass: qd.types.ndarray(),
+        tris: qd.types.ndarray(),
+        tri_area_rest: qd.types.ndarray(),
+        tri_B_rest: qd.types.ndarray(),
+        mu: qd.f32,
+        lam: qd.f32,
+        mu_forward: qd.f32,
+        mu_backward: qd.f32,
+        mu_lateral: qd.f32,
+        bend_v: qd.types.ndarray(),
+        bend_c: qd.types.ndarray(),
+        bend_w: qd.types.ndarray(),
+        bend_kx_rest: qd.types.ndarray(),
+        bending_stiffness: qd.f32,
+    ):
+        for i_v_ in range(verts.shape[0]):
+            i_v = i_v_ + v_start
+            self.verts_info[i_v].mass = mass[i_v_]
+            self.verts_info[i_v].pinned = 0
+            self.verts_info[i_v].tangent = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
+            self.verts_info[i_v].mu_forward = mu_forward
+            self.verts_info[i_v].mu_backward = mu_backward
+            self.verts_info[i_v].mu_lateral = mu_lateral
+            for i_b in range(self._B):
+                for j in qd.static(range(3)):
+                    self.verts[0, i_v, i_b].pos[j] = verts[i_v_, j]
+                self.verts[0, i_v, i_b].vel = qd.Vector.zero(gs.qd_float, 3)
+
+        # The rest frame (B_rest, area_rest) is computed once in numpy by `genesis/utils/shell.py`, the exact
+        # transcription of the spike's `rest_frame`, and only copied in here.
+        for i_t_ in range(tris.shape[0]):
+            i_t = i_t_ + tri_start
+            for j in qd.static(range(3)):
+                self.tri_info[i_t].v[j] = tris[i_t_, j] + v_start
+            self.tri_info[i_t].area_rest = tri_area_rest[i_t_]
+            self.tri_info[i_t].B_rest = qd.Matrix(
+                [[tri_B_rest[i_t_, 0], tri_B_rest[i_t_, 1]], [tri_B_rest[i_t_, 2], tri_B_rest[i_t_, 3]]]
+            )
+            self.tri_info[i_t].mu = mu
+            self.tri_info[i_t].lam = lam
+
+        # The bending coefficients c, weight w and Kx_rest also come from `genesis/utils/shell.py`, an exact
+        # transcription of the spike's `bending_coefficients`, `bending_weight` and `Kx_rest`: an SVD null
+        # space is not something a kernel should compute, so it never runs on-device.
+        for i_s_ in range(bend_v.shape[0]):
+            i_s = i_s_ + bend_start
+            for j in qd.static(range(4)):
+                self.bend_info[i_s].v[j] = bend_v[i_s_, j] + v_start
+                self.bend_info[i_s].c[j] = bend_c[i_s_, j]
+            self.bend_info[i_s].w = bend_w[i_s_]
+            for j in qd.static(range(3)):
+                self.bend_info[i_s].kx_rest[j] = bend_kx_rest[i_s_, j]
+            self.bend_info[i_s].stiffness = bending_stiffness
 
     @qd.kernel
     def _kernel_add_vverts(
@@ -1017,6 +1177,24 @@ class VBDSolver(Solver):
         return w
 
     @qd.func
+    def _func_vertex_weight2(self, B, role):
+        """`_func_vertex_weight` for the 2x2 rest matrix of a shell triangle: row of `B` for local vertex
+        `role` in {1, 2}, vertex 0 (role 0) carrying minus the sum of the other rows."""
+        w = qd.Vector.zero(gs.qd_float, 2)
+        if role == 0:
+            w = -(B[0, :] + B[1, :])
+        else:
+            w = B[role - 1, :]
+        return w
+
+    @qd.func
+    def _func_cofactor2(self, F):
+        """The membrane's 3x2 analogue of `_func_cofactor`: `d J / d F` with `J = |f0 x f1|`, verified in
+        `verify_avbd_shell_math.py` against torch autograd on random `F`."""
+        n_hat = F[:, 0].cross(F[:, 1]).normalized()
+        return qd.Matrix.cols([F[:, 1].cross(n_hat), n_hat.cross(F[:, 0])])
+
+    @qd.func
     def _func_fiber_terms(self, fr, i_e, i_b, w_i):
         """Fibre reinforcement E = V k/2 (|F0 a| - 1)^2 on the unactuated F0 = Ds B_rest (a spine or tendon: it
         resists length change along `a` whatever the muscle does). Returns (force on the vertex with row
@@ -1093,6 +1271,49 @@ class VBDSolver(Solver):
                         damp += qd.cast(
                             self._func_rest_block(i_e, w0, self._func_vertex_weight_static(B0, r)) @ d_j, self._acc
                         )
+
+        # Shell membrane: the same stable neo-Hookean law on the 3x2 in-plane deformation gradient
+        # `F = Ds B_rest`, `Ds` the deformed edges in world space (`verify_avbd_shell_math.py`, membrane_energy).
+        # The block is the same Gauss-Newton form as the tet's: always positive semidefinite, never projected.
+        for c in range(self.vt_offset[i_v], self.vt_offset[i_v + 1]):
+            i_t = self.vt_elem[c]
+            role = self.vt_role[c]
+            v = self.tri_info[i_t].v
+            p0 = self.verts[f + 1, v[0], i_b].pos
+            Ds = qd.Matrix.cols([self.verts[f + 1, v[1], i_b].pos - p0, self.verts[f + 1, v[2], i_b].pos - p0])
+            Bm = self.tri_info[i_t].B_rest
+            F = Ds @ Bm
+            mu = self.tri_info[i_t].mu
+            lam = self.tri_info[i_t].lam
+            alpha = 1.0 + mu / lam
+            n = F[:, 0].cross(F[:, 1])
+            J = n.norm()
+            cof = self._func_cofactor2(F)
+            P = mu * F + lam * (J - alpha) * cof
+            w = self._func_vertex_weight2(Bm, role)
+            A0 = self.tri_info[i_t].area_rest
+            q = qd.cast(cof @ w, self._acc)
+            force -= qd.cast(A0 * (P @ w), self._acc)
+            K += qd.cast(A0 * mu * w.norm_sqr(), self._acc) * qd.Matrix.identity(self._acc, 3)
+            K += qd.cast(A0 * lam, self._acc) * q.outer_product(q)
+
+        # Shell bending: E = w/2 |K x - K x_rest|^2, K x = sum_i c_i x_i over the stencil's four vertices.
+        # grad_i = w c_i (K x - K x_rest), H_ii = w c_i^2 I exactly (verify_avbd_shell_math.py): a scalar
+        # times the identity, so it needs no projection.
+        for c in range(self.vb_offset[i_v], self.vb_offset[i_v + 1]):
+            i_s = self.vb_elem[c]
+            role = self.vb_role[c]
+            bv = self.bend_info[i_s].v
+            coeffs = self.bend_info[i_s].c
+            kx = qd.Vector.zero(gs.qd_float, 3)
+            for r in qd.static(range(4)):
+                kx += coeffs[r] * self.verts[f + 1, bv[r], i_b].pos
+            residual = kx - self.bend_info[i_s].kx_rest
+            stiffness = self.bend_info[i_s].stiffness
+            w_bend = self.bend_info[i_s].w
+            c_i = coeffs[role]
+            force -= qd.cast(stiffness * w_bend * c_i * residual, self._acc)
+            K += qd.cast(stiffness * w_bend * c_i * c_i, self._acc) * qd.Matrix.identity(self._acc, 3)
 
         kd_h = qd.cast(self._damping / self._substep_dt, self._acc)
         force -= kd_h * (K0 @ qd.cast(x - self.verts[f, i_v, i_b].pos, self._acc) + damp)
@@ -2956,7 +3177,16 @@ class VBDSolver(Solver):
                 self.energy[i_b] += qd.cast(0.5 * k * C * C + self.cons[i_c, i_b].lam_hi * C, qd.f64)
 
     def compute_energy(self, f):
-        """Incremental potential of substep `f` at the current iterate, shape (B,). Non-increasing across sweeps."""
+        """Incremental potential of substep `f` at the current iterate, shape (B,). Non-increasing across sweeps.
+
+        The sum covers the inertia and the tetrahedra only. It omits the rigid, attachment, contact and
+        muscle-tendon terms, and it has no shell term, so it refuses a scene that holds shell elements rather
+        than return a number that is quietly missing most of the energy."""
+        if self.n_triangles > 0 or self.n_stencils > 0:
+            gs.raise_exception(
+                "compute_energy has no shell term, so it would under-report a scene with triangles or bending "
+                "stencils. Read the tissue diagnostics instead, or add the shell energy to _kernel_compute_energy."
+            )
         self._kernel_compute_energy(f)
         if self._n_constraints > 0:
             self._kernel_constraint_energy(f)
@@ -3242,6 +3472,14 @@ class VBDSolver(Solver):
     @property
     def n_elements(self):
         return sum(entity.n_elements for entity in self._entities)
+
+    @property
+    def n_triangles(self):
+        return sum(entity.n_triangles for entity in self._entities)
+
+    @property
+    def n_stencils(self):
+        return sum(entity.n_stencils for entity in self._entities)
 
     @property
     def n_vverts(self):

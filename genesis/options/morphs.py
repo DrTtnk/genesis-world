@@ -941,6 +941,44 @@ class TetMesh(Morph):
         return self
 
 
+class TriMesh(Morph):
+    """
+    Morph built from an explicit triangle mesh, for a VBD shell entity: no tetrahedralization, and the
+    triangles are both the simulated elements and the render mesh.
+
+    Parameters
+    ----------
+    verts : array_like, shape (n_vertices, 3)
+        Rest position of each vertex, in metres.
+    faces : array_like, shape (n_faces, 3)
+        Zero-based vertex index of each triangle, wound consistently across the mesh.
+    """
+
+    verts: NDArrayType
+    faces: NDArrayType
+
+    @model_validator(mode="after")
+    def _check_mesh(self) -> Self:
+        verts = np.asarray(self.verts)
+        faces = np.asarray(self.faces)
+
+        if verts.ndim != 2 or verts.shape[1] != 3:
+            gs.raise_exception(f"`verts` must have shape (n_vertices, 3), got {verts.shape}.")
+        if not np.isfinite(verts).all():
+            gs.raise_exception("`verts` contains a non-finite value.")
+
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            gs.raise_exception(f"`faces` must have shape (n_faces, 3), got {faces.shape}.")
+        if faces.dtype.kind not in "iu":
+            gs.raise_exception(f"`faces` must be an integer array, got dtype {faces.dtype}.")
+        if faces.size and ((faces < 0).any() or (faces >= len(verts)).any()):
+            gs.raise_exception("`faces` has an index out of range of `verts`.")
+
+        self.verts = verts
+        self.faces = faces
+        return self
+
+
 ############################ Rigid & Articulated ############################
 
 

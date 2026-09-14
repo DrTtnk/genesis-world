@@ -9,6 +9,7 @@ import genesis as gs
 import genesis.utils.element as eu
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
+import genesis.utils.shell as su
 from genesis.engine.states.cache import QueriedStates
 from genesis.engine.states.entities import VBDEntityState
 from genesis.repr_base import RBC
@@ -119,6 +120,8 @@ class VBDEntity(Entity):
         idx,
         v_start=0,
         el_start=0,
+        tri_start=0,
+        bend_start=0,
         vvert_start=0,
         vface_start=0,
         muscle_group_start=0,
@@ -128,9 +131,13 @@ class VBDEntity(Entity):
 
         self._v_start = v_start  # offset for vertex index of elements
         self._el_start = el_start  # offset for element index
+        self._tri_start = tri_start  # offset for shell triangle index
+        self._bend_start = bend_start  # offset for shell bending stencil index
         self._vvert_start = vvert_start  # offset for render vertices
         self._vface_start = vface_start  # offset for render faces
         self._muscle_group_start = muscle_group_start
+        self._n_triangles = 0
+        self._n_stencils = 0
         self._step_global_added = None
         self._distance_constraints = np.zeros((0, 2), dtype=gs.np_int)
         self._distance_bounds = np.zeros((0, 2), dtype=gs.np_float)
@@ -184,6 +191,27 @@ class VBDEntity(Entity):
         self._n_vertices = len(init_positions)
         self._n_elements = len(elems)
 
+    def instantiate_shell(self, verts, tris):
+        """
+        Initialize a shell VBD entity with explicit vertices and triangles: no thickness, no tetrahedra.
+        The rest membrane frame and the bending stencils of every shared edge are computed here, once, from
+        the rest positions.
+
+        Parameters
+        ----------
+        verts : np.ndarray
+            Array of vertex positions with shape (n_vertices, 3).
+        tris : np.ndarray
+            Array of triangles indexing into verts, with shape (n_triangles, 3).
+        """
+        self.instantiate(verts, np.zeros((0, 4), dtype=gs.np_int))
+        positions = tensor_to_array(self.init_positions, dtype=gs.np_float)
+        self.tris = tris.astype(gs.np_int, copy=False)
+        self._n_triangles = len(self.tris)
+        self._tri_area_rest, self._tri_B_rest = su.triangle_rest_frames(positions, self.tris)
+        self._bend_v, self._bend_c, self._bend_w, self._bend_kx_rest = su.bending_stencils(positions, self.tris)
+        self._n_stencils = len(self._bend_v)
+
     def sample(self):
         """
         Build the entity's visual geoms and simulation mesh from its morph.
@@ -196,6 +224,22 @@ class VBDEntity(Entity):
         A `TetMesh` morph carries its own tetrahedral connectivity. It skips tetrahedralization and welding: its
         `verts`, `elems` and `faces` pass through to `instantiate` and the render mesh unchanged.
         """
+        if isinstance(self._morph, gs.options.morphs.TriMesh):
+            vmesh = gs.Mesh.from_attrs(verts=self._morph.verts, faces=self._morph.faces, surface=self._surface)
+            self._vgeoms = gs.List(
+                [
+                    VBDVisGeom(
+                        entity=self,
+                        vvert_start=self._vvert_start,
+                        vface_start=self._vface_start,
+                        vmesh=vmesh,
+                        sim_verts_idx=np.arange(len(self._morph.verts), dtype=gs.np_int),
+                    )
+                ]
+            )
+            self.instantiate_shell(self._morph.verts, self._morph.faces)
+            return
+
         if isinstance(self._morph, gs.options.morphs.TetMesh):
             vmesh = gs.Mesh.from_attrs(verts=self._morph.verts, faces=self._morph.faces, surface=self._surface)
             self._vgeoms = gs.List(
@@ -265,30 +309,34 @@ class VBDEntity(Entity):
             )
 
         verts_numpy = tensor_to_array(self.init_positions, dtype=gs.np_float)
-        elems_np = self.elems.astype(gs.np_int, copy=False)
 
-        p0 = verts_numpy[elems_np[:, 0]]
-        p1 = verts_numpy[elems_np[:, 1]]
-        p2 = verts_numpy[elems_np[:, 2]]
-        p3 = verts_numpy[elems_np[:, 3]]
-        Dm = np.stack([p1 - p0, p2 - p0, p3 - p0], axis=-1)
-        total_rest_volume = np.abs(np.linalg.det(Dm)).sum() / 6.0
+        if isinstance(self.material, gs.materials.VBD.Shell):
+            self._add_shell_to_solver(verts_numpy)
+        else:
+            elems_np = self.elems.astype(gs.np_int, copy=False)
 
-        gain = self.material.gain if isinstance(self.material, gs.materials.VBD.Muscle) else 0.0
+            p0 = verts_numpy[elems_np[:, 0]]
+            p1 = verts_numpy[elems_np[:, 1]]
+            p2 = verts_numpy[elems_np[:, 2]]
+            p3 = verts_numpy[elems_np[:, 3]]
+            Dm = np.stack([p1 - p0, p2 - p0, p3 - p0], axis=-1)
+            total_rest_volume = np.abs(np.linalg.det(Dm)).sum() / 6.0
 
-        self._solver._kernel_add_elements(
-            v_start=self._v_start,
-            el_start=self._el_start,
-            verts=verts_numpy,
-            elems=elems_np,
-            mass=float(self.material.rho * total_rest_volume / self.n_vertices),
-            mu=self.material.mu,
-            lam=self.material.lam,
-            gain=gain,
-            mu_forward=self.material.mu_forward,
-            mu_backward=self.material.mu_backward,
-            mu_lateral=self.material.mu_lateral,
-        )
+            gain = self.material.gain if isinstance(self.material, gs.materials.VBD.Muscle) else 0.0
+
+            self._solver._kernel_add_elements(
+                v_start=self._v_start,
+                el_start=self._el_start,
+                verts=verts_numpy,
+                elems=elems_np,
+                mass=float(self.material.rho * total_rest_volume / self.n_vertices),
+                mu=self.material.mu,
+                lam=self.material.lam,
+                gain=gain,
+                mu_forward=self.material.mu_forward,
+                mu_backward=self.material.mu_backward,
+                mu_lateral=self.material.mu_lateral,
+            )
 
         for vgeom in self._vgeoms:
             # A vgeom without a texture carries no UVs; an empty array leaves its slice of the solver buffer zeroed.
@@ -305,6 +353,35 @@ class VBDEntity(Entity):
             )
 
         self.active = True
+
+    def _add_shell_to_solver(self, verts_numpy):
+        """Vertex mass from triangle area times thickness times density, split evenly over each triangle's
+        three corners, then the triangle and bending-stencil tables themselves."""
+        thickness, rho = self.material.thickness, self.material.rho
+        mass = np.zeros(self.n_vertices, dtype=gs.np_float)
+        corner_mass = np.repeat((self._tri_area_rest * thickness * rho / 3.0).astype(gs.np_float), 3)
+        np.add.at(mass, self.tris.reshape(-1), corner_mass)
+
+        self._solver._kernel_add_shell_elements(
+            v_start=self._v_start,
+            tri_start=self._tri_start,
+            bend_start=self._bend_start,
+            verts=verts_numpy,
+            mass=mass,
+            tris=self.tris,
+            tri_area_rest=self._tri_area_rest,
+            tri_B_rest=self._tri_B_rest.reshape(-1, 4),
+            mu=self.material.mu,
+            lam=self.material.lam,
+            mu_forward=self.material.mu_forward,
+            mu_backward=self.material.mu_backward,
+            mu_lateral=self.material.mu_lateral,
+            bend_v=self._bend_v,
+            bend_c=self._bend_c,
+            bend_w=self._bend_w,
+            bend_kx_rest=self._bend_kx_rest,
+            bending_stiffness=self.material.bending_stiffness,
+        )
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- basic entity ops -------------------------------
@@ -692,6 +769,26 @@ class VBDEntity(Entity):
     def el_start(self):
         """Global element index offset for this entity."""
         return self._el_start
+
+    @property
+    def n_triangles(self):
+        """Number of shell triangles in the VBD entity, 0 for a tetrahedral entity."""
+        return self._n_triangles
+
+    @property
+    def n_stencils(self):
+        """Number of shell bending stencils in the VBD entity, 0 for a tetrahedral entity."""
+        return self._n_stencils
+
+    @property
+    def tri_start(self):
+        """Global triangle index offset for this entity."""
+        return self._tri_start
+
+    @property
+    def bend_start(self):
+        """Global bending-stencil index offset for this entity."""
+        return self._bend_start
 
     @property
     def n_vverts(self):

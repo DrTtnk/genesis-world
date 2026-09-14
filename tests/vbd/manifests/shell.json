@@ -1,0 +1,18 @@
+{
+  "note": "Frozen budgets for the shell elements. Measured on 2026-09-14 on the CPU float64 backend. The corrugated tube is the reason the shell exists: a pleated wall must open by unfolding, not by stretching its material, because a gut that reaches 80 cm by stretching would need twelve times its circumference in material strain and would thin to foil. Written before the measurement, then set from it.",
+  "corrugated_tube": {
+    "geometry": "16 pleats around, 9 rings along, pleat amplitude 0.008 m on a 0.02 m mean radius, opened by a growing capsule bolus over 200 steps and settled for 200 more",
+    "radius_growth": {
+      "note": "lower bound. The lumen must actually open, or the test proves nothing.",
+      "measured": 1.0,
+      "measured_lumen_radius_m": [0.012, 0.024],
+      "minimum": 0.5
+    },
+    "area_growth": {
+      "note": "upper bound, and the point of the whole element type. The measurement is 0.000 to six figures: the pleats unfold and the material does not stretch at all. A fraction of a percent is allowed for the settling motion; anything above that means the wall is stretching and the shell is buying nothing over a tet wall.",
+      "measured": 0.0,
+      "measured_total_area_m2": [0.060248, 0.060248],
+      "maximum": 0.02
+    }
+  }
+}
