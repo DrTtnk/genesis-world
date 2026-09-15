@@ -436,7 +436,8 @@ def test_the_replay_buffer_reproduces_the_forward_states(show_viewer):
     solver = scene.vbd_solver
     solver._kernel_predict(0)
     predicted = solver.verts.pos.to_numpy()[1].copy()
-    solver._kernel_sweeps(0)
+    for _sweep in range(solver._n_iterations):
+        solver._kernel_sweeps(0, _sweep)
     for sweep in reversed(range(4)):
         for c in reversed(range(solver.n_colors)):
             solver._kernel_undo_sweep(0, sweep, solver.color_offsets[c], solver.color_offsets[c + 1])

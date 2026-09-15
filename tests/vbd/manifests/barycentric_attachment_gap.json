@@ -1,0 +1,4 @@
+{
+  "note": "Placeholder written before measurement; test_vbd_barycentric_attachment.py freezes the real budget from the measured floor times 1.5 to 2, per AVBD_PORT_REQUIREMENTS.md's 2e-4 m hard-attachment gate.",
+  "surface_anchor_gap_budget_m": 2e-4
+}

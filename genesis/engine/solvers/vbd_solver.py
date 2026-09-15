@@ -49,6 +49,7 @@ from genesis.engine.solvers.vbd_contact import (
 from genesis.engine.solvers.vbd_rigid import func_attachment_soft_system
 from genesis.engine.solvers.vbd_rigid_attachment import (
     VBDRigidAttachment,
+    func_attachment_point,
     func_attachment_pose,
     func_solve_attachment_link,
     func_update_attachment_dual,
@@ -434,7 +435,16 @@ class VBDSolver(Solver):
         # deformation gradient (`genesis/utils/shell.py`, proved in `verify_avbd_shell_math.py`). `B_rest` is
         # the 2x2 rest edge matrix inverse, in an orthonormal frame of the rest triangle's own plane.
         qd_mat2 = qd.types.matrix(2, 2, gs.qd_float)
-        struct_tri_info = qd.types.struct(v=gs.qd_ivec3, area_rest=gs.qd_float, B_rest=qd_mat2, mu=gs.qd_float, lam=gs.qd_float)
+        struct_tri_info = qd.types.struct(
+            v=gs.qd_ivec3,
+            area_rest=gs.qd_float,
+            B_rest=qd_mat2,
+            mu=gs.qd_float,
+            lam=gs.qd_float,
+            # columns of F at rest, which the Rayleigh damping's rest Hessian needs and nothing else does
+            f0_rest=gs.qd_vec3,
+            f1_rest=gs.qd_vec3,
+        )
         self.tri_info = struct_tri_info.field(shape=(max(self._n_triangles, 1),), layout=qd.Layout.SOA)
 
         # Shell bending: one quadratic stencil per interior edge, `E = w/2 |K x - K x_rest|^2` with `K x =
@@ -694,8 +704,11 @@ class VBDSolver(Solver):
             self._init_angle_constraints(acons, alo, ahi)
             if self._damping > 0.0:
                 for entity in self._entities:
+                    # The membrane rest block is positive semidefinite at every Poisson ratio (its mu part is a
+                    # Kronecker product of the weight Gram matrix with the in-plane projector, its lam part a Gram
+                    # matrix), so the tet's nu >= 1/8 condition does not apply to a shell.
                     if isinstance(entity.material, gs.materials.VBD.Shell):
-                        gs.raise_exception("Rayleigh damping is not implemented for shell elements.")
+                        continue
                     # K0 (the rest Hessian) is positive semidefinite only for lam' >= mu / 3, i.e. nu >= 1/8
                     if entity.material.nu < 0.125:
                         gs.raise_exception(
@@ -749,7 +762,9 @@ class VBDSolver(Solver):
                 )
             if (self._n_triangles or self._n_stencils) and self._sim.requires_grad:
                 gs.raise_exception("Shell elements have no adjoint yet, so they cannot be used with requires_grad.")
-            attached_entities = [entity for entity in self._entities if entity._rigid_links]
+            attached_entities = [
+                entity for entity in self._entities if entity._rigid_links or entity._barycentric_links
+            ]
             if attached_entities:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
             if self._contact_rules:
@@ -1025,6 +1040,21 @@ class VBDSolver(Solver):
             )
             self.tri_info[i_t].mu = mu
             self.tri_info[i_t].lam = lam
+            e0 = qd.Vector(
+                [verts[tris[i_t_, 1], 0] - verts[tris[i_t_, 0], 0],
+                 verts[tris[i_t_, 1], 1] - verts[tris[i_t_, 0], 1],
+                 verts[tris[i_t_, 1], 2] - verts[tris[i_t_, 0], 2]],
+                dt=gs.qd_float,
+            )
+            e1 = qd.Vector(
+                [verts[tris[i_t_, 2], 0] - verts[tris[i_t_, 0], 0],
+                 verts[tris[i_t_, 2], 1] - verts[tris[i_t_, 0], 1],
+                 verts[tris[i_t_, 2], 2] - verts[tris[i_t_, 0], 2]],
+                dt=gs.qd_float,
+            )
+            B0 = self.tri_info[i_t].B_rest
+            self.tri_info[i_t].f0_rest = e0 * B0[0, 0] + e1 * B0[1, 0]
+            self.tri_info[i_t].f1_rest = e0 * B0[0, 1] + e1 * B0[1, 1]
 
         # The bending coefficients c, weight w and Kx_rest also come from `genesis/utils/shell.py`, an exact
         # transcription of the spike's `bending_coefficients`, `bending_weight` and `Kx_rest`: an SVD null
@@ -1188,6 +1218,16 @@ class VBDSolver(Solver):
         return w
 
     @qd.func
+    def _func_vertex_weight2_static(self, B, role: qd.template()):
+        """`_func_vertex_weight2` for a compile-time `role`, as the damping's static neighbour loop needs."""
+        w = qd.Vector.zero(gs.qd_float, 2)
+        if qd.static(role == 0):
+            w = -(B[0, :] + B[1, :])
+        else:
+            w = B[role - 1, :]
+        return w
+
+    @qd.func
     def _func_vertex_weight2(self, B, role):
         """`_func_vertex_weight` for the 2x2 rest matrix of a shell triangle: row of `B` for local vertex
         `role` in {1, 2}, vertex 0 (role 0) carrying minus the sum of the other rows."""
@@ -1307,6 +1347,17 @@ class VBDSolver(Solver):
             force -= qd.cast(A0 * (P @ w), self._acc)
             K += qd.cast(A0 * mu * w.norm_sqr(), self._acc) * qd.Matrix.identity(self._acc, 3)
             K += qd.cast(A0 * lam, self._acc) * q.outer_product(q)
+            if qd.static(self._damping > 0.0):
+                w0 = self._func_vertex_weight2(Bm, role)
+                K0 += qd.cast(self._func_rest_block2(i_t, w0, w0), self._acc)
+                for r in qd.static(range(3)):
+                    if r != role:
+                        j = v[r]
+                        d_j = self.verts[f + 1, j, i_b].pos - self.verts[f, j, i_b].pos
+                        damp += qd.cast(
+                            self._func_rest_block2(i_t, w0, self._func_vertex_weight2_static(Bm, r)) @ d_j,
+                            self._acc,
+                        )
 
         # Shell bending: E = w/2 |K x - K x_rest|^2, K x = sum_i c_i x_i over the stencil's four vertices.
         # grad_i = w c_i (K x - K x_rest), H_ii = w c_i^2 I exactly (verify_avbd_shell_math.py): a scalar
@@ -1472,11 +1523,19 @@ class VBDSolver(Solver):
                     qd.Matrix.identity(gs.qd_float, 3) - n_b.outer_product(n_b), self._acc
                 )
         if qd.static(self.has_rigid_attachment):
-            i_a = self.rigid_attachment.vertex_attachment[i_v]
-            if i_a >= 0:
+            # A vertex reaches its attachments through the same CSR vbd_mtu.py uses for a routed anchor: weight w on
+            # the force, w^2 on the curvature block, so a plain vertex attachment (weight 1) is unchanged and a
+            # barycentric one (weight < 1) carries its fair share.
+            for slot in range(
+                self.rigid_attachment.vert_anchor_offset[i_v], self.rigid_attachment.vert_anchor_offset[i_v + 1]
+            ):
+                i_a = self.rigid_attachment.vert_anchor[slot] // 4
+                corner = self.rigid_attachment.vert_anchor[slot] % 4
+                weight = self.rigid_attachment.info[i_a].weights[corner]
                 pos, quat = func_attachment_pose(i_a, i_b, self.rigid_attachment)
+                point = func_attachment_point(f + 1, i_a, i_b, self, self.rigid_attachment)
                 force_a, hessian_a = func_attachment_soft_system(
-                    x,
+                    point,
                     pos,
                     quat,
                     self.rigid_attachment.info[i_a].local_pos,
@@ -1485,8 +1544,8 @@ class VBDSolver(Solver):
                     self.rigid_attachment.previous_error[i_a, i_b],
                     self.rigid_attachment.alpha,
                 )
-                force += qd.cast(force_a, self._acc)
-                H += qd.cast(hessian_a, self._acc)
+                force += qd.cast(weight * force_a, self._acc)
+                H += qd.cast(weight * weight * hessian_a, self._acc)
         if qd.static(self.has_contact):
             force_c, hessian_c = func_contact_vertex_terms(f, i_v, i_b, self, self.contact)
             force += qd.cast(force_c, self._acc)
@@ -1496,6 +1555,33 @@ class VBDSolver(Solver):
             force += qd.cast(force_m, self._acc)
             H += qd.cast(hessian_m, self._acc)
         return force, H, K0
+
+    @qd.func
+    def _func_rest_block2(self, i_t, w_i, w_j):
+        """Block of shell triangle i_t's exact energy Hessian at rest between the vertices with in-plane weights w_i
+        and w_j, the matrix the Rayleigh damping uses. With u = F_rest w and n the unit rest normal,
+
+            A0 [ mu (w_i . w_j) (I - n n^T) + lam u_i u_j^T + mu [u_i x u_j]_x ],
+
+        derived and checked against autograd on random triangles, for all nine blocks, in
+        `verify_avbd_shell_math.py` (`membrane_rest_block`). At rest F is an isometry, so J = 1 and J - alpha =
+        -mu / lam, which is where the in-plane projector and the cross term come from. Symmetric part positive
+        semidefinite at every Poisson ratio, and zero on rigid motions, so damping never brakes a coiling gut.
+        Bending is deliberately left out: its quadratic model is not rotation invariant about a curved rest, so its
+        Hessian does not annihilate a rotation (same spike)."""
+        A0 = self.tri_info[i_t].area_rest
+        mu = self.tri_info[i_t].mu
+        lam = self.tri_info[i_t].lam
+        f0 = self.tri_info[i_t].f0_rest
+        f1 = self.tri_info[i_t].f1_rest
+        n = f0.cross(f1)
+        u_i = f0 * w_i[0] + f1 * w_i[1]
+        u_j = f0 * w_j[0] + f1 * w_j[1]
+        blk = A0 * mu * w_i.dot(w_j) * (qd.Matrix.identity(gs.qd_float, 3) - n.outer_product(n))
+        blk += A0 * lam * u_i.outer_product(u_j)
+        c = u_i.cross(u_j)  # zero on the diagonal block
+        blk += A0 * mu * qd.Matrix([[0.0, -c[2], c[1]], [c[2], 0.0, -c[0]], [-c[1], c[0], 0.0]])
+        return blk
 
     @qd.func
     def _func_rest_block(self, i_e, w_i, w_j):
@@ -1668,23 +1754,36 @@ class VBDSolver(Solver):
         )
 
     @qd.kernel
-    def _kernel_sweeps(self, f: qd.i32):
-        for sweep in qd.static(range(self._n_iterations)):
+    def _kernel_sweeps(self, f: qd.i32, sweep: qd.i32):
+        """One sweep. The sweep index is a runtime argument and Python drives the loop, so the body is
+        transformed once instead of `n_iterations` times.
+
+        It cannot be a loop inside the kernel: the colour passes below are top-level `ndrange` loops, which is
+        what makes them parallel with an implicit barrier between them, and wrapping them in an outer loop would
+        serialise the whole solve. So the choice is `n_iterations` inlined copies of this body or `n_iterations`
+        kernel launches. The launches cost a few microseconds each against a step of about a millisecond, while
+        the inlining costs about 4.6 seconds of Quadrants front-end work per sweep on every process start.
+        """
+        if True:
             self._func_sweep(f, sweep)
             if qd.static(self.has_rigid_attachment):
+                # one block per free body, in order: the bodies couple only through the soft elements, so this
+                # is Gauss-Seidel over blocks and a later body already sees the earlier one's new pose
                 for i_b in range(self._B):
                     if not self.env_failed[i_b]:
-                        func_solve_attachment_link(f, i_b, self, self.rigid_attachment)
+                        for i_f in range(self.rigid_attachment.n_free):
+                            func_solve_attachment_link(f, i_f, i_b, self, self.rigid_attachment)
                 for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
                     if not self.env_failed[i_b]:
                         func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
             # the pairs restart from zero next substep, so the dual update after the last sweep would only skew
             # the reported reactions away from the forces the sweep applied
-            if qd.static(self.has_contact and sweep < self._n_iterations - 1):
-                func_contact_dual_update(f, self._constraint_dual_relaxation, self, self.contact)
+            if qd.static(self.has_contact):
+                if sweep < self._n_iterations - 1:
+                    func_contact_dual_update(f, self._constraint_dual_relaxation, self, self.contact)
 
     @qd.func
-    def _func_sweep(self, f, sweep: qd.template()):
+    def _func_sweep(self, f, sweep):
         """One Gauss-Seidel sweep. Each top-level loop is a serial task with an implicit
         barrier after it, so the statically unrolled color loops are race-free without a Python round trip. The
         constraints' dual updates ride inside the color pass of their owner vertex (see `_owner_csr`): a pass of
@@ -1996,7 +2095,8 @@ class VBDSolver(Solver):
                     f, self, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config
                 )
             else:
-                self._kernel_sweeps(f)
+                for sweep in range(self._n_iterations):
+                    self._kernel_sweeps(f, sweep)
             return
         # The force scale of this substep: the imbalance left at the predicted position, floored by the body's own
         # weight so that a body already at rest still has a finite scale. An absolute newton tolerance is meaningless

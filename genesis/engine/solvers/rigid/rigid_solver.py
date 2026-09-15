@@ -1438,10 +1438,19 @@ class RigidSolver(KinematicSolver):
         is_articulated = self.n_dofs > 0 and all(
             joint.type in (gs.JOINT_TYPE.FIXED, gs.JOINT_TYPE.REVOLUTE) for joint in self.joints
         )
+        # Several free bodies held together by soft tissue is the anatomical case: bones with no joint between
+        # them, connected by ligaments, muscles and flesh, kept apart by articular contact. Each free body owns
+        # its own 6x6 block and they couple only through those elements, so the coupled solve is one block per
+        # body in Gauss-Seidel order. Fixed links may share the scene; anything else may not.
         free_joints = [joint for joint in self.joints if joint.type == gs.JOINT_TYPE.FREE]
-        is_free = len(free_joints) == 1 and self.n_dofs == 6 and self.n_qs == 7
+        is_free = (
+            len(free_joints) >= 1
+            and all(joint.type in (gs.JOINT_TYPE.FIXED, gs.JOINT_TYPE.FREE) for joint in self.joints)
+            and self.n_dofs == 6 * len(free_joints)
+            and self.n_qs == 7 * len(free_joints)
+        )
         if not is_articulated and not is_free:
-            gs.raise_exception("VBD rigid coupling requires one free link or fixed-base revolute joints.")
+            gs.raise_exception("VBD rigid coupling requires free links or fixed-base revolute joints.")
         if self._requires_grad or self._use_hibernation or self.n_equalities:
             gs.raise_exception("VBD rigid ownership requires forward dynamics without hibernation or equalities.")
         if self._enable_collision or self._integrator != gs.integrator.Euler:
@@ -1451,8 +1460,12 @@ class RigidSolver(KinematicSolver):
         if (self.get_dofs_frictionloss() != 0).any():
             gs.raise_exception("VBD rigid ownership does not support joint frictionloss.")
         if not is_articulated:
-            if np.linalg.norm(free_joints[0].link.inertial_pos) > gs.EPS:
-                gs.raise_exception("VBD free-link ownership requires the link origin at its centre of mass.")
+            for joint in free_joints:
+                if np.linalg.norm(joint.link.inertial_pos) > gs.EPS:
+                    gs.raise_exception(
+                        f"VBD free-link ownership requires the link origin at its centre of mass; "
+                        f"link {joint.link.name} has it at {joint.link.inertial_pos}."
+                    )
             if (self.get_dofs_armature() != 0).any() or (self.get_dofs_damping() != 0).any():
                 gs.raise_exception("The VBD free-link spike requires zero armature and joint damping.")
         if self._has_vbd_ownership:

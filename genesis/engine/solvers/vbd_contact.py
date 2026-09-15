@@ -89,9 +89,16 @@ class VBDContact:
         cv_kind, cv_ref, cv_group, cv_owner, triangles, edges = [], [], [], [], [], []
         rv_link, rv_local = [], []
         for entity in entities:
-            elems = entity.elems.astype(np.int64)
-            faces, tets_idx, _ = igl.boundary_facets(elems)
-            faces = self._oriented_outward(faces, elems[tets_idx], tensor_to_array(entity.init_positions))
+            if entity.n_triangles:
+                # A shell is already a surface: its own triangles are the contact faces, and every vertex of
+                # it is on the boundary. There is no tetrahedron to wind the normal against, so the authored
+                # winding is the sign convention. The model must declare which side is the lumen; nothing here
+                # can infer it, and a wall wound inconsistently will push the wrong way.
+                faces = np.asarray(entity.tris, dtype=np.int64)
+            else:
+                elems = entity.elems.astype(np.int64)
+                faces, tets_idx, _ = igl.boundary_facets(elems)
+                faces = self._oriented_outward(faces, elems[tets_idx], tensor_to_array(entity.init_positions))
             boundary, faces_local = np.unique(faces.reshape(-1), return_inverse=True)
             base = len(cv_kind)
             cv_kind.extend([0] * len(boundary))
@@ -153,7 +160,9 @@ class VBDContact:
         if self.n_rv:
             self.link_rv.from_numpy(order.astype(gs.np_int))
         # dof_moves_link[i_d, i_l]: the hinge coordinate i_d lies between link i_l and the root
-        moves = np.zeros((max(rigid.n_dofs, 1), rigid.n_links), dtype=gs.np_int)
+        # both dimensions are floored at one: a scene whose only contact is tissue against tissue has no
+        # rigid link and no rigid dof, and a zero-width field is refused by the backend
+        moves = np.zeros((max(rigid.n_dofs, 1), max(rigid.n_links, 1)), dtype=gs.np_int)
         for link in rigid.links:
             i_l = link.idx
             while True:
@@ -242,8 +251,9 @@ class VBDContact:
         self.prescribed_target = pose_type.field(shape=(max(self.n_prescribed, 1), solver._B), layout=qd.Layout.SOA)
         # wrench (world force, world torque about the link origin) the tissue applies to each collider link, and its
         # time integral since the last clear, accumulated every substep so a caller can balance momentum
-        self.link_reaction = qd.Vector.field(6, dtype=qd.f64, shape=(solver.sim.rigid_solver.n_links, solver._B))
-        self.link_impulse = qd.Vector.field(6, dtype=qd.f64, shape=(solver.sim.rigid_solver.n_links, solver._B))
+        n_links = max(solver.sim.rigid_solver.n_links, 1)  # a tissue-only contact scene has no rigid link
+        self.link_reaction = qd.Vector.field(6, dtype=qd.f64, shape=(n_links, solver._B))
+        self.link_impulse = qd.Vector.field(6, dtype=qd.f64, shape=(n_links, solver._B))
 
     @staticmethod
     def _relative_pose(entity, link):

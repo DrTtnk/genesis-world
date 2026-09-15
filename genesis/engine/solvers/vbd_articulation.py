@@ -14,7 +14,7 @@ from genesis.engine.solvers.vbd_contact import (
     func_refresh_rigid_vertices,
 )
 from genesis.engine.solvers.vbd_mtu import func_mtu_dof_terms, func_refresh_mtu_anchors
-from genesis.engine.solvers.vbd_rigid_attachment import func_update_attachment_dual
+from genesis.engine.solvers.vbd_rigid_attachment import func_attachment_point, func_update_attachment_dual
 from genesis.utils.array_class import DynInfo, DynState, RigidInfo
 
 
@@ -35,8 +35,8 @@ def kernel_sweeps_articulation(
                     f, i_b, solver, solver.rigid_attachment, dyn_state, dyn_info, rigid_info, rigid_config
                 )
                 for i_l in range(solver.rigid_attachment.rigid.n_links):
-                    solver.rigid_attachment.articulation_pose[i_l, i_b].pos = dyn_state.links.pos[i_l, i_b]
-                    solver.rigid_attachment.articulation_pose[i_l, i_b].quat = dyn_state.links.quat[i_l, i_b]
+                    solver.rigid_attachment.link_pose[i_l, i_b].pos = dyn_state.links.pos[i_l, i_b]
+                    solver.rigid_attachment.link_pose[i_l, i_b].quat = dyn_state.links.quat[i_l, i_b]
         for i_a, i_b in qd.ndrange(solver.rigid_attachment.n_attachments, solver._B):
             if not solver.env_failed[i_b]:
                 func_update_attachment_dual(f, i_a, i_b, solver, solver.rigid_attachment)
@@ -62,7 +62,7 @@ def kernel_begin_articulation(
                 anchor = gu.qd_transform_by_trans_quat(
                     attachment.info[i_a].local_pos, dyn_state.links.pos[i_l, i_b], dyn_state.links.quat[i_l, i_b]
                 )
-                attachment.previous_error[i_a, i_b] = solver.verts[f, attachment.info[i_a].vertex, i_b].pos - anchor
+                attachment.previous_error[i_a, i_b] = func_attachment_point(f, i_a, i_b, solver, attachment) - anchor
                 attachment.state[i_a, i_b].multiplier *= attachment.alpha * attachment.gamma
                 attachment.state[i_a, i_b].stiffness = qd.max(
                     solver._k_start, attachment.gamma * attachment.state[i_a, i_b].stiffness
@@ -83,8 +83,8 @@ def kernel_begin_articulation(
                 rigid_info.qpos[i_q, i_b] = predicted
             func_forward_kinematics_batch(i_b, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=False)
             for i_l in range(attachment.rigid.n_links):
-                attachment.articulation_pose[i_l, i_b].pos = dyn_state.links.pos[i_l, i_b]
-                attachment.articulation_pose[i_l, i_b].quat = dyn_state.links.quat[i_l, i_b]
+                attachment.link_pose[i_l, i_b].pos = dyn_state.links.pos[i_l, i_b]
+                attachment.link_pose[i_l, i_b].quat = dyn_state.links.quat[i_l, i_b]
 
 
 @qd.func
@@ -128,7 +128,7 @@ def func_solve_articulation_batch(
                     dyn_state.links.quat[i_l, i_b],
                 )
                 error = (
-                    solver.verts[f + 1, attachment.info[i_a].vertex, i_b].pos
+                    func_attachment_point(f + 1, i_a, i_b, solver, attachment)
                     - anchor
                     - attachment.alpha * attachment.previous_error[i_a, i_b]
                 )

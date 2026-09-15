@@ -145,6 +145,9 @@ class VBDEntity(Entity):
         self._angle_bounds = np.zeros((0, 2), dtype=gs.np_float)
         self._rigid_links = []
         self._rigid_vertices_idx = np.empty(0, dtype=gs.np_int)
+        self._barycentric_links = []
+        self._barycentric_verts = np.empty((0, 4), dtype=gs.np_int)
+        self._barycentric_weights = np.empty((0, 4), dtype=gs.np_float)
         self.sample()
 
         self.init_tgt_vars()
@@ -185,6 +188,26 @@ class VBDEntity(Entity):
 
         if not init_positions.shape[0] > 0:
             gs.raise_exception("Entity has zero vertices.")
+
+        # A tetrahedron with a non-positive rest volume has an inverted or singular rest frame, so `B_rest` is
+        # the inverse of a left-handed or degenerate matrix and every deformation gradient built from it is
+        # reflected. Nothing downstream notices: energies and forces stay finite and the simulation diverges
+        # somewhere far away, which reads as an engine defect rather than a bad input. Refuse it here, where the
+        # value enters.
+        if len(elems):
+            corners = init_positions[elems]
+            rest_volume = np.einsum(
+                "ij,ij->i",
+                np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]),
+                corners[:, 3] - corners[:, 0],
+            ) / 6.0
+            bad = np.flatnonzero(rest_volume <= 0.0)
+            if len(bad):
+                gs.raise_exception(
+                    f"{len(bad)} of {len(elems)} tetrahedra have a negative rest volume or are degenerate; "
+                    f"element {bad[0]} has volume {rest_volume[bad[0]]:.3e} m^3. Wind each tetrahedron so that "
+                    f"(v1 - v0) x (v2 - v0) . (v3 - v0) is positive."
+                )
 
         self.init_positions = gs.tensor(init_positions)
         self.elems = elems
@@ -541,6 +564,65 @@ class VBDEntity(Entity):
         self._rigid_links.extend([link] * len(vertices_idx))
         self._rigid_vertices_idx = combined
 
+    def add_barycentric_attachments(self, anchors, link):
+        """Attach material points to a rigid link with the same two-way augmented-Lagrangian force as
+        `add_rigid_attachments`, one point per anchor.
+
+        Each anchor is a `SurfaceAnchor` (one triangle of this entity and three barycentric weights) or a
+        `TissueAnchor` (four of this entity's vertices and four barycentric weights), from `vbd_mtu`. The bound
+        point is the weighted sum of its vertices, C = sum_j w_j x_j - (link_pos + R local); a vertex weighted
+        1 is exactly `add_rigid_attachments` on that vertex. Only tissue point to rigid link is supported: an
+        anchor naming another entity, a shell-to-shell or shell-to-tet binding, and a through-thickness offset
+        on a surface anchor (a shell carries no thickness, and the moment it would apply has no agreed
+        convention) are all out of scope and refused. Declare before scene.build().
+        """
+        from genesis.engine.solvers.vbd_mtu import SurfaceAnchor, TissueAnchor
+
+        if self._scene.is_built:
+            gs.raise_exception("Declare VBD barycentric attachments before scene.build().")
+        if link.entity.scene is not self._scene:
+            gs.raise_exception("The attached rigid link must belong to the same scene.")
+        if link.entity.solver is not self._sim.rigid_solver:
+            gs.raise_exception("The attachment target must belong to the rigid solver.")
+        verts, weights = [], []
+        for anchor in anchors:
+            if isinstance(anchor, SurfaceAnchor):
+                if anchor.entity is not self:
+                    gs.raise_exception("A surface anchor must name this entity: shell-to-tet and shell-to-shell "
+                                        "attachments are not supported.")
+                if len(anchor.weights) != 3:
+                    gs.raise_exception("A surface anchor needs three barycentric weights, one per triangle corner.")
+                if abs(sum(anchor.weights) - 1.0) > 1e-6:
+                    gs.raise_exception(f"The barycentric weights of a surface anchor sum to {sum(anchor.weights)}.")
+                if not 0 <= anchor.triangle < len(self.tris):
+                    gs.raise_exception(
+                        f"Surface anchor triangle {anchor.triangle} is outside the entity's "
+                        f"{len(self.tris)} triangles."
+                    )
+                triangle = self.tris[anchor.triangle]
+                verts.append(tuple(int(v) for v in triangle) + (int(triangle[0]),))
+                weights.append(tuple(float(w) for w in anchor.weights) + (0.0,))
+            elif isinstance(anchor, TissueAnchor):
+                if anchor.entity is not self:
+                    gs.raise_exception("A tissue anchor must name this entity: shell-to-tet and shell-to-shell "
+                                        "attachments are not supported.")
+                if len(anchor.vertices) != 4 or len(anchor.weights) != 4:
+                    gs.raise_exception("A tissue anchor needs four vertices and four barycentric weights.")
+                if abs(sum(anchor.weights) - 1.0) > 1e-6:
+                    gs.raise_exception(f"The barycentric weights of a tissue anchor sum to {sum(anchor.weights)}.")
+                verts.append(tuple(int(v) for v in anchor.vertices))
+                weights.append(tuple(float(w) for w in anchor.weights))
+            else:
+                gs.raise_exception(f"Unknown barycentric anchor {anchor!r}.")
+        verts = np.asarray(verts, dtype=gs.np_int).reshape(-1, 4)
+        if (verts < 0).any() or (verts >= self.n_vertices).any():
+            gs.raise_exception("A barycentric anchor must index this VBD entity's vertices.")
+        self._barycentric_verts = np.concatenate([self._barycentric_verts, verts])
+        self._barycentric_weights = np.concatenate(
+            [self._barycentric_weights, np.asarray(weights, dtype=gs.np_float)]
+        )
+        self._barycentric_links.extend([link] * len(verts))
+
     def add_distance_constraints(self, pairs, lo=None, hi=None):
         """
         Declare hard distance constraints between pairs of this entity's vertices. Without bounds the rest distance
@@ -642,7 +724,8 @@ class VBDEntity(Entity):
         pinned = np.asarray(pinned)
         if pinned.shape != (self.n_vertices,):
             gs.raise_exception(f"`pinned` should have shape ({self.n_vertices},), got {pinned.shape}.")
-        if pinned[self._rigid_vertices_idx].any():
+        touched = self._barycentric_verts[self._barycentric_weights != 0.0]
+        if pinned[self._rigid_vertices_idx].any() or (touched.size and pinned[touched].any()):
             gs.raise_exception("A physically attached vertex must remain free to transmit force.")
         self._solver._kernel_set_pinned(self._v_start, pinned.astype(gs.np_int))
 

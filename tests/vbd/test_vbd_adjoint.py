@@ -75,7 +75,8 @@ def test_jacobian_matches_finite_differences_of_the_residual(show_viewer, k_fibe
     scene.step()  # settle into contact
     _kick(scene, box, 0)
     solver._kernel_predict(0)
-    solver._kernel_sweeps(0)  # a generic, unconverged iterate: J is the Jacobian of r at any x
+    for _sweep in range(solver._n_iterations):
+        solver._kernel_sweeps(0, _sweep)  # a generic, unconverged iterate: J is the Jacobian of r at any x
     if constrained:
         mult = solver.cons_hist.mult.to_numpy()[1, :, 0]
         k_eff = solver.cons_hist.k_eff.to_numpy()[1, :, 0]
