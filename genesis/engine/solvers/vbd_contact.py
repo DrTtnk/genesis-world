@@ -66,6 +66,12 @@ class EnvStatus(NamedTuple):
 class VBDContact:
     def __init__(self, solver, entities, colliders, prescribed, rules):
         self.solver = solver
+        # Only a tissue whose collision group appears in a rule can collide. The others are left out of the
+        # contact vertex set entirely: they would find no pair, but the motion-bound guard would still hold them
+        # to the candidate margin per substep, and a fast connector between two falling bones has no business
+        # failing a contact step it can never take part in.
+        ruled = {group for rule in rules for group in rule[:2]}
+        entities = [entity for entity in entities if entity.material.collision_group in ruled]
         self.colliders = [link for link, _ in colliders]
         # a prescribed collider is a fixed-base rigid entity: every link's geoms collide, the base pose is driven
         colliders = list(colliders) + [(link, group) for entity, group, _ in prescribed for link in entity.links]

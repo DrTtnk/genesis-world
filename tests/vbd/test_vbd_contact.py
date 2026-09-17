@@ -996,3 +996,37 @@ def test_momentum_balances_gravity_and_the_reported_table_impulse(n_iterations, 
     # residual measured -3.91 percent of the weight at 4 sweeps against +0.49 percent at 8: the direction is not
     # stable across sweep counts, so only the magnitude is a property of the solver worth freezing.
     assert torch.isfinite(tissue.get_positions()).all()
+
+
+def test_a_tissue_outside_every_contact_rule_is_not_held_to_the_motion_bound():
+    """The motion-bound guard exists so that a colliding vertex cannot jump through a surface between two
+    candidate collections. A tissue whose collision group appears in no rule can never collide, so its speed is
+    not the guard's business: here such a tissue free-falls past the margin per substep while a second tissue
+    rests on a table under a rule, and the step must not fail."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-10.0),
+        show_viewer=False,
+    )
+    table = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.2, 0.2, 0.02), pos=(0.0, 0.0, -0.01), fixed=True),
+        material=gs.materials.Rigid(),
+    )
+    resting = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.0, 0.0, 0.0205), nobisect=False, maxvolume=1e-5),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1),
+    )
+    falling = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.5, 0.0, 0.5), nobisect=False, maxvolume=1e-5),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=0),
+    )
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=2)
+    scene.vbd_solver.add_contact_rule(1, 2, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.build()
+    # 0.3 s of free fall: 2.9 m/s, 5.9 mm per 2 ms substep, well past the 1 mm margin
+    for _ in range(150):
+        scene.step()
+    dropped = 0.5 - float(falling.get_positions()[..., 2].mean())
+    assert dropped > 0.3, "the unruled tissue must be falling freely"
+    assert float(resting.get_positions()[..., 2].min()) > -1e-4, "the ruled tissue still rests on the table"
