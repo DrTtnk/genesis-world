@@ -15,6 +15,7 @@ from genesis.engine.solvers.vbd_contact import (
 )
 from genesis.engine.solvers.vbd_mtu import func_mtu_dof_terms, func_refresh_mtu_anchors
 from genesis.engine.solvers.vbd_rigid_attachment import func_attachment_point, func_update_attachment_dual
+from genesis.engine.solvers.vbd_tissue_attachment import func_update_tissue_attachment_dual
 from genesis.utils.array_class import DynInfo, DynState, RigidInfo
 
 
@@ -40,6 +41,10 @@ def kernel_sweeps_articulation(
         for i_a, i_b in qd.ndrange(solver.rigid_attachment.n_attachments, solver._B):
             if not solver.env_failed[i_b]:
                 func_update_attachment_dual(f, i_a, i_b, solver, solver.rigid_attachment)
+        if qd.static(solver.has_tissue_attachment):
+            for i_a, i_b in qd.ndrange(solver.tissue_attachment.n_attachments, solver._B):
+                if not solver.env_failed[i_b]:
+                    func_update_tissue_attachment_dual(f, i_a, i_b, solver, solver.tissue_attachment)
         # see _kernel_sweeps in vbd_solver.py: no dual update after the last sweep
         if qd.static(solver.has_contact and sweep < solver._n_iterations - 1):
             func_contact_dual_update(f, solver._constraint_dual_relaxation, solver, solver.contact)

@@ -727,6 +727,10 @@ class VBDEntity(Entity):
         touched = self._barycentric_verts[self._barycentric_weights != 0.0]
         if pinned[self._rigid_vertices_idx].any() or (touched.size and pinned[touched].any()):
             gs.raise_exception("A physically attached vertex must remain free to transmit force.")
+        for side in (point for pair in self._solver._tissue_attachment_pairs for point in pair):
+            entity, verts, weights = side
+            if entity is self and any(pinned[v] for v, w in zip(verts, weights) if w != 0.0):
+                gs.raise_exception("A physically attached vertex must remain free to transmit force; it cannot be pinned.")
         self._solver._kernel_set_pinned(self._v_start, pinned.astype(gs.np_int))
 
     def set_pin_targets(self, target):

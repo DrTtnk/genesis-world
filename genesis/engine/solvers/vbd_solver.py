@@ -59,6 +59,13 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     kernel_set_vertex_state,
 )
 from genesis.engine.solvers.vbd_contact import EnvStatus
+from genesis.engine.solvers.vbd_tissue_attachment import (
+    VBDTissueAttachment,
+    func_tissue_attachment_vertex_terms,
+    func_update_tissue_attachment_dual,
+    kernel_begin_tissue_attachment,
+    kernel_set_tissue_attachment_state,
+)
 from genesis.engine.solvers.vbd_mtu import (
     HillParameters,
     LinkAnchor,
@@ -123,6 +130,8 @@ class VBDSolver(Solver):
             )
         self._grad_converge = options.grad_converge
         self.rigid_attachment = None
+        self.tissue_attachment = None
+        self._tissue_attachment_pairs = []
         self._n_muscle_groups = 0
         self.contact = None
         self._contact_rules = []
@@ -139,6 +148,10 @@ class VBDSolver(Solver):
     @property
     def has_rigid_attachment(self):
         return self.rigid_attachment is not None
+
+    @property
+    def has_tissue_attachment(self):
+        return self.tissue_attachment is not None
 
     @property
     def has_contact(self):
@@ -212,6 +225,46 @@ class VBDSolver(Solver):
         if not stiffness > 0.0 or not thickness > 0.0 or friction < 0.0:
             gs.raise_exception("A contact rule needs stiffness > 0, thickness > 0 and friction >= 0.")
         self._contact_rules.append((int(group_a), int(group_b), float(stiffness), float(friction), float(thickness)))
+
+    def _resolve_point_anchor(self, anchor):
+        """A `TissueAnchor` or `SurfaceAnchor` as (entity, four vertex indices, four weights), the one form
+        vbd_mtu.py also reduces both to."""
+        if isinstance(anchor, SurfaceAnchor):
+            if len(anchor.weights) != 3:
+                gs.raise_exception("A surface anchor needs three barycentric weights, one per triangle corner.")
+            if abs(sum(anchor.weights) - 1.0) > 1e-6:
+                gs.raise_exception(f"The barycentric weights of a surface anchor sum to {sum(anchor.weights)}.")
+            if not 0 <= anchor.triangle < len(anchor.entity.tris):
+                gs.raise_exception(
+                    f"Surface anchor triangle {anchor.triangle} is outside the entity's {len(anchor.entity.tris)} triangles."
+                )
+            triangle = anchor.entity.tris[anchor.triangle]
+            return anchor.entity, tuple(int(v) for v in triangle) + (int(triangle[0]),), tuple(float(w) for w in anchor.weights) + (0.0,)
+        if isinstance(anchor, TissueAnchor):
+            if len(anchor.vertices) != 4 or len(anchor.weights) != 4:
+                gs.raise_exception("A tissue anchor needs four vertices and four barycentric weights.")
+            if abs(sum(anchor.weights) - 1.0) > 1e-6:
+                gs.raise_exception(f"The barycentric weights of a tissue anchor sum to {sum(anchor.weights)}.")
+            if any(not 0 <= v < anchor.entity.n_vertices for v in anchor.vertices):
+                gs.raise_exception("A tissue anchor must index its entity's vertices.")
+            return anchor.entity, tuple(int(v) for v in anchor.vertices), tuple(float(w) for w in anchor.weights)
+        gs.raise_exception(f"Unknown tissue attachment anchor {anchor!r}.")
+
+    def add_tissue_attachment(self, anchor_a, anchor_b):
+        """Bind a material point of one tissue to a material point of another (or of the same tissue) with the
+        two-way augmented-Lagrangian force of the rigid attachments, and return the attachment's index. Each
+        anchor is a `TissueAnchor` or a `SurfaceAnchor`; the points bind with the offset they have now, so the
+        rest state is stress-free. Declare before `scene.build()`."""
+        if self._scene.is_built:
+            gs.raise_exception("Declare tissue attachments before scene.build().")
+        a, b = self._resolve_point_anchor(anchor_a), self._resolve_point_anchor(anchor_b)
+        if a[0] is b[0] and sorted(zip(a[1], a[2])) == sorted(zip(b[1], b[2])):
+            gs.raise_exception("A tissue attachment cannot bind a material point to the same material point.")
+        for entity, _, _ in (a, b):
+            if entity.scene is not self._scene:
+                gs.raise_exception("Both anchors of a tissue attachment must belong to this scene.")
+        self._tissue_attachment_pairs.append((a, b))
+        return len(self._tissue_attachment_pairs) - 1
 
     def _add_routed_unit(self, kind, anchors, parameters, activation0=0.0, fibre_length0=None):
         if self._scene.is_built:
@@ -767,6 +820,10 @@ class VBDSolver(Solver):
             ]
             if attached_entities:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
+            if self._tissue_attachment_pairs:
+                if self._sim.requires_grad:
+                    gs.raise_exception("Tissue attachments have no adjoint yet, so they cannot be used with requires_grad.")
+                self.tissue_attachment = VBDTissueAttachment(self, self._tissue_attachment_pairs)
             if self._contact_rules:
                 if self._sim.requires_grad:
                     gs.raise_exception("Mesh contact has no adjoint, so it cannot be used with requires_grad.")
@@ -1546,6 +1603,10 @@ class VBDSolver(Solver):
                 )
                 force += qd.cast(weight * force_a, self._acc)
                 H += qd.cast(weight * weight * hessian_a, self._acc)
+        if qd.static(self.has_tissue_attachment):
+            force_t, hessian_t = func_tissue_attachment_vertex_terms(f, i_v, i_b, self, self.tissue_attachment)
+            force += qd.cast(force_t, self._acc)
+            H += qd.cast(hessian_t, self._acc)
         if qd.static(self.has_contact):
             force_c, hessian_c = func_contact_vertex_terms(f, i_v, i_b, self, self.contact)
             force += qd.cast(force_c, self._acc)
@@ -1776,6 +1837,10 @@ class VBDSolver(Solver):
                 for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
                     if not self.env_failed[i_b]:
                         func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
+            if qd.static(self.has_tissue_attachment):
+                for i_a, i_b in qd.ndrange(self.tissue_attachment.n_attachments, self._B):
+                    if not self.env_failed[i_b]:
+                        func_update_tissue_attachment_dual(f, i_a, i_b, self, self.tissue_attachment)
             # the pairs restart from zero next substep, so the dual update after the last sweep would only skew
             # the reported reactions away from the forces the sweep applied
             if qd.static(self.has_contact):
@@ -3331,6 +3396,8 @@ class VBDSolver(Solver):
                     )
                 else:
                     kernel_begin_attachment(f, self, self.rigid_attachment, rigid.dyn_state, rigid.rigid_info)
+            if self.tissue_attachment is not None:
+                kernel_begin_tissue_attachment(f, self, self.tissue_attachment)
             # every substep, gradients or not: at two sweeps the primal is never converged within a substep, and this
             # decay is the dual damping that stops the multipliers integrating stale violations (once per step, as the
             # AVBD paper does per frame, the ladder python's spine stretch went from 0.2 to 8 percent)
@@ -3508,6 +3575,13 @@ class VBDSolver(Solver):
                 kernel_set_attachment_state(
                     envs_idx, state.attachment_multiplier, state.attachment_stiffness, self.rigid_attachment.state
                 )
+            if self.tissue_attachment is not None:
+                kernel_set_tissue_attachment_state(
+                    envs_idx,
+                    state.tissue_attachment_multiplier,
+                    state.tissue_attachment_stiffness,
+                    self.tissue_attachment.state,
+                )
             kernel_clear_env_failure(
                 envs_idx, self.env_failed, self.failed_substep, self.inverted_streak, self.tissue_errno
             )
@@ -3541,6 +3615,13 @@ class VBDSolver(Solver):
             ).contiguous()
             state.attachment_stiffness = qd_to_torch(
                 self.rigid_attachment.state.stiffness, transpose=True, copy=True
+            ).contiguous()
+        if self.tissue_attachment is not None:
+            state.tissue_attachment_multiplier = qd_to_torch(
+                self.tissue_attachment.state.multiplier, transpose=True, copy=True
+            ).contiguous()
+            state.tissue_attachment_stiffness = qd_to_torch(
+                self.tissue_attachment.state.stiffness, transpose=True, copy=True
             ).contiguous()
         if self.contact is not None:
             state.prescribed_start_pos = qd_to_torch(

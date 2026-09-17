@@ -11,12 +11,13 @@ This module implements the subset of `AVBD_API_MAP.md` section 2 the engine supp
   entity registered as a prescribed collider.
 - Tissue as an explicit `TetMesh` plus one `VBD.Base` material per tissue (one material per tissue, not
   one per tet).
-- `hard_point` attachments from one tissue vertex (a node anchor: one barycentric weight of 1) to a link.
+- `hard_point` attachments from one tissue vertex (a node anchor: one barycentric weight of 1) to a link, and
+  `hard_point` attachments between two tissue anchors (barycentric points of the same or different tissues).
 - Routes, Hill MTUs, ligaments and rotary restraints, with world, link and tissue anchors.
 - Collision groups, contact rules and prescribed ellipsoid colliders.
 
-Every other record class in the packet schema is rejected at build, by name: barycentric and
-tissue-to-tissue attachments, the `elastic_point` law, more than one material in one tissue, a free-root
+Every other record class in the packet schema is rejected at build, by name: barycentric attachments to a
+link, the `elastic_point` law, more than one material in one tissue, a free-root
 articulated chain, regions, and any capability the engine does not advertise.
 """
 
@@ -335,14 +336,21 @@ def _build_attachments(packet, anchors_by_id, tissues_by_id, tets_by_tissue_id, 
         other_anchor = anchors_by_id[attachment.other_anchor_id]
         if tissue_anchor.kind != "tissue":
             gs.raise_exception(f"Attachment '{attachment.id}' tissue_anchor_id does not reference a tissue anchor.")
-        if other_anchor.kind == "tissue":
-            gs.raise_exception(f"Attachment '{attachment.id}' is a tissue-to-tissue attachment, which is not supported.")
-        if other_anchor.kind != "link":
-            gs.raise_exception(f"Attachment '{attachment.id}' targets a '{other_anchor.kind}' anchor; only a link target is supported.")
+        if other_anchor.kind not in ("link", "tissue"):
+            gs.raise_exception(f"Attachment '{attachment.id}' targets a '{other_anchor.kind}' anchor; only a link or tissue target is supported.")
         if attachment.law == "elastic_point":
             gs.raise_exception(f"Attachment '{attachment.id}' uses law 'elastic_point', which is not supported; only 'hard_point' is.")
         if attachment.law != "hard_point":
             gs.raise_exception(f"Attachment '{attachment.id}' has unsupported law '{attachment.law}'.")
+        if other_anchor.kind == "tissue":
+            # a barycentric point of each tissue, bound with the offset they have at rest
+            points = []
+            for anchor in (tissue_anchor, other_anchor):
+                entity = tissues_by_id[anchor.tissue_id]
+                tet = tets_by_tissue_id[anchor.tissue_id][anchor.tet_index]
+                points.append(TissueAnchor(entity, tuple(int(v) for v in tet), tuple(float(w) for w in anchor.barycentric_weights)))
+            entity.scene.vbd_solver.add_tissue_attachment(*points)
+            continue
 
         weights = np.asarray(tissue_anchor.barycentric_weights, dtype=np.float64)
         node = int(np.argmax(weights))

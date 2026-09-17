@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import genesis as gs
+from genesis.utils.misc import tensor_to_array
 
 from .fixture_packet import _quat, _single_tet_tissue, _tet_verts, build_hinge_model_packet, build_minimal_packet
 
@@ -255,7 +256,9 @@ def test_build_model_rejects_a_barycentric_hard_point_attachment():
         gs.avbd.build_model(hinge_model_scene(), packet)
 
 
-def test_build_model_rejects_a_tissue_to_tissue_attachment():
+def test_build_model_binds_two_tissues_at_a_point():
+    """A tissue-to-tissue hard_point attachment builds and holds: the second tissue, otherwise unsupported,
+    keeps its anchor on the first one's anchor within the constraint tolerance."""
     av = gs.avbd
     packet = build_minimal_packet()
     other_tissue = _single_tet_tissue("wall_b", "mat_wall", _tet_verts((0.3, 0.0, 0.0)))
@@ -279,8 +282,17 @@ def test_build_model_rejects_a_tissue_to_tissue_attachment():
         anchors=packet.anchors + (anchor_a, anchor_b),
         attachments=packet.attachments + (attachment,),
     )
-    with pytest.raises(gs.GenesisException, match="att_seam.*tissue-to-tissue"):
-        gs.avbd.build_model(hinge_model_scene(), packet)
+    scene = hinge_model_scene()
+    model = gs.avbd.build_model(scene, packet)
+    scene.build()
+    wall, wall_b = model.ids.tissues["wall"], model.ids.tissues["wall_b"]
+    offset = tensor_to_array(wall.init_positions)[0] - tensor_to_array(wall_b.init_positions)[0]
+    for _ in range(50):
+        scene.step()
+    pa = tensor_to_array(wall.get_positions())[0][0]
+    pb = tensor_to_array(wall_b.get_positions())[0][0]
+    assert np.isfinite(pb).all()
+    assert np.linalg.norm(pa - pb - offset) < 2e-4
 
 
 def test_build_model_rejects_multiple_materials_on_one_tissue():
