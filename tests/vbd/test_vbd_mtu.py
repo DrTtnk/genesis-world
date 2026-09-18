@@ -452,3 +452,62 @@ def test_a_route_with_one_anchor_is_rejected():
     scene, _ = tissue_only_scene()
     with pytest.raises(Exception, match="two anchors"):
         scene.vbd_solver.add_mtu([WorldAnchor((0.0, 0.0, 0.0))], hill_parameters())
+
+
+def test_a_link_anchor_given_in_world_lands_there_whatever_the_link_frame(show_viewer):
+    """The frame trap: a link's own frame is not the frame the morph was given.
+
+    A non-convex collision mesh is re-oriented when the rigid entity is built, so a local offset written by
+    hand against the pose that was requested lands somewhere else; the python head's bones come out rotated by
+    up to 137 degrees this way, and every connector anchored by hand was wrong by up to twice its offset. A
+    world rest position is converted with the link's actual pose at build, so it lands where it was asked to.
+    """
+    from genesis.engine.solvers.vbd_mtu import LinkAnchor
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-1e3),
+        show_viewer=show_viewer,
+    )
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.004, 0.004, 0.004), pos=(0.0, 0.0, 0.0), nobisect=False, maxvolume=1e-9),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3),
+    )
+    held = scene.add_entity(morph=gs.morphs.Box(size=(0.01, 0.01, 0.01), pos=(0.0, 0.0, 0.0), fixed=True),
+                            material=gs.materials.Rigid(rho=1000.0))
+    # a link whose frame is turned a quarter circle about z against the world
+    turned = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.02, 0.01, 0.01), pos=(0.1, 0.0, 0.0), quat=(0.5**0.5, 0.0, 0.0, 0.5**0.5)),
+        material=gs.materials.Rigid(rho=1000.0),
+    )
+    tissue.add_rigid_attachments(np.array([0]), held.links[0])
+    corner_world = (0.1, 0.02, 0.0)          # 20 mm from the link origin along world +y
+    slack = float(np.linalg.norm(np.asarray(corner_world)))
+    solver = scene.sim.vbd_solver
+    by_world = solver.add_ligament([LinkAnchor(held.links[0], world_pos=(0.0, 0.0, 0.0)),
+                                    LinkAnchor(turned.links[0], world_pos=corner_world)],
+                                   stiffness=1.0, slack_length=slack)
+    # the same point written as a local offset in the frame the morph was given, which the turn invalidates
+    by_local = solver.add_ligament([LinkAnchor(held.links[0], local_pos=(0.0, 0.0, 0.0)),
+                                    LinkAnchor(turned.links[0], local_pos=(0.0, 0.02, 0.0))],
+                                   stiffness=1.0, slack_length=slack)
+    scene.build()
+    scene.step()
+    length = tensor_to_array(scene.sim.vbd_solver.mtu_state().route_length)[0]
+    assert length[by_world] == pytest.approx(slack, abs=1e-6), "a world anchor must land where it was asked to"
+    assert abs(length[by_local] - slack) > 1e-3, "the local form is read in the link's own frame, as documented"
+
+
+def test_a_link_anchor_needs_exactly_one_of_local_and_world():
+    from genesis.engine.solvers.vbd_mtu import LinkAnchor
+
+    class Fake:
+        idx = 0
+
+    with pytest.raises(gs.GenesisException, match="exactly one"):
+        LinkAnchor(Fake())
+    with pytest.raises(gs.GenesisException, match="exactly one"):
+        LinkAnchor(Fake(), local_pos=(0.0, 0.0, 0.0), world_pos=(0.0, 0.0, 0.0))
+    with pytest.raises(gs.GenesisException, match="three coordinates"):
+        LinkAnchor(Fake(), world_pos=(0.0, 0.0))

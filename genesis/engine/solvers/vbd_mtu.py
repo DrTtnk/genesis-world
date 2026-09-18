@@ -40,7 +40,7 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.utils.array_class import DynState
-from genesis.utils.misc import qd_to_torch
+from genesis.utils.misc import qd_to_torch, tensor_to_array
 
 W = 0.45  # force-length bell width
 W_PE = 0.6  # parallel elastic engagement width
@@ -73,8 +73,27 @@ class WorldAnchor:
 
 @dataclass(frozen=True)
 class LinkAnchor:
+    """A point carried by a rigid link, given either in the link's own frame or in the world.
+
+    `local_pos` is measured in the link frame, which is not something a caller can always know before
+    `scene.build()`: a non-convex collision mesh is re-oriented at build, so its link frame is rotated by up to
+    180 degrees against the pose the morph was given, and a local offset written by hand then lands somewhere
+    else entirely. `world_pos` is the rest position of the same point in world coordinates, converted with the
+    link's actual pose when the scene is built, which is what `add_rigid_attachments` already does with the
+    tissue vertices it is handed. Give exactly one of the two.
+    """
+
     link: object
-    local_pos: tuple
+    local_pos: tuple | None = None
+    world_pos: tuple | None = None
+
+    def __post_init__(self):
+        if (self.local_pos is None) == (self.world_pos is None):
+            gs.raise_exception("A link anchor needs exactly one of local_pos and world_pos.")
+        for name in ("local_pos", "world_pos"):
+            value = getattr(self, name)
+            if value is not None and len(tuple(value)) != 3:
+                gs.raise_exception(f"A link anchor's {name} needs three coordinates, got {value!r}.")
 
 
 @dataclass(frozen=True)
@@ -122,6 +141,17 @@ class VBDMTU:
         self.n_units = len(units)
         self.n_restraints = len(restraints)
         rigid = solver._sim.rigid_solver
+        # Poses as built, read on first use so that a scene with no rigid link at all still builds.
+        link_poses = None
+
+        def pose_of(i_l):
+            nonlocal link_poses
+            if link_poses is None:
+                link_poses = (
+                    tensor_to_array(rigid.get_links_pos()).reshape(solver._B, rigid.n_links, 3)[0],
+                    tensor_to_array(rigid.get_links_quat()).reshape(solver._B, rigid.n_links, 4)[0],
+                )
+            return link_poses[0][i_l], link_poses[1][i_l]
 
         anchor_kind, anchor_link, anchor_local, anchor_verts, anchor_weights, anchor_unit = [], [], [], [], [], []
         offsets = [0]
@@ -137,7 +167,14 @@ class VBDMTU:
                 elif isinstance(anchor, LinkAnchor):
                     anchor_kind.append(KIND_LINK)
                     anchor_link.append(anchor.link.idx)
-                    anchor_local.append(anchor.local_pos)
+                    # A world rest position is converted with the link's pose as built, since that is the frame
+                    # the solver will read the offset back in; see LinkAnchor.
+                    if anchor.local_pos is not None:
+                        anchor_local.append(tuple(anchor.local_pos))
+                    else:
+                        pos, quat = pose_of(anchor.link.idx)
+                        anchor_local.append(tuple(gu.inv_transform_by_quat(
+                            np.asarray(anchor.world_pos, dtype=np.float64) - pos, quat)))
                     anchor_verts.append((0, 0, 0, 0))
                     anchor_weights.append((0.0, 0.0, 0.0, 0.0))
                 elif isinstance(anchor, SurfaceAnchor):
