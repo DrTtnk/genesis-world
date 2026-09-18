@@ -35,6 +35,11 @@ from genesis.engine.solvers.vbd_articulation import (
     kernel_end_articulation,
     kernel_sweeps_articulation,
 )
+from genesis.engine.solvers.vbd_accd import (
+    kernel_accd_rescale_links,
+    kernel_accd_rescale_verts,
+    kernel_accd_toi,
+)
 from genesis.engine.solvers.vbd_contact import (
     VBDContact,
     func_contact_dual_update,
@@ -144,6 +149,14 @@ class VBDSolver(Solver):
         self._contact_k_max_ratio = (
             options.constraint_k_max_ratio if options.contact_k_max_ratio is None else options.contact_k_max_ratio
         )
+        self._contact_ccd = options.contact_ccd
+        self._contact_ccd_scale = options.contact_ccd_scale
+        self._contact_ccd_gap = options.contact_ccd_gap
+        self._contact_ccd_iterations = options.contact_ccd_iterations
+        if not 0.0 < self._contact_ccd_scale < 1.0:
+            gs.raise_exception(
+                f"VBDOptions.contact_ccd_scale must lie in (0, 1), got {self._contact_ccd_scale}."
+            )
         self._raise_on_env_failure = options.raise_on_env_failure
         self._max_inverted_substeps = options.max_consecutive_inverted_substeps
         self.mtu = None
@@ -854,6 +867,18 @@ class VBDSolver(Solver):
                     gs.raise_exception(
                         "Prescribed colliders in a batched scene need RigidOptions.batch_links_info=True."
                     )
+                if self._contact_ccd:
+                    # Both carry a pose this filter cannot rescale: a prescribed collider follows its own
+                    # interpolant, and an articulated body's pose comes from joint coordinates the rigid solver
+                    # owns. Rescaling only what VBD owns would let the other side cross unchecked.
+                    if self._prescribed_colliders:
+                        gs.raise_exception(
+                            "VBDOptions.contact_ccd cannot rescale a prescribed collider's driven pose."
+                        )
+                    if self.rigid_attachment is not None and self.rigid_attachment.is_articulated:
+                        gs.raise_exception(
+                            "VBDOptions.contact_ccd cannot rescale an articulated body's pose."
+                        )
                 self.contact = VBDContact(
                     self, self._entities, self._rigid_colliders, self._prescribed_colliders, self._contact_rules
                 )
@@ -3456,6 +3481,13 @@ class VBDSolver(Solver):
                         f"{self._self_cell:.4f} m. Raise the cell capacity or the cell size."
                     )
             self.solve(f)
+            if self.contact is not None and self._contact_ccd:
+                # before the velocities: they are the pose difference over the substep, so the rescaled pose
+                # carries the rescaled velocity with it
+                kernel_accd_toi(f, self, self.contact)
+                if self.rigid_attachment is not None:
+                    kernel_accd_rescale_links(self, self.contact, self.rigid_attachment)
+                kernel_accd_rescale_verts(f, self, self.contact)
             self._kernel_update_velocity(f)
             self._kernel_tissue_diagnostics(f, self._sim.cur_substep_global)
             if self.contact is not None:

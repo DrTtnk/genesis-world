@@ -1000,6 +1000,29 @@ class VBDOptions(Options):
         when something light and fast rides on something heavy, such as a thin tissue pad on a falling bone, where
         the thickness that suits the geometry would otherwise cap the speed. Larger values cost candidate pairs and
         a coarser hash grid. Defaults to the largest rule thickness.
+    contact_ccd : bool, optional
+        Whether a substep is rescaled so that no contact pair reaches `contact_ccd_gap`, instead of being refused
+        when a pair crosses. After the primal solve every candidate pair is swept from the pose at the start of
+        the substep to the pose the solve reached, additive CCD gives a time of impact no later than the true one,
+        and the whole substep (tissue vertices and free bodies alike) is rescaled by the smallest one. Nothing
+        then crosses, at the price of an inelastic slowdown: the pose is that of a shorter step while the clock
+        advances by the whole one, so an approaching pair loses the speed a re-solved step would have kept. The
+        smallest time of impact is reported by `VBDContact.diagnostics().min_toi`. Needs free bodies the VBD
+        solver owns: prescribed colliders and articulated attachments carry poses this cannot rescale, and are
+        refused. Defaults to False.
+    contact_ccd_scale : float, optional
+        Conservative rescaling of additive CCD, in (0, 1). Each advance covers that fraction of the fully safe
+        one, and the sweep stops when the remaining gap is under (1 - scale) of the first, so the bound falls
+        short of the true time of impact by about that fraction: 0.9 measured at 0.88 to 0.90 of it. Defaults
+        to 0.9.
+    contact_ccd_gap : float, optional
+        The distance (m) additive CCD refuses to let a pair close to. Zero lets surfaces approach without limit
+        while never touching, which leaves the whole contact layer to the penalty; a positive value keeps a gap
+        the penalty never has to recover, and slows every substep in which a pair is that close. Defaults to 0.
+    contact_ccd_iterations : int, optional
+        Advance budget per pair. The sweep converges geometrically at (1 - `contact_ccd_scale`), so 64 is far
+        more than a head-on approach needs; a pair that does not converge returns the advances it has taken,
+        which is conservative like any other bound. Defaults to 64.
     raise_on_env_failure : bool, optional
         Whether a contact failure in any environment raises at the next step. A failed environment always stops
         advancing (its positions, prescribed motion and multipliers freeze) until it is reset. True stops the
@@ -1037,6 +1060,10 @@ class VBDOptions(Options):
     contact_margin: Optional[float] = None
     contact_crossing_depth: Optional[float] = None
     contact_k_max_ratio: Optional[float] = None
+    contact_ccd: StrictBool = False
+    contact_ccd_scale: PositiveFloat = 0.9
+    contact_ccd_gap: NonNegativeFloat = 0.0
+    contact_ccd_iterations: PositiveInt = 64
     raise_on_env_failure: StrictBool = True
     max_consecutive_inverted_substeps: PositiveInt = 1000
 

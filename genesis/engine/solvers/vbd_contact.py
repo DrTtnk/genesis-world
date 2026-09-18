@@ -45,13 +45,16 @@ ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
 
 class ContactDiagnostics(NamedTuple):
     """Per-environment contact state of the last substep: candidate pair counts, the largest motion of a tissue
-    and of a rigid contact vertex over the substep (m), and the raw error word."""
+    and of a rigid contact vertex over the substep (m), the raw error word, and the smallest continuous-collision
+    time of impact since the last `clear_toi()` (1 when no substep was rescaled, and always 1 without
+    `VBDOptions.contact_ccd`)."""
 
     n_point_pairs: torch.Tensor
     n_edge_pairs: torch.Tensor
     max_tissue_motion: torch.Tensor
     max_rigid_motion: torch.Tensor
     errno: torch.Tensor
+    min_toi: torch.Tensor
 
 
 class EnvStatus(NamedTuple):
@@ -257,6 +260,11 @@ class VBDContact:
         self.cv_slot = qd.field(dtype=gs.qd_int, shape=(8 * self.pair_cap, solver._B))
         self.errno = qd.field(dtype=gs.qd_int, shape=solver._B)
         self.max_motion = qd.field(dtype=gs.qd_float, shape=(2, solver._B))
+        # the substep's conservative time of impact, and the smallest one since it was last cleared
+        self.toi = qd.field(dtype=gs.qd_float, shape=solver._B)
+        self.min_toi = qd.field(dtype=gs.qd_float, shape=solver._B)
+        self.toi.fill(1.0)
+        self.min_toi.fill(1.0)
         # Prescribed collider links follow a pose interpolant from the pose at the start of the step to the target
         # set for its end, sampled at every substep; both ends are state.
         # The targets refer to a reference link of the entity; the base link pose that realizes them follows from
@@ -341,8 +349,16 @@ class VBDContact:
     def diagnostics(self):
         motion = qd_to_torch(self.max_motion, transpose=True)
         return ContactDiagnostics(
-            qd_to_torch(self.n_pt), qd_to_torch(self.n_ee), motion[:, 0], motion[:, 1], qd_to_torch(self.errno)
+            qd_to_torch(self.n_pt),
+            qd_to_torch(self.n_ee),
+            motion[:, 0],
+            motion[:, 1],
+            qd_to_torch(self.errno),
+            qd_to_torch(self.min_toi),
         )
+
+    def clear_toi(self):
+        self.min_toi.fill(1.0)
 
     def reactions(self):
         """Wrench on each registered collider, shape (B, n_colliders, 6): world force then world torque about the
@@ -1009,7 +1025,10 @@ def func_edges_crossed(f, i_b, ea, eb, s, t, solver: qd.template(), contact: qd.
 def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), contact: qd.template(), dyn_state: DynState):
     """Wrenches on the collider links from the final pair state, the substep's validity checks (finite geometry,
     no contact vertex moved further than the candidate margin, no pair deeper than its thickness), and the failure
-    latch of any environment whose checks failed."""
+    latch of any environment whose checks failed. The two crossing tests are skipped under
+    `VBDOptions.contact_ccd`, which prevents a crossing instead of reporting one: a sign flip of two edges whose
+    closest parameters changed feature, or a point at a face boundary read as behind it, would then be the only
+    thing left for them to find."""
     for i_l, i_b in qd.ndrange(contact.link_reaction.shape[0], solver._B):
         if not solver.env_failed[i_b]:
             contact.link_reaction[i_l, i_b] = qd.Vector.zero(qd.f64, 6)
@@ -1018,9 +1037,12 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
             d, n, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
             if not (d == d):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
-            # signed over the face: a point this far behind the surface is past what the penalty can recover
-            if d < -contact.crossing_depth:
-                qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
+            # signed over the face: a point this far behind the surface is past what the penalty can recover.
+            # With the continuous filter on there is nothing to detect: no pair ever reaches the gap, so the two
+            # crossing tests here would only report their own false positives.
+            if qd.static(not solver._contact_ccd):
+                if d < -contact.crossing_depth:
+                    qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
             y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
             if y < 0.0:
                 force = -(y * n + scale * slide)
@@ -1040,9 +1062,10 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
             # with the failure bit-identical under a ten-thousandfold change of contact stiffness, which is
             # what a report the penalty cannot influence looks like. A crossing counts when the edges also end
             # up closer than the depth the penalty is trusted to recover.
-            d_ee, n_ee, s_ee, t_ee, h_ee = func_ee_geometry(f, i_p, i_b, solver, contact)
-            if d_ee < contact.crossing_depth and func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
-                qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
+            if qd.static(not solver._contact_ccd):
+                d_ee, n_ee, s_ee, t_ee, h_ee = func_ee_geometry(f, i_p, i_b, solver, contact)
+                if d_ee < contact.crossing_depth and func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
+                    qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
             if y < 0.0:
                 force = -(y * n + scale * slide)
                 func_accumulate_reaction(f, ea[0], (1.0 - s) * force, i_b, solver, contact, dyn_state)
@@ -1080,6 +1103,8 @@ def kernel_reset_contact(envs_idx: qd.types.ndarray(), contact: qd.template(), d
         contact.rv_pos_prev[i_r, i_b] = contact.rv_pos[i_r, i_b]
     for i_b_ in range(envs_idx.shape[0]):
         contact.errno[envs_idx[i_b_]] = 0
+        contact.toi[envs_idx[i_b_]] = 1.0
+        contact.min_toi[envs_idx[i_b_]] = 1.0
     for i_p, i_b_ in qd.ndrange(contact.n_prescribed, envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         i_l = contact.prescribed_link[i_p]
