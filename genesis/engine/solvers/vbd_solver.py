@@ -162,19 +162,35 @@ class VBDSolver(Solver):
     def has_mtu(self):
         return self.mtu is not None
 
-    def add_rigid_collider(self, link, collision_group):
-        """Let the collision meshes of a rigid link take part in mesh contact with the tissue, in the given
-        collision group. Declare before `scene.build()`; the link's pose is read from the rigid solver each
-        substep, so a fixed link, a link the tissue drives, or a prescribed link all work."""
+    def add_rigid_collider(self, link, collision_group, regions=None):
+        """Let the collision meshes of a rigid link take part in mesh contact, in the given collision group.
+
+        Declare before `scene.build()`; the link's pose is read from the rigid solver each substep, so a fixed
+        link, a link the tissue drives, or a prescribed link all work.
+
+        `regions` restricts which of the link's geometry takes part, as world-space spheres
+        `[(x, y, z, radius), ...]` measured at the rest pose: a triangle is collected when all three of its
+        corners lie inside one of them. A whole bone is mostly nowhere near anything it can touch -- of the
+        python head's 14,872 collider vertices only 1,148 lie within 2.5 mm of another bone, and 39 of the
+        braincase's 3,938 -- and every triangle that cannot meet a partner still costs a place in the hash grid
+        and a candidate test every substep. Regions are geometric rather than face indices because the collision
+        geometry a morph builds is not required to keep the mesh's own indexing.
+        """
         if self._scene.is_built:
             gs.raise_exception("Rigid colliders must be declared before scene.build().")
-        if any(link is other for other, _ in self._rigid_colliders) or any(
+        if any(link is other for other, _, _ in self._rigid_colliders) or any(
             link is other for entity, _, _ in self._prescribed_colliders for other in entity.links
         ):
             gs.raise_exception(f"Link {link.name} is already a collider.")
         if not link.geoms:
             gs.raise_exception(f"Collider link {link.name} has no collision geometry.")
-        self._rigid_colliders.append((link, int(collision_group)))
+        if regions is not None:
+            regions = np.asarray(regions, dtype=np.float64)
+            if regions.ndim != 2 or regions.shape[1] != 4 or not len(regions):
+                gs.raise_exception(f"Collider regions need shape (n, 4) as (x, y, z, radius), got {regions.shape}.")
+            if not (regions[:, 3] > 0.0).all():
+                gs.raise_exception("Every collider region needs a radius above zero.")
+        self._rigid_colliders.append((link, int(collision_group), regions))
 
     def add_prescribed_collider(self, entity, collision_group, link=None):
         """Let the collision geometry of a fixed rigid entity collide with the tissue while the pose of `link` (its
@@ -187,7 +203,7 @@ class VBDSolver(Solver):
             gs.raise_exception("A prescribed collider must be a rigid entity whose links are all fixed.")
         if not any(link.geoms for link in entity.links):
             gs.raise_exception("A prescribed collider needs collision geometry.")
-        if any(link is other for link in entity.links for other, _ in self._rigid_colliders):
+        if any(link is other for link in entity.links for other, _, _ in self._rigid_colliders):
             gs.raise_exception("A link of the prescribed entity is already a collider.")
         if any(entity is other for other, _, _ in self._prescribed_colliders):
             gs.raise_exception("The entity is already a prescribed collider.")

@@ -1091,3 +1091,76 @@ def test_a_nonpositive_contact_margin_is_refused():
     scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
     with pytest.raises(gs.GenesisException, match="contact_margin"):
         scene.build()
+
+
+def test_a_collider_region_keeps_only_the_geometry_that_can_meet_something(show_viewer):
+    """A whole bone is mostly nowhere near anything it can touch, and the far side still costs a hash cell and a
+    candidate test every substep: of the python head's 14,872 collider vertices, 1,148 lie within 2.5 mm of
+    another bone. A region keeps the patch that can meet a partner and drops the rest, and the contact it does
+    make must be the same."""
+    import tempfile
+
+    import trimesh
+
+    # A long table, finely triangulated, of which only the middle can ever be touched by the box above it. It
+    # has to be a mesh rather than a Box morph: a box's collision geometry is its eight corners, and no
+    # triangle of it fits inside a region smaller than the whole table.
+    plate = trimesh.creation.box(extents=(2.0, 0.2, 0.02))
+    plate = plate.subdivide_to_size(0.05)
+    handle = tempfile.NamedTemporaryFile(suffix=".obj", delete=False)
+    handle.write(trimesh.exchange.obj.export_obj(plate).encode())
+    handle.close()
+
+    def build(regions):
+        scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=2.5e-3, substeps=4, gravity=(0.0, 0.0, -9.81)),
+            rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+            vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-10.0, damping=2e-3),
+            show_viewer=show_viewer,
+        )
+        table = scene.add_entity(
+            morph=gs.morphs.Mesh(file=handle.name, pos=(0.0, 0.0, -0.01), fixed=True, decimate=False,
+                                 convexify=False),
+            material=gs.materials.Rigid())
+        tissue = scene.add_entity(
+            morph=gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.0, 0.0, 0.0205), nobisect=False, maxvolume=1e-5),
+            material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+        scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0, regions=regions)
+        scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
+        scene.build()
+        for _ in range(80):
+            scene.step()
+        return scene.vbd_solver.contact, float(tissue.get_positions()[..., 2].min())
+
+    whole, lowest_whole = build(None)
+    patch, lowest_patch = build([(0.0, 0.0, 0.0, 0.2)])
+    print(f"whole table: {whole.n_cv} contact vertices, {whole.n_triangles} triangles, lowest {1000 * lowest_whole:.4f} mm; "
+          f"region: {patch.n_cv}, {patch.n_triangles}, lowest {1000 * lowest_patch:.4f} mm")
+    assert patch.n_triangles < whole.n_triangles
+    assert patch.n_cv < whole.n_cv
+    assert lowest_patch > -1e-4, "the region must still stop the box"
+    assert lowest_patch == pytest.approx(lowest_whole, abs=2e-5), "and hold it where the whole mesh did"
+
+
+def test_a_collider_region_that_touches_no_triangle_is_refused():
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-10.0), show_viewer=False)
+    table = scene.add_entity(morph=gs.morphs.Box(size=(0.2, 0.2, 0.02), pos=(0.0, 0.0, -0.01), fixed=True),
+                             material=gs.materials.Rigid())
+    scene.add_entity(morph=gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.0, 0.0, 0.05), nobisect=False, maxvolume=1e-5),
+                     material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0, regions=[(5.0, 0.0, 0.0, 0.01)])
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
+    with pytest.raises(gs.GenesisException, match="lies inside any of its regions"):
+        scene.build()
+
+
+def test_a_malformed_collider_region_is_refused():
+    scene = gs.Scene(sim_options=gs.options.SimOptions(dt=2e-3, substeps=1), show_viewer=False)
+    table = scene.add_entity(morph=gs.morphs.Box(size=(0.2, 0.2, 0.02), pos=(0.0, 0.0, -0.01), fixed=True),
+                             material=gs.materials.Rigid())
+    for bad, match in (([(0.0, 0.0, 0.0)], "shape"), ([], "shape"), ([(0.0, 0.0, 0.0, 0.0)], "radius")):
+        with pytest.raises(gs.GenesisException, match=match):
+            scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0, regions=bad)

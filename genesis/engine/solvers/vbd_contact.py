@@ -72,12 +72,12 @@ class VBDContact:
         # failing a contact step it can never take part in.
         ruled = {group for rule in rules for group in rule[:2]}
         entities = [entity for entity in entities if entity.material.collision_group in ruled]
-        self.colliders = [link for link, _ in colliders]
+        self.colliders = [link for link, _, _ in colliders]
         # a prescribed collider is a fixed-base rigid entity: every link's geoms collide, the base pose is driven
-        colliders = list(colliders) + [(link, group) for entity, group, _ in prescribed for link in entity.links]
+        colliders = list(colliders) + [(link, group, None) for entity, group, _ in prescribed for link in entity.links]
         n_groups = 1 + max(
             [entity.material.collision_group for entity in entities]
-            + [group for _, group in colliders]
+            + [group for _, group, _ in colliders]
             + [max(r[:2]) for r in rules]
         )
         stiffness = np.zeros((n_groups, n_groups))
@@ -113,11 +113,27 @@ class VBDContact:
             cv_owner.extend([-1 - entity.idx] * len(boundary))
             triangles.append(base + faces_local.reshape(-1, 3))
             edges.append(base + self._unique_edges(faces_local.reshape(-1, 3)))
-        for link, group in colliders:
+        for link, group, regions in colliders:
             if not link.geoms and not any(link is other for entity, _, _ in prescribed for other in entity.links):
                 gs.raise_exception(f"Collider link {link.name} has no collision geometry.")
             for geom in link.geoms:
                 local = gu.transform_by_trans_quat(geom.init_verts, geom.init_pos, geom.init_quat)
+                # Orientation first, on the closed mesh, because the volume sign is what says which way is out;
+                # only then does a region select part of it.
+                faces = self._faces_with_positive_volume(geom.init_faces.astype(np.int64), local)
+                if regions is not None:
+                    world = gu.transform_by_trans_quat(local, *self._link_rest_pose(link))
+                    inside = np.zeros(len(world), dtype=bool)
+                    for x, y, z, radius in regions:
+                        inside |= np.linalg.norm(world - np.array([x, y, z]), axis=1) <= radius
+                    faces = faces[inside[faces].all(axis=1)]
+                    if not len(faces):
+                        gs.raise_exception(
+                            f"No triangle of collider link {link.name} lies inside any of its regions."
+                        )
+                    used, faces = np.unique(faces.reshape(-1), return_inverse=True)
+                    faces = faces.reshape(-1, 3)
+                    local = local[used]
                 base = len(cv_kind)
                 cv_kind.extend([1] * len(local))
                 cv_ref.extend(range(len(rv_link), len(rv_link) + len(local)))
@@ -125,7 +141,6 @@ class VBDContact:
                 cv_owner.extend([link.idx] * len(local))
                 rv_link.extend([link.idx] * len(local))
                 rv_local.append(local)
-                faces = self._faces_with_positive_volume(geom.init_faces.astype(np.int64), local)
                 triangles.append(base + faces)
                 edges.append(base + self._unique_edges(faces))
         triangles = np.concatenate(triangles)
@@ -273,6 +288,14 @@ class VBDContact:
             pos = np.asarray(link.pos) + gu.transform_by_quat(pos, np.asarray(link.quat))
             quat = gu.transform_quat_by_quat(quat, np.asarray(link.quat))
             link = links[link.parent_idx]
+        return pos, quat
+
+    @staticmethod
+    def _link_rest_pose(link):
+        """The link's world pose as built, for measuring a world-space collider region against its geometry."""
+        solver = link.entity.solver
+        pos = tensor_to_array(solver.get_links_pos()).reshape(-1, solver.n_links, 3)[0][link.idx]
+        quat = tensor_to_array(solver.get_links_quat()).reshape(-1, solver.n_links, 4)[0][link.idx]
         return pos, quat
 
     @staticmethod
