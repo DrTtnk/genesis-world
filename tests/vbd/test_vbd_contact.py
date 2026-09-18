@@ -1211,3 +1211,96 @@ def _velocity_state(scene, entity, velocity):
     state._vel[:, entity.v_start : entity.v_start + entity.n_vertices] = torch.tensor(
         velocity, dtype=state._vel.dtype, device=state._vel.device)
     return state
+
+
+def _sinking_block_scene(rules, crossing_depth=None):
+    """A tissue block driven into a thick fixed plate at 2 m/s, which takes it about 1.3 mm behind the plate's
+    top face in one substep. The plate is 200 mm thick on purpose: with a candidate margin of 25 mm and a thin
+    plate, a point above the top face is also a candidate for the *bottom* face, which reads it as 10 mm behind
+    itself and drives it down through the solid to push it "out", so the depth under test would be the engine's
+    own doing. `rules` is a list of (group_a, group_b, thickness) beyond the plate-to-block rule."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-1e3, raise_on_env_failure=False,
+                                          contact_margin=2.5e-2, contact_crossing_depth=crossing_depth),
+        show_viewer=False,
+    )
+    plate = scene.add_entity(morph=gs.morphs.Box(size=(0.2, 0.2, 0.2), pos=(0.0, 0.0, -0.1), fixed=True),
+                             material=gs.materials.Rigid())
+    block = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0.0, 0.0, 0.0108), nobisect=False, maxvolume=1e-6),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+    for group, thickness in rules:
+        scene.add_entity(
+            morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0.5 + 0.1 * group, 0.0, 0.0), nobisect=False,
+                                maxvolume=1e-6),
+            material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=group))
+    scene.vbd_solver.add_rigid_collider(plate.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e4, friction=0.0, thickness=2e-4)
+    for group, thickness in rules:
+        scene.vbd_solver.add_contact_rule(0, group, stiffness=1e4, friction=0.0, thickness=thickness)
+    scene.build()
+    scene.vbd_solver.set_state(0, _velocity_state(scene, block, (0.0, 0.0, -2.0)))
+    scene.step()
+    status = scene.vbd_solver.env_status()
+    lowest = float(tensor_to_array(block.get_positions())[0][:, 2].min())
+    return scene, int(tensor_to_array(status.errno)[0]), lowest
+
+
+def test_a_coarse_rule_elsewhere_does_not_excuse_a_fine_rule_s_crossing():
+    """The crossing depth is each pair's own thickness unless it is set, so the scene's coarsest rule never
+    decides for its finest: a block 1.3 mm behind a face whose layer is 0.2 mm is a crossing whether or not some
+    unrelated pair 500 mm away is allowed a 5 mm layer."""
+    crossing = int(gs.utils.array_class.ErrorCode.VBD_CONTACT_CROSSING)
+    _, alone, depth_alone = _sinking_block_scene(rules=[])
+    _, beside, depth_beside = _sinking_block_scene(rules=[(2, 5e-3)])
+    print(f"alone: errno {alone}, {1000 * depth_alone:.3f} mm; "
+          f"beside a 5 mm rule: errno {beside}, {1000 * depth_beside:.3f} mm")
+    assert depth_alone < -5e-4 and depth_beside < -5e-4, "the block must really end up behind the face"
+    assert alone & crossing, "a fine pair a millimetre behind its 0.2 mm layer is a crossing"
+    assert beside & crossing, "and it stays one when a coarse rule exists elsewhere in the scene"
+
+
+def test_setting_the_crossing_depth_still_overrides_every_pair():
+    """The option keeps its meaning: one depth for the whole scene, which is why it is a deliberate choice."""
+    crossing = int(gs.utils.array_class.ErrorCode.VBD_CONTACT_CROSSING)
+    _, errno, depth = _sinking_block_scene(rules=[], crossing_depth=5e-3)
+    print(f"depth 5 mm: errno {errno}, {1000 * depth:.3f} mm behind the face")
+    assert depth < -5e-4
+    assert not errno & crossing, "1.3 mm behind the face is within a declared 5 mm depth"
+
+
+def test_a_contact_stiffness_cap_below_one_is_refused():
+    """The cap is a multiple of each rule's own stiffness. Below one it would quietly put every contact under
+    the stiffness the rule asks for, and zero or a negative value would make the curvature block wrong-signed."""
+    for ratio in (0.0, 0.5, -2.0):
+        with pytest.raises(gs.GenesisException, match="contact_k_max_ratio"):
+            gs.Scene(vbd_options=gs.options.VBDOptions(contact_k_max_ratio=ratio))
+
+
+def test_a_collider_region_keeps_a_triangle_larger_than_the_region(show_viewer):
+    """A region smaller than the triangles it selects still selects them. The plate's top face is two 200 mm
+    triangles and the region is a 10 mm sphere on it: a test that asked for the corners to be inside would keep
+    nothing and the build would fail, and a scene that silently lost its only surface would rest on air."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2.5e-3, substeps=4, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-1e3, damping=2e-3),
+        show_viewer=show_viewer,
+    )
+    plate = scene.add_entity(morph=gs.morphs.Box(size=(0.2, 0.2, 0.02), pos=(0.0, 0.0, -0.01), fixed=True),
+                             material=gs.materials.Rigid())
+    block = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0.0, 0.0, 0.0105), nobisect=False, maxvolume=1e-6),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+    scene.vbd_solver.add_rigid_collider(plate.links[0], collision_group=0, regions=[(0.0, 0.0, 0.0, 0.01)])
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
+    scene.build()
+    for _ in range(60):
+        scene.step()
+    lowest = float(tensor_to_array(block.get_positions())[0][:, 2].min())
+    print(f"region smaller than its triangles: block rests at {1000 * lowest:.3f} mm")
+    assert not bool(scene.vbd_solver.env_status().is_failed[0])
+    assert lowest > -1e-4, "the block must rest on the plate, not fall through a surface the region dropped"
+    assert lowest < 2e-3

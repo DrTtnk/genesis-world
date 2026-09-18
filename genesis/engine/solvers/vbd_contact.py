@@ -232,6 +232,11 @@ class VBDContact:
         self.margin = self.max_thickness if solver._contact_margin is None else solver._contact_margin
         if not self.margin > 0.0:
             gs.raise_exception(f"VBDOptions.contact_margin must be above zero, got {self.margin}.")
+        # Left unset, each pair is judged against its own rule thickness, which is what the check did before the
+        # option existed. A single global depth would let the scene's coarsest rule decide for its finest: two
+        # rules of 0.05 mm and 5 mm would judge the fine pair at 5 mm, and a vertex twenty layers behind its own
+        # face would pass unreported.
+        self.crossing_depth_per_pair = solver._contact_crossing_depth is None
         self.crossing_depth = (
             self.max_thickness if solver._contact_crossing_depth is None else solver._contact_crossing_depth
         )
@@ -1041,7 +1046,10 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
             # With the continuous filter on there is nothing to detect: no pair ever reaches the gap, so the two
             # crossing tests here would only report their own false positives.
             if qd.static(not solver._contact_ccd):
-                if d < -contact.crossing_depth:
+                depth = contact.crossing_depth
+                if qd.static(contact.crossing_depth_per_pair):
+                    depth = h
+                if d < -depth:
                     qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
             y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
             if y < 0.0:
@@ -1064,7 +1072,10 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
             # up closer than the depth the penalty is trusted to recover.
             if qd.static(not solver._contact_ccd):
                 d_ee, n_ee, s_ee, t_ee, h_ee = func_ee_geometry(f, i_p, i_b, solver, contact)
-                if d_ee < contact.crossing_depth and func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
+                depth = contact.crossing_depth
+                if qd.static(contact.crossing_depth_per_pair):
+                    depth = h_ee
+                if d_ee < depth and func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
                     qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
             if y < 0.0:
                 force = -(y * n + scale * slide)

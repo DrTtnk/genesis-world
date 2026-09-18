@@ -983,7 +983,8 @@ class VBDOptions(Options):
         that it converges; a contact between rigid bodies does not, because the rule stiffness is already chosen
         for the pair's mass: on the python head an anchor of 39 kN/m under a hundredfold ramp reaches 3.9 MN/m,
         which is 788 N on a 25 g bone for 200 micrometres of overlap, while a fourfold ramp carries that bone's
-        weight with 155 micrometres of compression. Defaults to `constraint_k_max_ratio`.
+        weight with 155 micrometres of compression. A multiple below one would put every contact under the
+        stiffness its own rule asks for, and is refused. Defaults to `constraint_k_max_ratio`.
     contact_crossing_depth : float, optional
         How far behind a face (m) a contact point may be before the substep is refused as a crossing the penalty
         failed to hold. The signed point-triangle force already pushes a point that slipped behind back out, so
@@ -991,8 +992,9 @@ class VBDOptions(Options):
         travels in one substep or a fast pair is refused rather than recovered: the python head's bones reach
         433 micrometres per substep while resting onto their joints, against a 200 micrometre layer. Raising it
         buys recovery, not a guarantee -- a point that passed clean through a thin bone is pushed back to the
-        side it came from -- and continuous collision detection is the honest fix. Defaults to the largest rule
-        thickness.
+        side it came from -- and `contact_ccd` is the honest fix. Left unset, each pair is judged against its own
+        rule thickness, so the scene's coarsest rule never decides for its finest; a value here overrides that
+        for every pair at once.
     contact_margin : float, optional
         How far beyond the contact thickness (m) a pair is still collected as a candidate, and therefore the
         largest distance a contact vertex may travel in one substep before the substep fails as possibly having

@@ -12,8 +12,9 @@ displacement is removed, and what remains satisfies |d(t2) - d(t1)| <= l_p |t2 -
 sides' largest vertex displacement. From a state at distance d the pair therefore cannot close the gap in less
 than (d - gap) / l_p, and advancing by `scale` of that is safe; the loop repeats until the remaining gap is under
 (1 - scale) of the first one, and the sum of the advances taken is the bound. The reference implementation, the
-brute-force sweep it was checked against and the measured tightness (the bound is at least 0.88 of the true time
-of impact) are in `spikes/verify_accd.py` and its test in the application repository.
+brute-force sweep it was checked against are in `spikes/verify_accd.py` and its test in the application
+repository. How tight the bound is depends on the geometry: 0.88 to 0.90 of the true time of impact on that
+test's sweeps, but an adversarial pair reaches 0.61, and the only guarantee is the direction of the inequality.
 
 Two costs are real and neither is a defect. A pair that comes within the tolerance of the gap without touching is
 cut short as well, which slows a grazing substep for nothing (4 of 191 random point-triangle sweeps). And

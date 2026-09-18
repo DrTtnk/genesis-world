@@ -38,6 +38,8 @@ class VBDRigidAttachment:
         # to -1 for a link that never moves. A fixed link still carries attachments: it just has no block.
         free_joints = [] if self.is_articulated else [j for j in self.rigid.joints if j.type == gs.JOINT_TYPE.FREE]
         self.n_free = len(free_joints)
+        # the links whose pose this class owns for the substep, which is what a caller must know to rescale them
+        self.free_links = frozenset(joint.link.idx for joint in free_joints)
         free_slot = np.full(self.rigid.n_links, -1, dtype=gs.np_int)
         for slot, joint in enumerate(free_joints):
             free_slot[joint.link.idx] = slot

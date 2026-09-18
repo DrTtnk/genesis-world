@@ -320,3 +320,49 @@ def test_a_prescribed_collider_with_the_filter_is_refused():
     scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.0, thickness=2e-4)
     with pytest.raises(Exception, match="prescribed"):
         scene.build()
+
+
+def test_a_collider_the_rigid_solver_moves_is_refused_with_the_filter():
+    """The filter rescales tissue and the free bodies this solver owns. A collider that moves under the rigid
+    solver's own dynamics would keep its full end-of-substep pose while the tissue was held back, which is a
+    state the sweep never checked, and with the filter on the crossing tests are off, so it would pass through
+    in silence. Refused at build instead."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-1e3, contact_ccd=True),
+        show_viewer=False,
+    )
+    ball = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0.0, 0.0, 0.1)),
+                            material=gs.materials.Rigid())
+    scene.add_entity(
+        morph=gs.morphs.Box(size=(0.04, 0.04, 0.01), pos=(0.0, 0.0, 0.0), nobisect=False, maxvolume=1e-6),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+    scene.vbd_solver.add_rigid_collider(ball.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.0, thickness=2e-4)
+    with pytest.raises(gs.GenesisException, match="owns for the substep"):
+        scene.build()
+
+
+def test_the_same_collider_is_accepted_once_tissue_owns_it():
+    """The other half of the refusal: attaching tissue to the body puts its pose under this solver, and the
+    filter can then hold it to the same time of impact as everything else."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-1e3, contact_ccd=True),
+        show_viewer=False,
+    )
+    ball = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0.0, 0.0, 0.1)),
+                            material=gs.materials.Rigid())
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0.0, 0.0, 0.13), nobisect=False, maxvolume=1e-6),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+    rest = tensor_to_array(tissue.init_positions)
+    tissue.add_rigid_attachments(np.flatnonzero(rest[:, 2] < rest[:, 2].min() + 1e-5), ball.links[0])
+    scene.vbd_solver.add_rigid_collider(ball.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.0, thickness=2e-4)
+    scene.build()
+    assert ball.links[0].idx in scene.vbd_solver.rigid_attachment.free_links
+    scene.step()
+    assert not bool(scene.vbd_solver.env_status().is_failed[0])

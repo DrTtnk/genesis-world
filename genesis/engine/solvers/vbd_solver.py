@@ -149,6 +149,12 @@ class VBDSolver(Solver):
         self._contact_k_max_ratio = (
             options.constraint_k_max_ratio if options.contact_k_max_ratio is None else options.contact_k_max_ratio
         )
+        if not self._contact_k_max_ratio >= 1.0:
+            gs.raise_exception(
+                f"VBDOptions.contact_k_max_ratio is a multiple of a rule's own stiffness, so it cannot be "
+                f"below one: {self._contact_k_max_ratio} would put every contact under the stiffness its rule "
+                f"asks for."
+            )
         self._contact_ccd = options.contact_ccd
         self._contact_ccd_scale = options.contact_ccd_scale
         self._contact_ccd_gap = options.contact_ccd_gap
@@ -878,6 +884,20 @@ class VBDSolver(Solver):
                     if self.rigid_attachment is not None and self.rigid_attachment.is_articulated:
                         gs.raise_exception(
                             "VBDOptions.contact_ccd cannot rescale an articulated body's pose."
+                        )
+                    # A collider that moves under the rigid solver's own dynamics is not rescaled by the filter,
+                    # and with the filter on the crossing checks are off, so such a pair would pass through in
+                    # silence. Only a fixed collider (which never moves) and a free body this solver owns for
+                    # the substep can take part.
+                    owned = self.rigid_attachment.free_links if self.rigid_attachment is not None else frozenset()
+                    unowned = [link for link, _, _ in self._rigid_colliders
+                               if not link.is_fixed and link.idx not in owned]
+                    if unowned:
+                        gs.raise_exception(
+                            f"VBDOptions.contact_ccd can only rescale a collider that is fixed or that this "
+                            f"solver owns for the substep, and these move under the rigid solver instead: "
+                            f"{sorted(link.name for link in unowned)}. Attach tissue to them so VBD owns their "
+                            f"pose, fix them, or leave the filter off."
                         )
                 self.contact = VBDContact(
                     self, self._entities, self._rigid_colliders, self._prescribed_colliders, self._contact_rules
