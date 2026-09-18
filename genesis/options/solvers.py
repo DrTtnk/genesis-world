@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import numpy as np
 from pydantic import Field, PrivateAttr, StrictBool, model_validator
@@ -977,6 +977,13 @@ class VBDOptions(Options):
     contact_cell_cap : int, optional
         Largest number of contact vertices per hash-grid cell. Overflow fails the substep; raise it for meshes much
         finer than the contact thickness. Defaults to 64.
+    contact_margin : float, optional
+        How far beyond the contact thickness (m) a pair is still collected as a candidate, and therefore the
+        largest distance a contact vertex may travel in one substep before the substep fails as possibly having
+        missed a collision. It is not a physical layer: the thickness alone decides where a pair pushes. Raise it
+        when something light and fast rides on something heavy, such as a thin tissue pad on a falling bone, where
+        the thickness that suits the geometry would otherwise cap the speed. Larger values cost candidate pairs and
+        a coarser hash grid. Defaults to the largest rule thickness.
     raise_on_env_failure : bool, optional
         Whether a contact failure in any environment raises at the next step. A failed environment always stops
         advancing (its positions, prescribed motion and multipliers freeze) until it is reset. True stops the
@@ -1011,6 +1018,7 @@ class VBDOptions(Options):
     max_dual_steps: PositiveInt = 200
     contact_pair_cap: PositiveInt = 65536
     contact_cell_cap: PositiveInt = 64
+    contact_margin: Optional[float] = None
     raise_on_env_failure: StrictBool = True
     max_consecutive_inverted_substeps: PositiveInt = 1000
 

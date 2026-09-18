@@ -1030,3 +1030,64 @@ def test_a_tissue_outside_every_contact_rule_is_not_held_to_the_motion_bound():
     dropped = 0.5 - float(falling.get_positions()[..., 2].mean())
     assert dropped > 0.3, "the unruled tissue must be falling freely"
     assert float(resting.get_positions()[..., 2].min()) > -1e-4, "the ruled tissue still rests on the table"
+
+
+@pytest.mark.parametrize("margin", [None, 5e-3])
+def test_the_candidate_margin_can_be_raised_above_the_contact_thickness(margin, show_viewer):
+    """Thickness and margin answer different questions, and tying them together caps the speed of a scene.
+
+    A thin tissue pad rigidly carried by a fast body moves much further per substep than the physical contact
+    layer is thick: the python head's 0.5 mm articular pads reach 2 m/s on a falling bone, which is 200 um per
+    substep against a 200 um layer. The thickness must stay at the geometry's scale, so the margin is raised
+    instead. The physics is unchanged: with the default margin this scene fails the motion bound, with a raised
+    one it runs and the tissue still rests on the table rather than passing through it.
+    """
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-10.0, contact_margin=margin,
+                                          raise_on_env_failure=False),
+        show_viewer=show_viewer,
+    )
+    table = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.4, 0.4, 0.02), pos=(0.0, 0.0, -0.01), fixed=True),
+        material=gs.materials.Rigid(),
+    )
+    # dropped from 0.2 m, so it arrives at about 2 m/s: 4 mm per substep against a 0.2 mm layer
+    falling = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.0, 0.0, 0.2), nobisect=False, maxvolume=1e-5),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1),
+    )
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=2e-4)
+    scene.build()
+    assert scene.vbd_solver.contact.margin == pytest.approx(2e-4 if margin is None else margin)
+    for _ in range(140):
+        scene.step()
+    failed = bool(scene.vbd_solver.env_status().is_failed[0])
+    lowest = float(falling.get_positions()[..., 2].min())
+    print(f"margin {scene.vbd_solver.contact.margin} m: failed={failed}, lowest vertex {1000 * lowest:.3f} mm")
+    if margin is None:
+        assert failed, "the default margin is the thickness, and this scene outruns it"
+    else:
+        assert not failed
+        assert lowest > -1e-3, "the raised margin must not let the box pass through the table"
+        assert lowest < 0.01, "and it must actually have landed"
+
+
+def test_a_nonpositive_contact_margin_is_refused():
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-10.0, contact_margin=0.0),
+        show_viewer=False,
+    )
+    table = scene.add_entity(morph=gs.morphs.Box(size=(0.2, 0.2, 0.02), pos=(0.0, 0.0, -0.01), fixed=True),
+                             material=gs.materials.Rigid())
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.04, 0.04, 0.04), pos=(0.0, 0.0, 0.05), nobisect=False, maxvolume=1e-5),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+    scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.5, thickness=1e-3)
+    with pytest.raises(gs.GenesisException, match="contact_margin"):
+        scene.build()

@@ -203,7 +203,9 @@ class VBDContact:
         self.max_thickness = float(thickness.max())
         # a candidate is any pair within thickness + margin at the predicted positions; the margin is also the
         # largest motion a contact vertex may make in one substep without a candidate being missed
-        self.margin = self.max_thickness
+        self.margin = self.max_thickness if solver._contact_margin is None else solver._contact_margin
+        if not self.margin > 0.0:
+            gs.raise_exception(f"VBDOptions.contact_margin must be above zero, got {self.margin}.")
         self.cell = 2.0 * (self.max_thickness + self.margin)
         self.hash_buckets = 2 * self.n_cv
         self.hash_cap = solver._contact_cell_cap

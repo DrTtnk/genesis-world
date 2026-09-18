@@ -139,6 +139,7 @@ class VBDSolver(Solver):
         self._prescribed_colliders = []
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_cell_cap = options.contact_cell_cap
+        self._contact_margin = options.contact_margin
         self._raise_on_env_failure = options.raise_on_env_failure
         self._max_inverted_substeps = options.max_consecutive_inverted_substeps
         self.mtu = None
