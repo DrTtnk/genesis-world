@@ -958,7 +958,7 @@ def func_contact_dual_update(f, w, solver: qd.template(), contact: qd.template()
                 contact.cv_info[contact.tri_cv[contact.pt_pairs[i_p, i_b].b][0]].group,
             ]
             contact.pt_pairs[i_p, i_b].k = qd.min(
-                k + k0 / solver._constraint_tol * qd.max(h - d, 0.0), solver._constraint_k_max_ratio * k0
+                k + k0 / solver._constraint_tol * qd.max(h - d, 0.0), solver._contact_k_max_ratio * k0
             )
         if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
             d, n, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
@@ -969,7 +969,7 @@ def func_contact_dual_update(f, w, solver: qd.template(), contact: qd.template()
                 contact.cv_info[contact.edge_cv[contact.ee_pairs[i_p, i_b].b][0]].group,
             ]
             contact.ee_pairs[i_p, i_b].k = qd.min(
-                k + k0 / solver._constraint_tol * qd.max(h - d, 0.0), solver._constraint_k_max_ratio * k0
+                k + k0 / solver._constraint_tol * qd.max(h - d, 0.0), solver._contact_k_max_ratio * k0
             )
 
 
@@ -1034,7 +1034,14 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
             ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
             eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
-            if func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
+            # A sign flip alone is not interpenetration: two edges sliding tangentially past each other swap
+            # sides while staying far outside the layer, and the penalty was never asked to hold them. The
+            # python head's joints slide 433 micrometres a substep and failed every configuration this way,
+            # with the failure bit-identical under a ten-thousandfold change of contact stiffness, which is
+            # what a report the penalty cannot influence looks like. A crossing counts when the edges also end
+            # up closer than the depth the penalty is trusted to recover.
+            d_ee, n_ee, s_ee, t_ee, h_ee = func_ee_geometry(f, i_p, i_b, solver, contact)
+            if d_ee < contact.crossing_depth and func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
             if y < 0.0:
                 force = -(y * n + scale * slide)

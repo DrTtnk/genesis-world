@@ -977,6 +977,13 @@ class VBDOptions(Options):
     contact_cell_cap : int, optional
         Largest number of contact vertices per hash-grid cell. Overflow fails the substep; raise it for meshes much
         finer than the contact thickness. Defaults to 64.
+    contact_k_max_ratio : float, optional
+        Upper bound of a contact pair's stiffness as a multiple of its rule stiffness, separately from
+        `constraint_k_max_ratio`, which governs attachments and ligaments. A hard attachment wants a high cap so
+        that it converges; a contact between rigid bodies does not, because the rule stiffness is already chosen
+        for the pair's mass: on the python head an anchor of 39 kN/m under a hundredfold ramp reaches 3.9 MN/m,
+        which is 788 N on a 25 g bone for 200 micrometres of overlap, while a fourfold ramp carries that bone's
+        weight with 155 micrometres of compression. Defaults to `constraint_k_max_ratio`.
     contact_crossing_depth : float, optional
         How far behind a face (m) a contact point may be before the substep is refused as a crossing the penalty
         failed to hold. The signed point-triangle force already pushes a point that slipped behind back out, so
@@ -1029,6 +1036,7 @@ class VBDOptions(Options):
     contact_cell_cap: PositiveInt = 64
     contact_margin: Optional[float] = None
     contact_crossing_depth: Optional[float] = None
+    contact_k_max_ratio: Optional[float] = None
     raise_on_env_failure: StrictBool = True
     max_consecutive_inverted_substeps: PositiveInt = 1000
 

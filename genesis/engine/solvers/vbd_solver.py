@@ -141,6 +141,9 @@ class VBDSolver(Solver):
         self._contact_cell_cap = options.contact_cell_cap
         self._contact_margin = options.contact_margin
         self._contact_crossing_depth = options.contact_crossing_depth
+        self._contact_k_max_ratio = (
+            options.constraint_k_max_ratio if options.contact_k_max_ratio is None else options.contact_k_max_ratio
+        )
         self._raise_on_env_failure = options.raise_on_env_failure
         self._max_inverted_substeps = options.max_consecutive_inverted_substeps
         self.mtu = None

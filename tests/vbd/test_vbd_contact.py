@@ -1164,3 +1164,50 @@ def test_a_malformed_collider_region_is_refused():
     for bad, match in (([(0.0, 0.0, 0.0)], "shape"), ([], "shape"), ([(0.0, 0.0, 0.0, 0.0)], "radius")):
         with pytest.raises(gs.GenesisException, match=match):
             scene.vbd_solver.add_rigid_collider(table.links[0], collision_group=0, regions=bad)
+
+
+def test_edges_sliding_past_each_other_are_not_reported_as_a_crossing(show_viewer):
+    """Two surfaces sliding tangentially swap the sign of their edges' triple product without ever touching.
+
+    Reporting that as a crossing the penalty failed to hold stops a scene that is doing nothing wrong: the
+    python head's joints slide 433 micrometres a substep as the skull rests onto them, and every run died this
+    way, identically under a ten-thousandfold change of contact stiffness. A crossing now also has to bring the
+    edges within the depth the penalty is trusted to recover.
+    """
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=4, floor_height=-1e3, raise_on_env_failure=False,
+                                          contact_margin=5e-3),
+        show_viewer=show_viewer,
+    )
+    plate = scene.add_entity(morph=gs.morphs.Box(size=(0.2, 0.2, 0.01), pos=(0.0, 0.0, 0.0), fixed=True),
+                             material=gs.materials.Rigid())
+    # a tissue block 3 mm clear of the plate, given a hard sideways shove: it slides past every edge of the
+    # plate at 2 m/s, which is 4 mm a substep, without ever coming within the 0.2 mm layer
+    slider = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(-0.08, 0.0, 0.018), nobisect=False, maxvolume=1e-6),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1))
+    scene.vbd_solver.add_rigid_collider(plate.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e4, friction=0.0, thickness=2e-4)
+    scene.build()
+    rest = tensor_to_array(slider.init_positions)
+    scene.vbd_solver.set_state(0, _velocity_state(scene, slider, (2.0, 0.0, 0.0)))
+    for _ in range(40):
+        scene.step()
+    status = scene.vbd_solver.env_status()
+    now = tensor_to_array(slider.get_positions())[0]
+    print(f"slid {1000 * (now[:, 0].mean() - rest[:, 0].mean()):.1f} mm, failed={bool(status.is_failed[0])}, "
+          f"errno={int(status.errno[0])}, lowest {1000 * now[:, 2].min():.3f} mm")
+    assert now[:, 0].mean() - rest[:, 0].mean() > 0.05, "the block must actually have slid across the plate"
+    assert now[:, 2].min() > 0.004, "and stayed clear of it, so nothing here is a real crossing"
+    assert not bool(status.is_failed[0]), f"a tangential pass must not fail the substep (errno {int(status.errno[0])})"
+
+
+def _velocity_state(scene, entity, velocity):
+    """The solver state with one entity's vertices given a uniform velocity. `vel` is a read-only property, so
+    the backing tensor is written in place."""
+    state = scene.vbd_solver.get_state(0)
+    state._vel[:, entity.v_start : entity.v_start + entity.n_vertices] = torch.tensor(
+        velocity, dtype=state._vel.dtype, device=state._vel.device)
+    return state
