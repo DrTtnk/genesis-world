@@ -123,10 +123,18 @@ class VBDContact:
                 faces = self._faces_with_positive_volume(geom.init_faces.astype(np.int64), local)
                 if regions is not None:
                     world = gu.transform_by_trans_quat(local, *self._link_rest_pose(link))
-                    inside = np.zeros(len(world), dtype=bool)
+                    # A triangle is kept when its bounding sphere reaches into a region: the centroid within the
+                    # radius plus the triangle's own longest edge. Testing the corners instead drops a triangle
+                    # that is larger than the region and covers it, which the head's rods and the splenial do;
+                    # this test keeps a few triangles that only come close, which costs a little and cannot
+                    # silently remove a contact.
+                    corners = world[faces]
+                    centroid = corners.mean(axis=1)
+                    span = np.linalg.norm(corners - corners[:, [1, 2, 0]], axis=2).max(axis=1)
+                    keep = np.zeros(len(faces), dtype=bool)
                     for x, y, z, radius in regions:
-                        inside |= np.linalg.norm(world - np.array([x, y, z]), axis=1) <= radius
-                    faces = faces[inside[faces].all(axis=1)]
+                        keep |= np.linalg.norm(centroid - np.array([x, y, z]), axis=1) <= radius + span
+                    faces = faces[keep]
                     if not len(faces):
                         gs.raise_exception(
                             f"No triangle of collider link {link.name} lies inside any of its regions."
@@ -221,6 +229,13 @@ class VBDContact:
         self.margin = self.max_thickness if solver._contact_margin is None else solver._contact_margin
         if not self.margin > 0.0:
             gs.raise_exception(f"VBDOptions.contact_margin must be above zero, got {self.margin}.")
+        self.crossing_depth = (
+            self.max_thickness if solver._contact_crossing_depth is None else solver._contact_crossing_depth
+        )
+        if not self.crossing_depth > 0.0:
+            gs.raise_exception(
+                f"VBDOptions.contact_crossing_depth must be above zero, got {self.crossing_depth}."
+            )
         self.cell = 2.0 * (self.max_thickness + self.margin)
         self.hash_buckets = 2 * self.n_cv
         self.hash_cap = solver._contact_cell_cap
@@ -1003,8 +1018,8 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
             d, n, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
             if not (d == d):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
-            # signed over the face: a point a whole layer behind the surface has passed through it
-            if d < -h:
+            # signed over the face: a point this far behind the surface is past what the penalty can recover
+            if d < -contact.crossing_depth:
                 qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
             y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
             if y < 0.0:

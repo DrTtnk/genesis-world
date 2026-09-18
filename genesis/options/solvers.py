@@ -977,6 +977,15 @@ class VBDOptions(Options):
     contact_cell_cap : int, optional
         Largest number of contact vertices per hash-grid cell. Overflow fails the substep; raise it for meshes much
         finer than the contact thickness. Defaults to 64.
+    contact_crossing_depth : float, optional
+        How far behind a face (m) a contact point may be before the substep is refused as a crossing the penalty
+        failed to hold. The signed point-triangle force already pushes a point that slipped behind back out, so
+        this is the depth at which that recovery is no longer trusted. It has to exceed the distance a surface
+        travels in one substep or a fast pair is refused rather than recovered: the python head's bones reach
+        433 micrometres per substep while resting onto their joints, against a 200 micrometre layer. Raising it
+        buys recovery, not a guarantee -- a point that passed clean through a thin bone is pushed back to the
+        side it came from -- and continuous collision detection is the honest fix. Defaults to the largest rule
+        thickness.
     contact_margin : float, optional
         How far beyond the contact thickness (m) a pair is still collected as a candidate, and therefore the
         largest distance a contact vertex may travel in one substep before the substep fails as possibly having
@@ -1019,6 +1028,7 @@ class VBDOptions(Options):
     contact_pair_cap: PositiveInt = 65536
     contact_cell_cap: PositiveInt = 64
     contact_margin: Optional[float] = None
+    contact_crossing_depth: Optional[float] = None
     raise_on_env_failure: StrictBool = True
     max_consecutive_inverted_substeps: PositiveInt = 1000
 

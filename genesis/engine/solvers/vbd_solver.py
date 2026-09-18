@@ -140,6 +140,7 @@ class VBDSolver(Solver):
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_cell_cap = options.contact_cell_cap
         self._contact_margin = options.contact_margin
+        self._contact_crossing_depth = options.contact_crossing_depth
         self._raise_on_env_failure = options.raise_on_env_failure
         self._max_inverted_substeps = options.max_consecutive_inverted_substeps
         self.mtu = None
@@ -169,8 +170,9 @@ class VBDSolver(Solver):
         link, a link the tissue drives, or a prescribed link all work.
 
         `regions` restricts which of the link's geometry takes part, as world-space spheres
-        `[(x, y, z, radius), ...]` measured at the rest pose: a triangle is collected when all three of its
-        corners lie inside one of them. A whole bone is mostly nowhere near anything it can touch -- of the
+        `[(x, y, z, radius), ...]` measured at the rest pose: a triangle is collected when its bounding sphere
+        reaches into one of them, so a triangle larger than the region still counts and nothing that could touch
+        is silently dropped. A whole bone is mostly nowhere near anything it can touch -- of the
         python head's 14,872 collider vertices only 1,148 lie within 2.5 mm of another bone, and 39 of the
         braincase's 3,938 -- and every triangle that cannot meet a partner still costs a place in the hash grid
         and a candidate test every substep. Regions are geometric rather than face indices because the collision
