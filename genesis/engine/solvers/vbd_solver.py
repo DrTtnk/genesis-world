@@ -23,6 +23,8 @@ uses `B_a = B A`, `A = (1/s) m m^T + sqrt(s) (I - m m^T)`, `s = 1 - a gain`, `de
 from typing import NamedTuple
 
 import networkx as nx
+import itertools
+
 import numpy as np
 import torch
 
@@ -659,14 +661,37 @@ class VBDSolver(Solver):
         offset = np.searchsorted(inc_vert[order], np.arange(self._n_vertices + 1))
         return offset, inc_elem[order], inc_role[order]
 
-    def _compute_vertex_coloring_and_incidence(self, elems, cons, acons, tris, bends):
+    def _live_read_bonds(self):
+        """Every group of vertices that one term reads from the buffer the color pass is writing, in global
+        indices. They have to differ in color for the same reason a constraint's two ends do: two threads of one
+        launch must never read positions each other is part way through writing.
+
+        A tissue attachment reads every weighted corner of both its sides (`func_tissue_attachment_gap` at
+        `f + 1`), and those are what this returns.
+
+        A routed unit has the same problem and is NOT here. Its force comes from the whole route's length, so
+        `func_anchor_position` at `f + 1` reads every tissue anchor along it, and all of them would have to
+        differ in color. On the python head that asks for 42 colors, and the solver refuses to compile 12
+        sweeps of them. Coloring cannot buy this one; it needs the route to read a start-of-sweep snapshot
+        instead, which makes the term Jacobi rather than Gauss-Seidel and is a change to the physics rather
+        than to the bookkeeping. It is left open deliberately."""
+        bonds = []
+        for (entity_a, verts_a, weights_a), (entity_b, verts_b, weights_b) in self._tissue_attachment_pairs:
+            bond = {int(entity_a.v_start + v) for v, w in zip(verts_a, weights_a) if w != 0.0}
+            bond |= {int(entity_b.v_start + v) for v, w in zip(verts_b, weights_b) if w != 0.0}
+            if len(bond) > 1:
+                bonds.append(sorted(bond))
+        return bonds
+
+    def _compute_vertex_coloring_and_incidence(self, elems, cons, acons, tris, bends, bonds):
         """Greedy vertex coloring of the graph of tets, triangles, bending stencils and constraints, plus the
         vertex -> incident-element CSR list of each of the first three.
 
         Returns (perm, color_offsets, n_colors, ve_offset, ve_elem, ve_role, vt_offset, vt_elem, vt_role,
         vb_offset, vb_elem, vb_role, color): vertices sorted by color (`perm[color_offsets[c]:color_offsets[c+1]]`
         is color `c`), and the CSR triples for tets, triangles and bending stencils. Two vertices that share a
-        tet, a triangle, a bending stencil or a constraint never share a color, so each color is one race-free
+        tet, a triangle, a bending stencil, a constraint or a tissue attachment never share a color, so each
+        color is one race-free
         Gauss-Seidel sweep: a stencil couples all four of its vertices (`H_ij = w c_i c_j I` for every `i, j`,
         not only `i == j`), so every pair of the four, not only edges of the stencil's two triangles, must differ.
         """
@@ -682,9 +707,23 @@ class VBDSolver(Solver):
         for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)):
             keep = acons[:, a] != acons[:, b]  # a vertex may serve both vectors of an angle constraint
             graph.add_edges_from(zip(acons[keep, a].tolist(), acons[keep, b].tolist()))
+        # These are the groups a single term reads from the live buffer: a tissue attachment's weighted corners
+        # on both sides, and every tissue anchor along a routed unit. A tissue attachment reads the live
+        # positions of every weighted corner of BOTH its sides
+        # (`func_tissue_attachment_gap` at `f + 1`), so all of them have to be in different colors for the same
+        # reason a constraint's two ends do. They were not in this graph, and 147 of the python head's 312
+        # attachments had at least one pair of weighted corners sharing a color, which is two threads of one
+        # launch reading positions the other is part way through writing. That is a race rather than a
+        # reordering: the two reads can disagree about what the value is, not merely about its rounding, which
+        # is why one run of a pair could finish the head's 100 ms probe while the other refused a substep.
+        for bond in bonds:
+            graph.add_edges_from(itertools.combinations(sorted(bond), 2))
         coloring = nx.greedy_color(graph, strategy="smallest_last")
         color = np.array([coloring[i] for i in range(self._n_vertices)], dtype=np.int64)
         assert (color[cons[:, 0]] != color[cons[:, 1]]).all(), "a constraint joins two vertices of the same color"
+        assert all(
+            len({color[v] for v in bond}) == len(bond) for bond in bonds
+        ), "a term reads two vertices of the same color while that color is being written"
         assert all(
             (color[acons[:, a]] != color[acons[:, b]])[acons[:, a] != acons[:, b]].all()
             for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
@@ -798,7 +837,7 @@ class VBDSolver(Solver):
                 vb_elem,
                 vb_role,
                 color,
-            ) = self._compute_vertex_coloring_and_incidence(elems, cons, acons, tris, bends)
+            ) = self._compute_vertex_coloring_and_incidence(elems, cons, acons, tris, bends, self._live_read_bonds())
             self._init_constraints(cons, lo, hi)
             self._init_angle_constraints(acons, alo, ahi)
             if self._damping > 0.0:
