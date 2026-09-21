@@ -46,14 +46,6 @@ ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
 POINT_TRIANGLE = 0
 EDGE_EDGE = 1
 
-# How far off zero the side test's triple product has to be, relative to the product of the three vector
-# magnitudes that scale it, before a change of its sign is read as two edges having swapped sides. The
-# normalised quantity is the sine of the angle between the edges times the cosine of the angle their offset
-# makes with the common normal, so this is the smallest misalignment the test is willing to believe. Single
-# precision positions carry about seven digits and the product is a difference of nearly equal numbers, so a
-# thousandth of a degree of skew is already at the noise floor; two edges that genuinely cross are orders
-# above it.
-CROSSING_SIDE_FLOOR = 1e-5
 
 # VBD_CONTACT_MOTION_BOUND no longer marks a refused substep (see kernel_end_contact): it marks that this
 # substep's safe bound ran out, which the next kernel_begin_contact reads to decide to rebuild. Every other bit
@@ -1301,50 +1293,6 @@ def func_accumulate_reaction(f, cv, force, i_b, solver: qd.template(), contact: 
             qd.atomic_add(contact.link_reaction[i_l, i_b][j + 3], qd.cast(torque[j], qd.f64))
 
 
-@qd.func
-def func_edges_swapped_sides(a0, b0, c0, d0, a1, b1, c1, d1):
-    """Whether two edges swapped sides over the substep: the sign of the triple product
-    (b - a) x (d - c) . (a - c) at the start against its sign at the end.
-
-    The product carries a factor of the sine of the angle between the two edges, so for edges that are nearly
-    parallel it is the difference of nearly equal numbers and its sign is rounding noise. Two surfaces resting
-    against each other meet along nearly parallel edges, which put every load-bearing contact of the python
-    head one rounding error away from being reported as a crossing: at substep 357 of a head36 run the closest
-    pair in the scene sat at 99.72 percent of its contact layer, with nothing anywhere behind anything, and the
-    substep was refused. A sign change therefore counts only when the quantity that changed sign was itself
-    meaningfully non-zero, measured against the magnitude the three vectors give it. A real crossing is a long
-    way from the floor on both sides of the substep, because the edges leave and enter at a definite angle.
-    """
-    swapped = False
-    side0 = (b0 - a0).cross(d0 - c0).dot(a0 - c0)
-    side1 = (b1 - a1).cross(d1 - c1).dot(a1 - c1)
-    if side0 * side1 < 0.0:
-        scale0 = (b0 - a0).norm() * (d0 - c0).norm() * (a0 - c0).norm()
-        scale1 = (b1 - a1).norm() * (d1 - c1).norm() * (a1 - c1).norm()
-        floor = gs.qd_float(CROSSING_SIDE_FLOOR)
-        if qd.abs(side0) > floor * scale0 and qd.abs(side1) > floor * scale1:
-            swapped = True
-    return swapped
-
-
-@qd.func
-def func_edges_crossed(f, i_b, ea, eb, s, t, solver: qd.template(), contact: qd.template()):
-    """Whether two edges whose closest points are interior swapped sides over the substep."""
-    crossed = False
-    if s > 0.0 and s < 1.0 and t > 0.0 and t < 1.0:
-        crossed = func_edges_swapped_sides(
-            func_cv_pos_prev(f, ea[0], i_b, solver, contact),
-            func_cv_pos_prev(f, ea[1], i_b, solver, contact),
-            func_cv_pos_prev(f, eb[0], i_b, solver, contact),
-            func_cv_pos_prev(f, eb[1], i_b, solver, contact),
-            func_cv_pos(f, ea[0], i_b, solver, contact),
-            func_cv_pos(f, ea[1], i_b, solver, contact),
-            func_cv_pos(f, eb[0], i_b, solver, contact),
-            func_cv_pos(f, eb[1], i_b, solver, contact),
-        )
-    return crossed
-
-
 @qd.kernel
 def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), contact: qd.template(), dyn_state: DynState):
     """Wrenches on the collider links from the final pair state, the substep's validity checks (finite geometry,
@@ -1383,19 +1331,23 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
             ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
             eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
-            # A sign flip alone is not interpenetration: two edges sliding tangentially past each other swap
-            # sides while staying far outside the layer, and the penalty was never asked to hold them. The
-            # python head's joints slide 433 micrometres a substep and failed every configuration this way,
-            # with the failure bit-identical under a ten-thousandfold change of contact stiffness, which is
-            # what a report the penalty cannot influence looks like. A crossing counts when the edges also end
-            # up closer than the depth the penalty is trusted to recover.
-            if qd.static(not solver._contact_ccd):
-                d_ee, n_ee, s_ee, t_ee, h_ee = func_ee_geometry(f, i_p, i_b, solver, contact)
-                depth = contact.crossing_depth
-                if qd.static(contact.crossing_depth_per_pair):
-                    depth = h_ee
-                if d_ee < depth and func_edges_crossed(f, i_b, ea, eb, s, t, solver, contact):
-                    qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
+            # There is no edge-edge crossing test. A crossing is measured against a surface and a pair of edges
+            # does not have one: the sign of (b - a) x (d - c) . (a - c) says which side of their common
+            # perpendicular the edges are on, which is not which side of a body they are on. Two convex
+            # surfaces resting against each other slide their boundary edges across each other continuously,
+            # and every one of those is a sign change with no penetration anywhere near it. The point-triangle
+            # test above does have a surface, so its distance is signed over the face and `d < -depth` reads as
+            # "this far behind", which is the question worth asking.
+            #
+            # Measured on the python head at the substep that used to refuse the run: the edge-edge test
+            # reported nine crossings, every one between angular.R and coronoid.R and at 22 to 89 percent of
+            # the depth, while the point-triangle test found no point behind a face anywhere in the scene, the
+            # most negative signed distance over its 43 interior projections being +0.154 mm. Nothing was
+            # penetrating. The test had already been narrowed twice, once to require the pair to be inside the
+            # layer and once to require the sign change to clear the noise of nearly parallel edges, and it
+            # still could not separate articulation from interpenetration, because the quantity it reads does
+            # not carry that difference. `VBDOptions.contact_ccd` prevents a crossing rather than reporting
+            # one, and the point-triangle test reports the ones that happen.
             if y < 0.0:
                 force = -(y * n + scale * slide)
                 func_accumulate_reaction(f, ea[0], (1.0 - s) * force, i_b, solver, contact, dyn_state)

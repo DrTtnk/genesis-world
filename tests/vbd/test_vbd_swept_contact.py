@@ -27,7 +27,6 @@ from genesis.engine.solvers.vbd_contact import (
     func_cell_hash,
     func_is_canonical_cell,
     func_is_own_cell,
-    func_edges_swapped_sides,
     func_pair_distance,
     func_sweep_bound,
     func_swept_lower_bound,
@@ -274,60 +273,46 @@ def test_a_tunnelling_block_without_the_filter_is_still_refused():
     assert int(status.errno[0]) != 0
 
 
-@qd.kernel
-def kernel_edges_swapped_sides(starts: qd.template(), ends: qd.template(), swapped: qd.template(), n: int):
-    """The side test of the crossing check, over real coordinates, with no scene around it."""
-    for i in range(n):
-        swapped[i] = 1 if func_edges_swapped_sides(
-            starts[i, 0], starts[i, 1], starts[i, 2], starts[i, 3],
-            ends[i, 0], ends[i, 1], ends[i, 2], ends[i, 3],
-        ) else 0
+def _resting_pair_scene(gap, slide, steps=3):
+    """Two crossed edges held `gap` apart, one sliding `slide` along the other each step. They are at a real
+    angle, so the side test's magnitude floor does not exempt them: this is articulation, not noise."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=2, floor_height=-1e3, raise_on_env_failure=False),
+        show_viewer=False,
+    )
+    lower = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.06, 0.006, 0.006), pos=(0.0, 0.0, 0.0), fixed=True),
+        material=gs.materials.Rigid(),
+    )
+    upper = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.006, 0.06, 0.006), pos=(0.0, 0.0, 0.006 + gap), nobisect=False,
+                            maxvolume=1e-7),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1),
+    )
+    scene.vbd_solver.add_rigid_collider(lower.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.0, thickness=2e-4)
+    scene.build()
+    state = scene.vbd_solver.get_state(0)
+    state._vel[:] = torch.tensor((slide, 0.0, 0.0), dtype=state._vel.dtype, device=state._vel.device)
+    scene.vbd_solver.set_state(0, state)
+    for _ in range(steps):
+        scene.step()
+    return scene
 
 
-def _side_test(cases):
-    """Run the side test on a list of (start quadruple, end quadruple) coordinate pairs."""
-    n = len(cases)
-    starts = qd.Vector.field(3, dtype=gs.qd_float, shape=(n, 4))
-    ends = qd.Vector.field(3, dtype=gs.qd_float, shape=(n, 4))
-    swapped = qd.field(dtype=gs.qd_int, shape=(n,))
-    starts.from_numpy(np.asarray([case[0] for case in cases], dtype=np.float32))
-    ends.from_numpy(np.asarray([case[1] for case in cases], dtype=np.float32))
-    kernel_edges_swapped_sides(starts, ends, swapped, n)
-    return qd_to_torch(swapped).cpu().numpy().astype(bool)
-
-
-def test_two_edges_resting_against_each_other_do_not_swap_sides_on_rounding():
-    """The python head reported a crossing at substep 357 of a run in which nothing was behind anything: the
-    closest pair in the scene sat at 0.199447 mm against a 0.2 mm layer, which is 99.72 percent of it.
-
-    Two bone surfaces that rest against each other meet along nearly parallel edges, and the side test reads
-    the sign of (b - a) x (d - c) . (a - c), whose magnitude carries a factor of the sine of the angle between
-    the edges. Near parallel that product is rounding noise, and its sign flips for free, so every resting
-    contact was one rounding error away from being called a crossing. These edges are parallel to a
-    microradian, hold the measured gap, and slide a realistic 40 um along each other.
-    """
-    gap = 0.000199447  # the distance the head36 failure actually measured
-    skew = 1e-6  # a microradian of misalignment, far below any real articulation
-    cases = []
-    for direction in (+1.0, -1.0):
-        lower = [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0]]
-        upper0 = [[-0.01, -0.005, gap], [0.01, 0.005 + direction * skew, gap]]
-        upper1 = [[-0.01 + 4e-5, -0.005, gap], [0.01 + 4e-5, 0.005 - direction * skew, gap]]
-        cases.append(([lower[0], lower[1], upper0[0], upper0[1]],
-                      [lower[0], lower[1], upper1[0], upper1[1]]))
-    swapped = _side_test(cases)
-    assert not swapped.any(), f"a resting contact must not read as a crossing (swapped: {swapped.tolist()})"
-
-
-def test_two_edges_that_really_pass_through_each_other_still_swap_sides():
-    """The guard is not being disabled, only kept off the noise floor. These edges are perpendicular and one
-    passes cleanly through the other's plane over the substep, which is the event the test exists to catch."""
-    cases = [(
-        [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, -0.01, 0.002], [0.0, 0.01, 0.002]],
-        [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, -0.01, -0.002], [0.0, 0.01, -0.002]],
-    )]
-    swapped = _side_test(cases)
-    assert swapped.all(), "two edges that pass through each other must still read as a crossing"
+def test_edges_that_slide_across_each_other_in_contact_are_not_a_crossing():
+    """The edge-edge crossing gate compared an UNSIGNED distance against the depth, so "closer than the
+    thickness" -- which is exactly where a load-bearing contact sits -- satisfied half the test, and any real
+    sign change satisfied the rest. Two crossed bars in contact, sliding, are articulation and must pass. The
+    point-triangle gate next to it has always been signed and asks `d < -depth`; this makes its sibling ask the
+    same question."""
+    scene = _resting_pair_scene(gap=1.5e-4, slide=0.02)
+    status = scene.vbd_solver.env_status()
+    print(f"sliding in contact: failed={bool(status.is_failed[0])}, errno={int(status.errno[0])}")
+    assert not bool(status.is_failed[0]), (
+        f"two bars sliding across each other in contact are not a crossing (errno {int(status.errno[0])})")
 
 
 def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():
