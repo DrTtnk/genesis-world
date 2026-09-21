@@ -66,6 +66,7 @@ def init(
     logger_verbose_time=False,
     performance_mode=False,
     use_deterministic_algorithms=False,
+    kernel_profiler=False,
 ):
     global _initialized
     if _initialized:
@@ -284,6 +285,7 @@ def init(
             # * Up to 500MiB static upper-bound mem alloc per kernel before switching to tight runtime-based bound
             ad_stack_sparse_threshold_bytes=200_000_000,
             ad_stack_experimental_enabled=True,
+            kernel_profiler=kernel_profiler,
             **qd_init_kwargs,
         )
 
