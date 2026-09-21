@@ -128,6 +128,9 @@ class VBDContact:
         # Contact vertices: the tissue boundary vertices first, then every vertex of every rigid collider mesh.
         cv_kind, cv_ref, cv_group, cv_owner, triangles, edges = [], [], [], [], [], []
         rv_link, rv_local = [], []
+        # Rest positions of the contact vertices, only ever used to size the grid. A rigid collider's are in its
+        # own frame rather than the world, which is enough, because an edge length does not care about the pose.
+        cv_rest = []
         for entity in entities:
             if entity.n_triangles:
                 # A shell is already a surface: its own triangles are the contact faces, and every vertex of
@@ -147,6 +150,7 @@ class VBDContact:
             cv_owner.extend([-1 - entity.idx] * len(boundary))
             triangles.append(base + faces_local.reshape(-1, 3))
             edges.append(base + self._unique_edges(faces_local.reshape(-1, 3)))
+            cv_rest.append(np.asarray(tensor_to_array(entity.init_positions))[boundary])
         for link, group, regions in colliders:
             if not link.geoms and not any(link is other for entity, _, _ in prescribed for other in entity.links):
                 gs.raise_exception(f"Collider link {link.name} has no collision geometry.")
@@ -183,10 +187,13 @@ class VBDContact:
                 cv_owner.extend([link.idx] * len(local))
                 rv_link.extend([link.idx] * len(local))
                 rv_local.append(local)
+                cv_rest.append(np.asarray(local))
                 triangles.append(base + faces)
                 edges.append(base + self._unique_edges(faces))
         triangles = np.concatenate(triangles)
         edges = np.concatenate(edges)
+        rest = np.concatenate(cv_rest)
+        self.median_edge = float(np.median(np.linalg.norm(rest[edges[:, 0]] - rest[edges[:, 1]], axis=1)))
         self.n_cv = len(cv_kind)
         self.n_rv = len(rv_link)
         self.n_triangles = len(triangles)
@@ -295,14 +302,27 @@ class VBDContact:
             gs.raise_exception(
                 f"VBDOptions.contact_crossing_depth must be above zero, got {self.crossing_depth}."
             )
-        # The grid cell size is sized off margin (D_min), not margin_max (D_max): the two are deliberately
-        # decoupled. A cell only has to be big enough that two primitives within one margin of each other share a
-        # canonical cell (see func_is_canonical_cell); making the reach a rebuild searches (margin_max) generous
-        # does not require making the grid coarser too. A coarser grid packs more contact vertices into one hash
-        # bucket for the same geometry, and hash_cap does not grow with margin_max -- coupling the two turned a
-        # bigger D_max into OVERFLOW_VBD_CONTACT_CELL on scenes with no margin_max of their own. A rebuild's
-        # search still widens (see `reach` in kernel_begin_contact below): it walks more, smaller cells instead.
-        self.cell = 2.0 * (self.max_thickness + self.margin)
+        # The cell decides nothing about which pairs are found. A primitive's own sweep, grown by the reach, is
+        # rasterised into the grid and so is every vertex's swept box, and func_is_canonical_cell accepts each
+        # overlap exactly once, so the candidate set is the same at any cell size and only the cost moves. Two
+        # costs move against each other: a bigger cell puts each box in fewer cells, and puts more vertices in
+        # each cell. The product is least near the mesh's own scale, which is why the default is the median
+        # contact edge rather than anything to do with the contact layer.
+        #
+        # Sizing it off the layer was the mistake this replaces. On the python head a 0.2 mm layer and a 0.2 mm
+        # margin gave a 0.8 mm cell for triangles averaging 2.8 mm across and reaching 84 mm, so the mean
+        # triangle was rasterised into 350 cells and the worst into 36288: one substep made 20.0 M cell visits
+        # and 11.8 M bucket-entry reads to keep 560 pairs, which is 21000 entries read for every pair kept, and
+        # about a gigabyte of scattered traffic. At the median edge of 3.1 mm the same substep needs about
+        # 2.4 M of both. The floor is twice the reach, so that growing a box by the reach can never add more
+        # than one cell a side; below that the grid costs cells without separating anything.
+        self.cell = (
+            max(2.0 * (self.max_thickness + self.margin_max), self.median_edge)
+            if solver._contact_cell_size is None
+            else solver._contact_cell_size
+        )
+        if not self.cell > 0.0:
+            gs.raise_exception(f"VBDOptions.contact_cell_size must be above zero, got {self.cell}.")
         self.hash_buckets = 2 * self.n_cv
         self.hash_cap = solver._contact_cell_cap
         self.cell_n = qd.field(dtype=gs.qd_int, shape=(self.hash_buckets, solver._B))

@@ -147,6 +147,7 @@ class VBDSolver(Solver):
         self._contact_sweep_cell_cap = options.contact_sweep_cell_cap
         self._contact_margin = options.contact_margin
         self._contact_margin_max = options.contact_margin_max
+        self._contact_cell_size = options.contact_cell_size
         self._contact_crossing_depth = options.contact_crossing_depth
         self._contact_k_max_ratio = (
             options.constraint_k_max_ratio if options.contact_k_max_ratio is None else options.contact_k_max_ratio

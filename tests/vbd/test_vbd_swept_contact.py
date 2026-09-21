@@ -357,14 +357,15 @@ def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():
     assert int(frozen["n_point_pairs"][0]) + int(frozen["n_edge_pairs"][0]) > 0, "the evidence must not be empty"
 
 
-def _two_block_scene(velocity):
+def _two_block_scene(velocity, cell=None):
     """Two tissue blocks a hair apart, both carried at the same velocity: the pair geometry is identical at every
     speed, only the swept cell ranges grow."""
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
         rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
         vbd_options=gs.options.VBDOptions(
-            n_iterations=1, floor_height=-1e3, contact_margin=1e-3, raise_on_env_failure=False
+            n_iterations=1, floor_height=-1e3, contact_margin=1e-3, contact_cell_size=cell,
+            raise_on_env_failure=False
         ),
         show_viewer=False,
     )
@@ -382,7 +383,7 @@ def _two_block_scene(velocity):
     state._vel[:] = torch.tensor((0.0, 0.0, velocity), dtype=state._vel.dtype, device=state._vel.device)
     scene.vbd_solver.set_state(0, state)
     scene.step()
-    return scene.vbd_solver.contact_diagnostics()
+    return scene
 
 
 def test_a_vertex_swept_across_many_cells_is_collected_once():
@@ -390,8 +391,8 @@ def test_a_vertex_swept_across_many_cells_is_collected_once():
     find it several times and collect the same pair twice, which would double the stiffness holding it. The two
     scenes here have the same geometry and no relative motion, so their candidate sets must match exactly; only
     the number of cells the vertices occupy differs, by a factor of eight."""
-    still = _two_block_scene(0.0)
-    carried = _two_block_scene(-8.0)
+    still = _two_block_scene(0.0).vbd_solver.contact_diagnostics()
+    carried = _two_block_scene(-8.0).vbd_solver.contact_diagnostics()
     print(f"still: {int(still.n_point_pairs[0])} pt, {int(still.n_edge_pairs[0])} ee; "
           f"carried: {int(carried.n_point_pairs[0])} pt, {int(carried.n_edge_pairs[0])} ee")
     assert int(still.n_point_pairs[0]) > 0 and int(still.n_edge_pairs[0]) > 0, "the fixture must find pairs"
@@ -454,6 +455,46 @@ def test_a_vertex_whose_swept_box_hashes_two_cells_into_one_bucket_is_still_coll
     kernel()
     assert int(hits[0]) == 1, "the canonical cell must accept the vertex exactly once despite the collision"
     assert int(hits[1]) == 0, "the non-canonical cell must never accept it, collision or not"
+
+
+def _candidate_set(scene):
+    """The pairs the search kept, as comparable sets of participant indices."""
+    contact = scene.vbd_solver.contact
+    n_pt = min(int(qd_to_torch(contact.n_pt)[0]), contact.pair_cap)
+    n_ee = min(int(qd_to_torch(contact.n_ee)[0]), contact.pair_cap)
+    pt = {(int(a), int(b)) for a, b in zip(
+        qd_to_torch(contact.pt_pairs.a)[:n_pt, 0].tolist(), qd_to_torch(contact.pt_pairs.b)[:n_pt, 0].tolist())}
+    ee = {(int(a), int(b)) for a, b in zip(
+        qd_to_torch(contact.ee_pairs.a)[:n_ee, 0].tolist(), qd_to_torch(contact.ee_pairs.b)[:n_ee, 0].tolist())}
+    return pt, ee
+
+
+def test_the_candidate_set_does_not_depend_on_the_grid_cell_size():
+    """The cell is a performance parameter and nothing else. A pair is collected because the searched box, which
+    is the primitive's own sweep grown by the reach, overlaps the vertex's swept box; both are rasterised into
+    whatever grid is in use, and `func_is_canonical_cell` accepts each overlap exactly once. So the set is an
+    invariant of the cell size, and that is what makes the size free to choose. The head36 contact grid was
+    sized off the contact layer at 0.8 mm while its triangles average 2.8 mm across, which put a single
+    triangle in 350 cells and one of them in 36288."""
+    sets = {}
+    for cell in (None, 5e-4, 4e-3, 2e-2):
+        pt, ee = _candidate_set(_two_block_scene(0.0, cell=cell))
+        sets[cell] = (pt, ee)
+    reference = sets[None]
+    assert reference[0] and reference[1], "the fixture must find pairs of both kinds"
+    for cell, found in sets.items():
+        assert found[0] == reference[0], f"point-triangle set changed at cell {cell}"
+        assert found[1] == reference[1], f"edge-edge set changed at cell {cell}"
+
+
+def test_the_grid_cell_follows_the_mesh_and_not_the_contact_layer():
+    """Left to itself the cell is the median contact edge, floored at twice the reach so that growing the box by
+    the reach can never add more than a cell on a side. The blocks here are meshed far coarser than their
+    0.2 mm layer, so the mesh is what decides."""
+    contact = _two_block_scene(0.0).vbd_solver.contact
+    floor = 2.0 * (contact.max_thickness + contact.margin_max)
+    assert contact.cell > floor, "this fixture is meant to be mesh-limited, not reach-limited"
+    assert contact.cell == pytest.approx(contact.median_edge, rel=1e-6)
 
 
 def test_a_free_rigid_body_departs_from_its_prediction_by_nothing_while_it_falls():

@@ -994,6 +994,18 @@ class VBDOptions(Options):
         which is 788 N on a 25 g bone for 200 micrometres of overlap, while a fourfold ramp carries that bone's
         weight with 155 micrometres of compression. A multiple below one would put every contact under the
         stiffness its own rule asks for, and is refused. Defaults to `constraint_k_max_ratio`.
+    contact_cell_size : float, optional
+        Side of the uniform hash grid cell (m) the candidate search rasterises into. It decides nothing about
+        which pairs are found: a pair is collected when the primitive's own sweep, grown by the reach, overlaps
+        a vertex's swept box, and both are rasterised into whatever grid is in use, so the candidate set is an
+        invariant of this value and only the cost changes. Sizing it off the contact layer is the trap, because
+        the layer is a property of the tolerance and the boxes are a property of the mesh: the python head's
+        0.2 mm layer gave a 0.8 mm cell for triangles averaging 2.8 mm across, so one triangle was rasterised
+        into 350 cells, the largest into 36288, and a substep made 20 million cell visits to keep 560 pairs.
+        Left unset it is the median contact edge length, floored at twice the reach so that growing a box by
+        the reach can never add more than one cell a side. Raise it and each box touches fewer cells while each
+        cell holds more vertices; the product has a minimum near the mesh's own scale, and far above it
+        `contact_cell_cap` starts to overflow.
     contact_crossing_depth : float, optional
         How far behind a face (m) a contact point may be before the substep is refused as a crossing the penalty
         failed to hold. The signed point-triangle force already pushes a point that slipped behind back out, so
@@ -1080,6 +1092,7 @@ class VBDOptions(Options):
     contact_sweep_cell_cap: PositiveInt = 512
     contact_margin: Optional[float] = None
     contact_margin_max: Optional[float] = None
+    contact_cell_size: Optional[float] = None
     contact_crossing_depth: Optional[float] = None
     contact_k_max_ratio: Optional[float] = None
     contact_ccd: StrictBool = False
