@@ -1002,14 +1002,21 @@ class VBDOptions(Options):
         rule thickness, so the scene's coarsest rule never decides for its finest; a value here overrides that
         for every pair at once.
     contact_margin : float, optional
-        How far beyond the contact thickness (m) a pair is still collected as a candidate, measured anywhere
-        along the substep's sweep from the position at its start to the prediction at its end. It is therefore
-        also the largest distance the solve may end from that swept path before the substep fails as possibly
-        having missed a collision. It is not a physical layer: the thickness alone decides where a pair pushes,
-        and it is not a speed limit either, because the search follows the travel instead of bounding it. Raise
-        it when the solve itself moves a vertex far off the path the prediction took, which is a stiff contact
-        or attachment reacting within the substep. Larger values cost candidate pairs and a coarser hash grid.
+        How far beyond the contact thickness (m) a pair still draws a force once it is a candidate (D_min of
+        Wang et al. 2022, "Fast GPU-Based Two-Way Continuous Collision Handling", Sec. 3.1). It is not a
+        physical layer: the thickness alone decides where a pair pushes. It is also the bound a substep's
+        candidate set (`VBDContact.d_budget`) must still clear for the environment to keep reusing it instead of
+        rebuilding -- see `contact_margin_max`. Larger values keep a build usable for fewer future substeps.
         Defaults to the largest rule thickness.
+    contact_margin_max : float, optional
+        How far beyond the contact thickness (m) a rebuild searches (D_max of Wang et al. 2022 Sec. 3.1),
+        collecting candidates a real response will not yet feel so that the set stays valid while later substeps
+        spend it down by twice their largest contact-vertex motion (Eq. 4) -- reused, not resurveyed, until it
+        drops below `contact_margin`. Larger values rebuild less often at the cost of more candidate pairs, a
+        coarser hash grid, and reach into geometry the margin alone would not have touched: size it against the
+        scene's own gaps, not as a blind multiple of `contact_margin`, which may already be sized generously.
+        It can never be below `contact_margin`, which is refused. Left unset it equals `contact_margin`, so every
+        substep with any motion rebuilds -- the same cost this had before the option existed.
     contact_ccd : bool, optional
         Whether a substep is rescaled so that no contact pair reaches `contact_ccd_gap`, instead of being refused
         when a pair crosses. After the primal solve every candidate pair is swept from the pose at the start of
@@ -1069,6 +1076,7 @@ class VBDOptions(Options):
     contact_cell_cap: PositiveInt = 64
     contact_sweep_cell_cap: PositiveInt = 512
     contact_margin: Optional[float] = None
+    contact_margin_max: Optional[float] = None
     contact_crossing_depth: Optional[float] = None
     contact_k_max_ratio: Optional[float] = None
     contact_ccd: StrictBool = False

@@ -13,13 +13,24 @@ from that swept path. That deviation is what the guard now measures, so the marg
 response rather than by the speed of the scene.
 """
 
+import types
+
 import numpy as np
 import pytest
 import quadrants as qd
 import torch
 
 import genesis as gs
-from genesis.engine.solvers.vbd_contact import EDGE_EDGE, POINT_TRIANGLE, func_pair_distance, func_sweep_bound, func_swept_lower_bound
+from genesis.engine.solvers.vbd_contact import (
+    EDGE_EDGE,
+    POINT_TRIANGLE,
+    func_cell_hash,
+    func_is_canonical_cell,
+    func_is_own_cell,
+    func_pair_distance,
+    func_sweep_bound,
+    func_swept_lower_bound,
+)
 from genesis.utils.misc import qd_to_torch, tensor_to_array
 
 N_CASES = 64
@@ -224,18 +235,28 @@ def test_the_swept_search_finds_a_pair_the_endpoint_search_cannot_see():
     assert lowest < 0.0015, "and it must have travelled to the plate rather than stopped in mid air"
 
 
-def test_a_response_that_outruns_the_margin_is_still_refused():
-    """The guard is not weakened, only re-aimed. The same impact with a 1 mm margin throws the block's vertices
-    2.98 mm off the path the search covered, and the substep is refused, because a pair the block met out there
-    would never have been collected."""
+def test_a_response_that_outruns_the_margin_triggers_a_rebuild_not_a_refusal():
+    """This used to be the guard refusing a substep: the same impact at a 1 mm margin throws the block's
+    vertices 2.98 mm off the path the search covered. Wang et al. 2022's bound (Sec. 3.1, Eq. 4) turns that
+    overrun into a trigger instead of a failure -- `VBDContact.d_budget` for this environment drops below
+    `margin`, so the *next* `kernel_begin_contact` rebuilds the candidate set at the wider `margin_max` reach.
+    The substep that spent the budget is kept, not discarded, and the run keeps going."""
     scene, block = _fast_block_scene(contact_ccd=True, margin=1e-3)
     scene.step()
     status = scene.vbd_solver.env_status()
     diagnostics = scene.vbd_solver.contact_diagnostics()
+    d_budget = float(qd_to_torch(scene.vbd_solver.contact.d_budget)[0])
     print(f"outrun: failed={bool(status.is_failed[0])}, errno={int(status.errno[0])}, "
-          f"deviation {1e6 * float(diagnostics.max_tissue_deviation[0]):.1f} um")
-    assert bool(status.is_failed[0])
-    assert float(diagnostics.max_tissue_deviation[0]) > scene.vbd_solver.contact.margin
+          f"deviation {1e6 * float(diagnostics.max_tissue_deviation[0]):.1f} um, "
+          f"d_budget {1e6 * d_budget:.1f} um, rebuilds {int(diagnostics.rebuild_count[0])}")
+    assert not bool(status.is_failed[0]), "the overrun must trigger a rebuild, not refuse the substep"
+    assert float(diagnostics.max_tissue_deviation[0]) > scene.vbd_solver.contact.margin, "fixture sanity check"
+    assert d_budget < scene.vbd_solver.contact.margin, "the overrun must have spent the safe bound"
+    assert int(diagnostics.rebuild_count[0]) == 1, "the cold start is the first rebuild"
+    scene.step()
+    diagnostics = scene.vbd_solver.contact_diagnostics()
+    assert not bool(scene.vbd_solver.env_status().is_failed[0])
+    assert int(diagnostics.rebuild_count[0]) == 2, "the spent budget must force a second rebuild next substep"
 
 
 def test_a_tunnelling_block_without_the_filter_is_still_refused():
@@ -250,6 +271,33 @@ def test_a_tunnelling_block_without_the_filter_is_still_refused():
           f"lowest {1000 * lowest:.3f} mm")
     assert bool(status.is_failed[0]), "a block the penalty cannot hold must not be reported as a taken substep"
     assert int(status.errno[0]) != 0
+
+
+def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():
+    """A batch does not stop when one environment latches: its other environments keep stepping, and the kernel
+    that rebuilds the contact buffers used to rebuild them for the failed environment too. The vertex a failure
+    report names is read out of those buffers afterwards, so every multi-substep failure lost its attribution.
+    The head36 probe at four substeps reported zero candidate pairs and a deviation from a later substep."""
+    scene, _ = _fast_block_scene(contact_ccd=False, margin=3e-3)
+    for _ in range(8):
+        scene.step()
+        if bool(scene.vbd_solver.env_status().is_failed[0]):
+            break
+    assert bool(scene.vbd_solver.env_status().is_failed[0]), "the fixture must latch a failure to preserve"
+    latched = scene.vbd_solver.contact_diagnostics()
+    frozen = {name: value.clone() for name, value in latched._asdict().items()}
+    positions = qd_to_torch(scene.vbd_solver.contact.cv_pred).clone()
+    failed_substep = int(scene.vbd_solver.env_status().failed_substep[0])
+
+    for _ in range(8):
+        scene.step()
+
+    after = scene.vbd_solver.contact_diagnostics()
+    for name, value in after._asdict().items():
+        assert torch.equal(value, frozen[name]), f"{name} was overwritten after the failure latch"
+    assert torch.equal(qd_to_torch(scene.vbd_solver.contact.cv_pred), positions), "predictions were overwritten"
+    assert int(scene.vbd_solver.env_status().failed_substep[0]) == failed_substep
+    assert int(frozen["n_point_pairs"][0]) + int(frozen["n_edge_pairs"][0]) > 0, "the evidence must not be empty"
 
 
 def _two_block_scene(velocity):
@@ -292,6 +340,63 @@ def test_a_vertex_swept_across_many_cells_is_collected_once():
     assert int(still.n_point_pairs[0]) > 0 and int(still.n_edge_pairs[0]) > 0, "the fixture must find pairs"
     assert int(carried.n_point_pairs[0]) == int(still.n_point_pairs[0])
     assert int(carried.n_edge_pairs[0]) == int(still.n_edge_pairs[0])
+
+
+def test_a_vertex_whose_swept_box_hashes_two_cells_into_one_bucket_is_still_collected_once():
+    """`func_cell_hash` is a generic spatial hash, not injective per vertex: two cells of one vertex's own
+    swept range can land in the same bucket, and both entries pass `func_is_canonical_cell` identically,
+    since that test reads the searched cell and the vertex's own bounds, never which slot the entry sits
+    in. A one-bucket table (`hash_buckets=1`) forces every cell to collide, so a vertex that spans two
+    cells of its own sweep is guaranteed to appear twice in the bucket. `contact.cell_c` -- the cell an
+    entry was inserted under -- and `func_is_own_cell`, which checks it against the cell currently being
+    searched, are what keep that vertex collected exactly once, in O(1) rather than the O(slot) scan
+    `func_is_first_entry` used to do."""
+    contact = types.SimpleNamespace(
+        cell_c=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 2, 1)),
+        cv_lo=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 1)),
+        cv_hi=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 1)),
+    )
+    cell_v = qd.field(dtype=gs.qd_int, shape=(1, 2, 1))
+    hits = qd.field(dtype=gs.qd_int, shape=(2,))
+
+    @qd.kernel
+    def kernel():
+        # one vertex (cv 0) whose own sweep spans exactly two cells, K and C
+        cell_k = qd.Vector([0, 0, 0], dt=gs.qd_int)
+        cell_c = qd.Vector([1, 0, 0], dt=gs.qd_int)
+        contact.cv_lo[0, 0] = cell_k
+        contact.cv_hi[0, 0] = cell_c
+        # insert cv 0 at both of its cells, exactly as kernel_begin_contact's cv loop does
+        h_k = func_cell_hash(cell_k, 1)
+        cell_v[h_k, 0, 0] = 0
+        contact.cell_c[h_k, 0, 0] = cell_k
+        h_c = func_cell_hash(cell_c, 1)
+        cell_v[h_c, 1, 0] = 0
+        contact.cell_c[h_c, 1, 0] = cell_c
+        # search cell K (the canonical cell of the pair, since the search box's own lower corner is K
+        # too): the bucket holds both of cv 0's entries, and only the one stored under K may match
+        hits[0] = 0
+        for slot in range(2):
+            cv = cell_v[h_k, slot, 0]
+            is_new = func_is_canonical_cell(cv, 0, cell_k, cell_k, contact) and func_is_own_cell(
+                h_k, slot, 0, cell_k, contact
+            )
+            if is_new:
+                hits[0] += 1
+        # search cell C: never canonical against a search box whose lower corner is K, so it must
+        # contribute nothing, collision or not
+        hits[1] = 0
+        for slot in range(2):
+            cv = cell_v[h_c, slot, 0]
+            is_new = func_is_canonical_cell(cv, 0, cell_c, cell_k, contact) and func_is_own_cell(
+                h_c, slot, 0, cell_c, contact
+            )
+            if is_new:
+                hits[1] += 1
+
+    kernel()
+    assert int(hits[0]) == 1, "the canonical cell must accept the vertex exactly once despite the collision"
+    assert int(hits[1]) == 0, "the non-canonical cell must never accept it, collision or not"
 
 
 def test_a_free_rigid_body_departs_from_its_prediction_by_nothing_while_it_falls():

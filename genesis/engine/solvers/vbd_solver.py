@@ -146,6 +146,7 @@ class VBDSolver(Solver):
         self._contact_cell_cap = options.contact_cell_cap
         self._contact_sweep_cell_cap = options.contact_sweep_cell_cap
         self._contact_margin = options.contact_margin
+        self._contact_margin_max = options.contact_margin_max
         self._contact_crossing_depth = options.contact_crossing_depth
         self._contact_k_max_ratio = (
             options.constraint_k_max_ratio if options.contact_k_max_ratio is None else options.contact_k_max_ratio
@@ -433,11 +434,8 @@ class VBDSolver(Solver):
             )
         if errno & ErrorCode.VBD_CONTACT_CROSSING:
             messages.append("A contact pair crossed its surface within one substep: the penalty did not hold it.")
-        if errno & ErrorCode.VBD_CONTACT_MOTION_BOUND:
-            messages.append(
-                "A contact vertex ended further than the contact margin from the path the candidate search "
-                "covered, so a collision may have been missed. Use more substeps or a larger margin."
-            )
+        # VBD_CONTACT_MOTION_BOUND is not a failure: it marks that an environment's candidate set ran out of
+        # safe bound and rebuilt (or will, next substep). See VBDContact.d_budget and ContactDiagnostics.
         if errno & ErrorCode.INVALID_VBD_CONTACT_NAN:
             messages.append("A contact pair has a non-finite distance.")
         if errno & ErrorCode.OVERFLOW_VBD_CONTACT_CELL:

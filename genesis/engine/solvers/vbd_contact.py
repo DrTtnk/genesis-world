@@ -46,16 +46,26 @@ ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
 POINT_TRIANGLE = 0
 EDGE_EDGE = 1
 
+# VBD_CONTACT_MOTION_BOUND no longer marks a refused substep (see kernel_end_contact): it marks that this
+# substep's safe bound ran out, which the next kernel_begin_contact reads to decide to rebuild. Every other bit
+# is a genuine failure and must still latch the environment, which is what this mask keeps in the aggregate check.
+# ~x on a positive Python int is -x-1, the correct two's-complement i32 bit pattern for "every bit but this
+# one": AND/OR do not care whether the field is read as signed, only bit masking with 0xFFFFFFFF would overflow
+# i32's literal range.
+_FATAL_ERRNO_MASK = ~int(ErrorCode.VBD_CONTACT_MOTION_BOUND)
+
 
 class ContactDiagnostics(NamedTuple):
     """Per-environment contact state of the last substep: candidate pair counts, the largest motion of a tissue
     and of a rigid contact vertex over the substep (m), the largest distance either of them ended from the swept
-    path the candidate search covered (m), the raw error word, and the smallest continuous-collision time of
-    impact since the last `clear_toi()` (1 when no substep was rescaled, and always 1 without
-    `VBDOptions.contact_ccd`).
+    path the candidate search covered (m), the raw error word, the smallest continuous-collision time of impact
+    since the last `clear_toi()` (1 when no substep was rescaled, and always 1 without `VBDOptions.contact_ccd`),
+    and how many candidate-set rebuilds this environment has needed since its last reset.
 
-    The motion is reported, not bounded: the search follows it. The deviation is what the validity guard holds
-    to `VBDOptions.contact_margin`, so it is the one to read after a `VBD_CONTACT_MOTION_BOUND` failure.
+    The motion is reported, not bounded: the search follows it. The deviation is reported too, but neither it
+    nor the motion is what triggers a rebuild any more -- `VBDContact.d_budget` is (Wang et al. 2022 Eq. 4),
+    and `VBD_CONTACT_MOTION_BOUND` in `errno` marks a substep whose bound ran out and will rebuild next, not a
+    refused one.
     """
 
     n_point_pairs: torch.Tensor
@@ -66,6 +76,7 @@ class ContactDiagnostics(NamedTuple):
     min_toi: torch.Tensor
     max_tissue_deviation: torch.Tensor
     max_rigid_deviation: torch.Tensor
+    rebuild_count: torch.Tensor
 
 
 class EnvStatus(NamedTuple):
@@ -81,9 +92,9 @@ class VBDContact:
     def __init__(self, solver, entities, colliders, prescribed, rules):
         self.solver = solver
         # Only a tissue whose collision group appears in a rule can collide. The others are left out of the
-        # contact vertex set entirely: they would find no pair, but the motion-bound guard would still hold them
-        # to the candidate margin per substep, and a fast connector between two falling bones has no business
-        # failing a contact step it can never take part in.
+        # contact vertex set entirely: they would find no pair, but would still spend the shared d_budget and
+        # trigger rebuilds by their own motion, and a fast connector between two falling bones has no business
+        # forcing a contact rebuild it can never take part in.
         ruled = {group for rule in rules for group in rule[:2]}
         entities = [entity for entity in entities if entity.material.collision_group in ruled]
         self.colliders = [link for link, _, _ in colliders]
@@ -238,13 +249,31 @@ class VBDContact:
         self.rule_friction.from_numpy(friction.astype(gs.np_float))
         self.rule_thickness.from_numpy(thickness.astype(gs.np_float))
         self.max_thickness = float(thickness.max())
-        # A candidate is any pair that comes within thickness + margin anywhere along the substep's sweep, from
-        # the position at its start to the prediction at its end. The margin is also how far the solve may end
-        # from that swept path without a candidate being missed: the search covers the path inflated by one
-        # margin, and by convexity a solve that ends inside the inflation took a path that stays inside it.
+        # A pair still draws a force once its distance is within thickness + margin (below, `func_pt_forces` /
+        # `func_ee_forces` self-gate on it through the inequality-clamped multiplier). A rebuild's search covers
+        # further than that, out to thickness + margin_max, precisely so the candidate set stays a safe superset
+        # while it is reused across substeps that never rebuild at all -- see margin_max below.
         self.margin = self.max_thickness if solver._contact_margin is None else solver._contact_margin
         if not self.margin > 0.0:
             gs.raise_exception(f"VBDOptions.contact_margin must be above zero, got {self.margin}.")
+        # D_max of Wang et al. 2022 ("Fast GPU-Based Two-Way Continuous Collision Handling", Sec. 3.1): a
+        # rebuild searches this far so the candidate set stays a safe superset while `d_budget` (D) runs down
+        # from it, and `margin` above is D_min, the bound a pair still has to clear to draw a force. Left unset,
+        # it defaults to `margin` itself (no extra reach): a build then covers exactly what it always covered,
+        # and d_budget starting the substep below margin whenever anything moved means every substep rebuilds,
+        # matching the behaviour before this option existed. Multiplying an arbitrary margin up is not a safe
+        # general default -- a scene whose margin is already sized against its own geometry (a coarse collider
+        # a few tens of millimetres across, say) can have that margin scaled into reach of a face on the far
+        # side of the same body, adding candidates that have nothing to do with the approach being tracked and
+        # over-constraining the response. Set this explicitly, sized to the scene's own gaps, to amortize
+        # rebuilds across substeps.
+        self.margin_max = self.margin if solver._contact_margin_max is None else solver._contact_margin_max
+        if not self.margin_max >= self.margin:
+            gs.raise_exception(
+                f"VBDOptions.contact_margin_max ({self.margin_max}) must be at least contact_margin "
+                f"({self.margin}): a build that searches less far than a pair still has to clear would let the "
+                f"reused set miss pairs margin alone would have caught."
+            )
         # Left unset, each pair is judged against its own rule thickness, which is what the check did before the
         # option existed. A single global depth would let the scene's coarsest rule decide for its finest: two
         # rules of 0.05 mm and 5 mm would judge the fine pair at 5 mm, and a vertex twenty layers behind its own
@@ -257,6 +286,13 @@ class VBDContact:
             gs.raise_exception(
                 f"VBDOptions.contact_crossing_depth must be above zero, got {self.crossing_depth}."
             )
+        # The grid cell size is sized off margin (D_min), not margin_max (D_max): the two are deliberately
+        # decoupled. A cell only has to be big enough that two primitives within one margin of each other share a
+        # canonical cell (see func_is_canonical_cell); making the reach a rebuild searches (margin_max) generous
+        # does not require making the grid coarser too. A coarser grid packs more contact vertices into one hash
+        # bucket for the same geometry, and hash_cap does not grow with margin_max -- coupling the two turned a
+        # bigger D_max into OVERFLOW_VBD_CONTACT_CELL on scenes with no margin_max of their own. A rebuild's
+        # search still widens (see `reach` in kernel_begin_contact below): it walks more, smaller cells instead.
         self.cell = 2.0 * (self.max_thickness + self.margin)
         self.hash_buckets = 2 * self.n_cv
         self.hash_cap = solver._contact_cell_cap
@@ -266,6 +302,10 @@ class VBDContact:
         # grid holds the vertex in every cell of that range, and the pair tests read both ends of the sweep
         self.cv_lo = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
         self.cv_hi = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
+        # the cell each bucket slot was inserted under: two cells of one vertex's own sweep can hash to the
+        # same bucket, and this is what a query tells them apart without scanning the bucket (see
+        # `func_is_own_cell`)
+        self.cell_c = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.hash_buckets, self.hash_cap, solver._B))
         self.cv_pred = qd.Vector.field(3, dtype=gs.qd_float, shape=(self.n_cv, solver._B))
         # A sweep that spans more cells than this is refused rather than searched: the rasterization is the
         # product of the three spans, so a body that travels hundreds of cells in one substep would cost more to
@@ -286,14 +326,20 @@ class VBDContact:
         self.cv_slot = qd.field(dtype=gs.qd_int, shape=(8 * self.pair_cap, solver._B))
         self.errno = qd.field(dtype=gs.qd_int, shape=solver._B)
         self.max_motion = qd.field(dtype=gs.qd_float, shape=(2, solver._B))
-        # how far the solved position ends from the swept path the search covered, which is the quantity the
-        # validity guard holds to the margin; the travel above is reported but no longer bounded
+        # how far the solved position ends from the swept path the search covered; reported for inspection, no
+        # longer what the rebuild decision reads (that is `d_budget` now, driven by the raw motion above)
         self.max_deviation = qd.field(dtype=gs.qd_float, shape=(2, solver._B))
         # the substep's conservative time of impact, and the smallest one since it was last cleared
         self.toi = qd.field(dtype=gs.qd_float, shape=solver._B)
         self.min_toi = qd.field(dtype=gs.qd_float, shape=solver._B)
         self.toi.fill(1.0)
         self.min_toi.fill(1.0)
+        # the running safe bound D of Wang et al. 2022 Eq. 4, zero-initialized so the first substep always
+        # rebuilds (see kernel_reset_contact), and how many rebuilds this environment has needed in total
+        self.d_budget = qd.field(dtype=gs.qd_float, shape=solver._B)
+        self.rebuild_count = qd.field(dtype=gs.qd_int, shape=solver._B)
+        # this substep's rebuild decision, read by every loop of kernel_begin_contact after the first sets it
+        self.rebuilding = qd.field(dtype=gs.qd_int, shape=solver._B)
         # Prescribed collider links follow a pose interpolant from the pose at the start of the step to the target
         # set for its end, sampled at every substep; both ends are state.
         # The targets refer to a reference link of the entity; the base link pose that realizes them follows from
@@ -387,6 +433,7 @@ class VBDContact:
             qd_to_torch(self.min_toi),
             deviation[:, 0],
             deviation[:, 1],
+            qd_to_torch(self.rebuild_count),
         )
 
     def clear_toi(self):
@@ -897,19 +944,16 @@ def func_is_canonical_cell(cv, i_b, cell, lo, contact: qd.template()):
 
 
 @qd.func
-def func_is_first_entry(cv, h, slot, i_b, contact: qd.template()):
-    """Whether this is the first slot of the bucket that holds this vertex.
+def func_is_own_cell(h, slot, i_b, cell, contact: qd.template()):
+    """Whether this bucket slot was inserted under the cell currently being searched.
 
     Two cells of one swept vertex can hash to the same bucket, which puts the vertex in it twice, and both
-    entries then pass the canonical-cell test, since that test reads the searched cell and not the entry.
-    Keeping the first of them is what stops the pair being collected twice, and a pair collected twice would be
-    held by twice its rule stiffness.
+    entries then pass the canonical-cell test, since that test reads the searched cell and not the entry. But
+    the two entries were inserted under different cells -- that is the only way they could collide rather than
+    be the same insert -- so at most one of them can carry the cell being searched. Accepting only that one is
+    what used to take `func_is_first_entry`'s O(slot) scan of the bucket; this is O(1).
     """
-    is_first = True
-    for earlier in range(slot):
-        if contact.cell_v[h, earlier, i_b] == cv:
-            is_first = False
-    return is_first
+    return (contact.cell_c[h, slot, i_b] == cell).all()
 
 
 @qd.func
@@ -943,52 +987,79 @@ def func_may_collide(cv_a, cv_b, contact: qd.template()):
 
 @qd.kernel
 def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), dyn_state: DynState):
-    """Rigid vertex positions from the link poses, the hash grid of the substep's sweeps, then the candidate
-    pairs of the substep and the per-vertex lists of the pairs they take part in."""
-    for i_r, i_b in qd.ndrange(contact.n_rv, solver._B):
-        i_l = contact.rv_link[i_r]
-        pos = dyn_state.links.pos[i_l, i_b]
-        quat = dyn_state.links.quat[i_l, i_b]
-        if qd.static(solver.has_rigid_attachment):
-            # A free body's pose for this substep is the one the attachment predicted from its velocity; the
-            # rigid solver's own table still holds the pose of the previous substep, because the solve commits
-            # back to it only at the end. Searching from that stale pose gives a free body a sweep of zero
-            # length and hands the whole of its travel to the validity guard, which is what refused every large
-            # step of the python head. A fixed or prescribed link is not in this table and keeps its own pose.
-            if solver.rigid_attachment.free_slot[i_l] >= 0:
-                pos = solver.rigid_attachment.link_pose[i_l, i_b].pos
-                quat = solver.rigid_attachment.link_pose[i_l, i_b].quat
-        contact.rv_pos_prev[i_r, i_b] = contact.rv_pos[i_r, i_b]
-        contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(contact.rv_local[i_r], pos, quat)
-    for h, i_b in qd.ndrange(contact.hash_buckets, solver._B):
-        contact.cell_n[h, i_b] = 0
-    for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
-        contact.cv_slot_n[cv, i_b] = 0
-        pred = func_cv_pos(f, cv, i_b, solver, contact)
-        prev = func_cv_pos_prev(f, cv, i_b, solver, contact)
-        contact.cv_pred[cv, i_b] = pred
-        lo, hi = func_sweep_cells(prev, pred, contact.cell)
-        contact.cv_lo[cv, i_b] = lo
-        contact.cv_hi[cv, i_b] = hi
-        span = (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1)
-        if span > contact.sweep_cell_cap:
-            qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_SWEEP)
-        else:
-            for ci in range(lo[0], hi[0] + 1):
-                for cj in range(lo[1], hi[1] + 1):
-                    for ck in range(lo[2], hi[2] + 1):
-                        h = func_cell_hash(qd.Vector([ci, cj, ck], dt=gs.qd_int), contact.hash_buckets)
-                        slot = qd.atomic_add(contact.cell_n[h, i_b], 1)
-                        if slot < contact.hash_cap:
-                            contact.cell_v[h, slot, i_b] = cv
-                        else:
-                            qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
+    """Rigid vertex positions from the link poses, then, only for an environment whose safe bound is spent, the
+    hash grid of the substep's sweeps, the candidate pairs of the substep and the per-vertex lists of the pairs
+    they take part in. An environment that still has proximity budget left keeps last build's candidate set and
+    pays only for the position refresh (Wang et al. 2022, "Fast GPU-Based Two-Way Continuous Collision
+    Handling", Sec. 3.1): the search is not what changes every substep, `contact.d_budget` is."""
+    # A failed environment writes nothing here. Its positions, sweeps and pair counts are the evidence of the
+    # substep that failed, and the substeps the batch still runs for its other environments would otherwise
+    # overwrite them: the vertex a report names is read from these buffers after the raise.
     for i_b in range(solver._B):
-        contact.n_pt[i_b] = 0
-        contact.n_ee[i_b] = 0
-    reach = contact.max_thickness + contact.margin
-    for i_t, i_b in qd.ndrange(contact.n_triangles, solver._B):
         if not solver.env_failed[i_b]:
+            contact.rebuilding[i_b] = 0
+            if contact.d_budget[i_b] < contact.margin:
+                contact.rebuilding[i_b] = 1
+                contact.rebuild_count[i_b] += 1
+    for i_r, i_b in qd.ndrange(contact.n_rv, solver._B):
+        if not solver.env_failed[i_b]:
+            i_l = contact.rv_link[i_r]
+            pos = dyn_state.links.pos[i_l, i_b]
+            quat = dyn_state.links.quat[i_l, i_b]
+            if qd.static(solver.has_rigid_attachment):
+                # A free body's pose for this substep is the one the attachment predicted from its velocity; the
+                # rigid solver's own table still holds the pose of the previous substep, because the solve commits
+                # back to it only at the end. Searching from that stale pose gives a free body a sweep of zero
+                # length and hands the whole of its travel to the validity guard, which is what refused every
+                # large step of the python head. A fixed or prescribed link is not in this table and keeps its
+                # own pose.
+                if solver.rigid_attachment.free_slot[i_l] >= 0:
+                    pos = solver.rigid_attachment.link_pose[i_l, i_b].pos
+                    quat = solver.rigid_attachment.link_pose[i_l, i_b].quat
+            contact.rv_pos_prev[i_r, i_b] = contact.rv_pos[i_r, i_b]
+            contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(contact.rv_local[i_r], pos, quat)
+    for h, i_b in qd.ndrange(contact.hash_buckets, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            contact.cell_n[h, i_b] = 0
+    for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
+        if not solver.env_failed[i_b]:
+            # the prediction is read every substep (kernel_end_contact's deviation and d_budget update need it
+            # regardless of whether the grid is rebuilt this substep); the sweep box and the grid insert are the
+            # expensive part, and only run when the safe bound ran out
+            pred = func_cv_pos(f, cv, i_b, solver, contact)
+            prev = func_cv_pos_prev(f, cv, i_b, solver, contact)
+            contact.cv_pred[cv, i_b] = pred
+            if contact.rebuilding[i_b]:
+                contact.cv_slot_n[cv, i_b] = 0
+                lo, hi = func_sweep_cells(prev, pred, contact.cell)
+                contact.cv_lo[cv, i_b] = lo
+                contact.cv_hi[cv, i_b] = hi
+                span = (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1)
+                if span > contact.sweep_cell_cap:
+                    qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_SWEEP)
+                else:
+                    for ci in range(lo[0], hi[0] + 1):
+                        for cj in range(lo[1], hi[1] + 1):
+                            for ck in range(lo[2], hi[2] + 1):
+                                cell = qd.Vector([ci, cj, ck], dt=gs.qd_int)
+                                h = func_cell_hash(cell, contact.hash_buckets)
+                                slot = qd.atomic_add(contact.cell_n[h, i_b], 1)
+                                if slot < contact.hash_cap:
+                                    contact.cell_v[h, slot, i_b] = cv
+                                    contact.cell_c[h, slot, i_b] = cell
+                                else:
+                                    qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
+    for i_b in range(solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            contact.n_pt[i_b] = 0
+            contact.n_ee[i_b] = 0
+    # the generous bound (D_max): a rebuild searches this far so the resulting candidate set stays a safe
+    # superset for several future substeps, not just the one being built. margin (D_min) is what a candidate
+    # still needs to clear to matter for the response (func_pt_forces/func_ee_forces): a pair kept only because
+    # it is inside margin_max but outside margin contributes zero force until it actually closes that gap.
+    reach = contact.max_thickness + contact.margin_max
+    for i_t, i_b in qd.ndrange(contact.n_triangles, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             tri = contact.tri_cv[i_t]
             a = func_cv_pos(f, tri[0], i_b, solver, contact)
             b = func_cv_pos(f, tri[1], i_b, solver, contact)
@@ -1007,8 +1078,8 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                         h = func_cell_hash(cell, contact.hash_buckets)
                         for slot in range(qd.min(contact.cell_n[h, i_b], contact.hash_cap)):
                             cv = contact.cell_v[h, slot, i_b]
-                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_first_entry(
-                                cv, h, slot, i_b, contact
+                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_own_cell(
+                                h, slot, i_b, cell, contact
                             )
                             if is_new and func_may_collide(cv, tri[0], contact):
                                 is_adjacent = False
@@ -1026,7 +1097,7 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                     h_rule = contact.rule_thickness[
                                         contact.cv_info[cv].group, contact.cv_info[tri[0]].group
                                     ]
-                                    if d < h_rule + contact.margin:
+                                    if d < h_rule + contact.margin_max:
                                         i_p = qd.atomic_add(contact.n_pt[i_b], 1)
                                         if i_p < contact.pair_cap:
                                             contact.pt_pairs[i_p, i_b].a = cv
@@ -1038,7 +1109,7 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                         else:
                                             qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS)
     for i_e, i_b in qd.ndrange(contact.n_edges, solver._B):
-        if not solver.env_failed[i_b]:
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             ea = contact.edge_cv[i_e]
             a = func_cv_pos(f, ea[0], i_b, solver, contact)
             b = func_cv_pos(f, ea[1], i_b, solver, contact)
@@ -1053,8 +1124,8 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                         h = func_cell_hash(cell, contact.hash_buckets)
                         for slot in range(qd.min(contact.cell_n[h, i_b], contact.hash_cap)):
                             cv = contact.cell_v[h, slot, i_b]
-                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_first_entry(
-                                cv, h, slot, i_b, contact
+                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_own_cell(
+                                h, slot, i_b, cell, contact
                             )
                             if is_new:
                                 for c_e in range(contact.cv_edge_offset[cv], contact.cv_edge_offset[cv + 1]):
@@ -1082,7 +1153,7 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                             h_rule = contact.rule_thickness[
                                                 contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
                                             ]
-                                            if dist < h_rule + contact.margin:
+                                            if dist < h_rule + contact.margin_max:
                                                 i_p = qd.atomic_add(contact.n_ee[i_b], 1)
                                                 if i_p < contact.pair_cap:
                                                     contact.ee_pairs[i_p, i_b].a = i_e
@@ -1095,38 +1166,63 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                                     qd.atomic_or(
                                                         contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS
                                                     )
-    # count the pairs of every contact vertex, prefix-sum the counts, then fill the flat slot list
+    # The dual state resets every substep, rebuild or not: lam and k are an Uzawa iterate that is only meant to
+    # converge across one substep's sweeps (kernel_reset_contact does the same for lam at the start of a whole
+    # step). A rebuild already zeroes them at insertion, but a reused pair keeps last substep's k, which ramps
+    # toward `_contact_k_max_ratio` in `func_contact_dual_update` and would otherwise carry that ramp forward
+    # substep after substep for as long as the set is reused, well past what the pair's own current violation
+    # asks for.
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
-        if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
-            qd.atomic_add(contact.cv_slot_n[contact.pt_pairs[i_p, i_b].a, i_b], 1)
-            tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
-            for j in qd.static(range(3)):
-                qd.atomic_add(contact.cv_slot_n[tri[j], i_b], 1)
-        if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
-            ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
-            eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
-            for j in qd.static(range(2)):
-                qd.atomic_add(contact.cv_slot_n[ea[j], i_b], 1)
-                qd.atomic_add(contact.cv_slot_n[eb[j], i_b], 1)
+        if not solver.env_failed[i_b]:
+            if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
+                contact.pt_pairs[i_p, i_b].lam = 0.0
+                tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+                contact.pt_pairs[i_p, i_b].k = contact.rule_stiffness[
+                    contact.cv_info[contact.pt_pairs[i_p, i_b].a].group, contact.cv_info[tri[0]].group
+                ]
+            if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
+                contact.ee_pairs[i_p, i_b].lam = 0.0
+                ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
+                eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
+                contact.ee_pairs[i_p, i_b].k = contact.rule_stiffness[
+                    contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
+                ]
+    # count the pairs of every contact vertex, prefix-sum the counts, then fill the flat slot list -- all as
+    # stale as the pairs themselves, so none of it is worth redoing on a substep that only reuses them
+    for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
+                qd.atomic_add(contact.cv_slot_n[contact.pt_pairs[i_p, i_b].a, i_b], 1)
+                tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+                for j in qd.static(range(3)):
+                    qd.atomic_add(contact.cv_slot_n[tri[j], i_b], 1)
+            if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
+                ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
+                eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
+                for j in qd.static(range(2)):
+                    qd.atomic_add(contact.cv_slot_n[ea[j], i_b], 1)
+                    qd.atomic_add(contact.cv_slot_n[eb[j], i_b], 1)
     for i_b in range(solver._B):
-        run = 0
-        for cv in range(contact.n_cv):
-            contact.cv_slot_offset[cv, i_b] = run
-            run += contact.cv_slot_n[cv, i_b]
-            contact.cv_slot_n[cv, i_b] = 0
-        contact.cv_slot_offset[contact.n_cv, i_b] = run
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            run = 0
+            for cv in range(contact.n_cv):
+                contact.cv_slot_offset[cv, i_b] = run
+                run += contact.cv_slot_n[cv, i_b]
+                contact.cv_slot_n[cv, i_b] = 0
+            contact.cv_slot_offset[contact.n_cv, i_b] = run
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
-        if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
-            func_register_slot(contact.pt_pairs[i_p, i_b].a, 8 * i_p + ROLE_POINT, i_b, contact)
-            tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
-            for j in qd.static(range(3)):
-                func_register_slot(tri[j], 8 * i_p + ROLE_TRIANGLE + j, i_b, contact)
-        if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
-            ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
-            eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
-            for j in qd.static(range(2)):
-                func_register_slot(ea[j], 8 * (i_p + contact.pair_cap) + ROLE_EDGE_A + j, i_b, contact)
-                func_register_slot(eb[j], 8 * (i_p + contact.pair_cap) + ROLE_EDGE_B + j, i_b, contact)
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
+                func_register_slot(contact.pt_pairs[i_p, i_b].a, 8 * i_p + ROLE_POINT, i_b, contact)
+                tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+                for j in qd.static(range(3)):
+                    func_register_slot(tri[j], 8 * i_p + ROLE_TRIANGLE + j, i_b, contact)
+            if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
+                ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
+                eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
+                for j in qd.static(range(2)):
+                    func_register_slot(ea[j], 8 * (i_p + contact.pair_cap) + ROLE_EDGE_A + j, i_b, contact)
+                    func_register_slot(eb[j], 8 * (i_p + contact.pair_cap) + ROLE_EDGE_B + j, i_b, contact)
 
 
 @qd.func
@@ -1199,11 +1295,11 @@ def func_edges_crossed(f, i_b, ea, eb, s, t, solver: qd.template(), contact: qd.
 @qd.kernel
 def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), contact: qd.template(), dyn_state: DynState):
     """Wrenches on the collider links from the final pair state, the substep's validity checks (finite geometry,
-    no contact vertex moved further than the candidate margin, no pair deeper than its thickness), and the failure
-    latch of any environment whose checks failed. The two crossing tests are skipped under
-    `VBDOptions.contact_ccd`, which prevents a crossing instead of reporting one: a sign flip of two edges whose
-    closest parameters changed feature, or a point at a face boundary read as behind it, would then be the only
-    thing left for them to find."""
+    no pair deeper than its thickness), the failure latch of any environment whose checks failed, and the safe
+    bound update of Wang et al. 2022 Eq. 4 that decides whether the *next* substep reuses this one's candidate
+    set or rebuilds it. The two crossing tests are skipped under `VBDOptions.contact_ccd`, which prevents a
+    crossing instead of reporting one: a sign flip of two edges whose closest parameters changed feature, or a
+    point at a face boundary read as behind it, would then be the only thing left for them to find."""
     for i_l, i_b in qd.ndrange(contact.link_reaction.shape[0], solver._B):
         if not solver.env_failed[i_b]:
             contact.link_reaction[i_l, i_b] = qd.Vector.zero(qd.f64, 6)
@@ -1259,19 +1355,28 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
             contact.max_deviation[kind, i_b] = 0.0
     for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
         if not solver.env_failed[i_b]:
-            # The search covered the segment from the start of the substep to the prediction, inflated by one
-            # margin. The solved position is the end of the path actually taken, and by convexity that whole path
-            # stays inside the inflation when its end does, so this distance, and not the travel, is what decides
-            # whether a pair could have been missed. Rescaling by a time of impact lands on the segment itself.
+            # The search covered the segment from the start of the substep to the prediction. The solved position
+            # is the end of the path actually taken; this is its distance from that segment, reported for
+            # inspection (it is not what drives a rebuild -- see the d_budget update below, which reads the raw
+            # motion instead). Rescaling by a time of impact lands on the segment itself.
             pos = func_cv_pos(f, cv, i_b, solver, contact)
             prev = func_cv_pos_prev(f, cv, i_b, solver, contact)
             deviation = func_point_segment_distance(pos, prev, contact.cv_pred[cv, i_b])
             qd.atomic_max(contact.max_motion[contact.cv_info[cv].kind, i_b], (pos - prev).norm())
             qd.atomic_max(contact.max_deviation[contact.cv_info[cv].kind, i_b], deviation)
-            if deviation > contact.margin:
-                qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_MOTION_BOUND)
     for i_b in range(solver._B):
-        if contact.errno[i_b] != 0 and not solver.env_failed[i_b]:
+        if not solver.env_failed[i_b]:
+            # Wang et al. 2022 Eq. 4: the safe bound shrinks by twice the largest displacement since it was
+            # last spent, because a pair the last build could have missed needs both of its vertices to have
+            # closed half the remaining gap. Once it is gone, next substep's kernel_begin_contact rebuilds with
+            # a fresh D_max and this env's bound starts over. The bit is refreshed, not accumulated: it reports
+            # this substep's state, not whether one was ever spent before.
+            contact.d_budget[i_b] -= 2.0 * qd.max(contact.max_motion[0, i_b], contact.max_motion[1, i_b])
+            contact.errno[i_b] &= _FATAL_ERRNO_MASK
+            if contact.d_budget[i_b] < contact.margin:
+                contact.errno[i_b] |= ErrorCode.VBD_CONTACT_MOTION_BOUND
+    for i_b in range(solver._B):
+        if (contact.errno[i_b] & _FATAL_ERRNO_MASK) != 0 and not solver.env_failed[i_b]:
             solver.env_failed[i_b] = 1
             solver.failed_substep[i_b] = substep_global
     for i_l, i_b in qd.ndrange(contact.link_impulse.shape[0], solver._B):
@@ -1294,6 +1399,10 @@ def kernel_reset_contact(envs_idx: qd.types.ndarray(), contact: qd.template(), d
         contact.errno[envs_idx[i_b_]] = 0
         contact.toi[envs_idx[i_b_]] = 1.0
         contact.min_toi[envs_idx[i_b_]] = 1.0
+        # zero is always below margin (margin > 0 is enforced at construction), so the next kernel_begin_contact
+        # rebuilds unconditionally: a reset carries no proximity information forward.
+        contact.d_budget[envs_idx[i_b_]] = 0.0
+        contact.rebuild_count[envs_idx[i_b_]] = 0
     for i_p, i_b_ in qd.ndrange(contact.n_prescribed, envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         i_l = contact.prescribed_link[i_p]

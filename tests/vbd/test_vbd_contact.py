@@ -1038,11 +1038,15 @@ def test_the_candidate_margin_can_be_raised_above_the_contact_thickness(margin, 
 
     A thin tissue pad rigidly carried by a fast body moves much further per substep than the physical contact
     layer is thick: the python head's 0.5 mm articular pads reach 2 m/s on a falling bone, which is 200 um per
-    substep against a 200 um layer. The thickness must stay at the geometry's scale, so the margin is raised
-    instead. Since the search became swept, the travel itself is no longer what the margin has to cover: this
-    box falls 4 mm a substep under either margin without a complaint, and the default one gives out at the
-    impact, where a single penalty sweep cannot hold 4 mm of approach inside a 0.2 mm layer and the response
-    leaves the region the search covered. The raised margin absorbs that response, and the box lands.
+    substep against a 200 um layer. The thickness must stay at the geometry's scale, so the margin is free to
+    be raised on its own. Since the search became swept, the travel itself is no longer what the margin has to
+    cover: this box falls 4 mm a substep under either margin without a complaint.
+
+    The default margin used to give out at the impact, where a single penalty sweep cannot hold 4 mm of
+    approach inside a 0.2 mm layer and the response leaves the region the search covered. It no longer does.
+    A response that leaves that region now spends the reuse bound and asks the next substep for a fresh
+    search, instead of refusing the substep it happened in, so both margins land the box on the table at its
+    contact layer. What the raised margin still buys is the number of searches, not whether the scene runs.
     """
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
@@ -1069,13 +1073,9 @@ def test_the_candidate_margin_can_be_raised_above_the_contact_thickness(margin, 
     failed = bool(scene.vbd_solver.env_status().is_failed[0])
     lowest = float(falling.get_positions()[..., 2].min())
     print(f"margin {scene.vbd_solver.contact.margin} m: failed={failed}, lowest vertex {1000 * lowest:.3f} mm")
-    if margin is None:
-        assert failed, "the default margin is the thickness, and this scene's impact outruns it"
-        assert lowest < 0.01, "and it must have failed at the table, not somewhere in the air above it"
-    else:
-        assert not failed
-        assert lowest > -1e-3, "the raised margin must not let the box pass through the table"
-        assert lowest < 0.01, "and it must actually have landed"
+    assert not failed, "a response that outruns the margin asks for a new search, it does not refuse the substep"
+    assert lowest > -1e-3, "and neither margin may let the box pass through the table"
+    assert lowest < 0.01, "and the box must actually have landed, not stopped in the air above the table"
 
 
 def test_a_nonpositive_contact_margin_is_refused():
