@@ -27,31 +27,16 @@ import quadrants as qd
 
 import genesis as gs
 from genesis.engine.solvers.vbd_contact import (
+    EDGE_EDGE,
+    POINT_TRIANGLE,
     func_cv_pos,
     func_cv_pos_prev,
-    func_point_triangle_weights,
+    func_pair_distance,
     func_refresh_link_vertices,
-    func_segment_parameters,
     func_slerp,
+    func_sweep_bound,
 )
 from genesis.engine.solvers.vbd_mtu import func_refresh_mtu_link_anchors
-
-POINT_TRIANGLE = 0
-EDGE_EDGE = 1
-
-
-@qd.func
-def func_pair_distance(x0, x1, x2, x3, kind: qd.template()):
-    """Clamped closest-point distance of a pair: the point x0 against the triangle (x1, x2, x3), or the edge
-    (x0, x1) against the edge (x2, x3). The same quantities the contact rules are written on."""
-    distance = gs.qd_float(0.0)
-    if qd.static(kind == POINT_TRIANGLE):
-        w = func_point_triangle_weights(x0, x1, x2, x3)
-        distance = (x0 - w[0] * x1 - w[1] * x2 - w[2] * x3).norm()
-    else:
-        s, t = func_segment_parameters(x0, x1, x2, x3)
-        distance = (x0 + s * (x1 - x0) - x2 - t * (x3 - x2)).norm()
-    return distance
 
 
 @qd.func
@@ -71,11 +56,7 @@ def func_accd_toi(s0, s1, s2, s3, e0, e1, e2, e3, gap, scale, iterations, kind: 
     p1 -= mean
     p2 -= mean
     p3 -= mean
-    bound = gs.qd_float(0.0)
-    if qd.static(kind == POINT_TRIANGLE):
-        bound = p0.norm() + qd.max(p1.norm(), qd.max(p2.norm(), p3.norm()))
-    else:
-        bound = qd.max(p0.norm(), p1.norm()) + qd.max(p2.norm(), p3.norm())
+    bound = func_sweep_bound(e0 - s0, e1 - s1, e2 - s2, e3 - s3, kind)
     distance = func_pair_distance(s0, s1, s2, s3, kind)
     toi = gs.qd_float(1.0)
     if distance <= gap:

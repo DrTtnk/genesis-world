@@ -144,6 +144,7 @@ class VBDSolver(Solver):
         self._prescribed_colliders = []
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_cell_cap = options.contact_cell_cap
+        self._contact_sweep_cell_cap = options.contact_sweep_cell_cap
         self._contact_margin = options.contact_margin
         self._contact_crossing_depth = options.contact_crossing_depth
         self._contact_k_max_ratio = (
@@ -434,8 +435,8 @@ class VBDSolver(Solver):
             messages.append("A contact pair crossed its surface within one substep: the penalty did not hold it.")
         if errno & ErrorCode.VBD_CONTACT_MOTION_BOUND:
             messages.append(
-                "A contact vertex moved further than the contact margin in one substep, so a collision may have "
-                "been missed. Use more substeps or a larger thickness."
+                "A contact vertex ended further than the contact margin from the path the candidate search "
+                "covered, so a collision may have been missed. Use more substeps or a larger margin."
             )
         if errno & ErrorCode.INVALID_VBD_CONTACT_NAN:
             messages.append("A contact pair has a non-finite distance.")
@@ -443,6 +444,11 @@ class VBDSolver(Solver):
             messages.append("More contact vertices in one hash cell than VBDOptions.contact_cell_cap allows.")
         if errno & ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS:
             messages.append("More candidate contact pairs than VBDOptions.contact_pair_cap allows.")
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_SWEEP:
+            messages.append(
+                "A contact vertex swept more hash cells in one substep than VBDOptions.contact_sweep_cell_cap "
+                "allows."
+            )
         if messages:
             gs.raise_exception(" ".join(messages))
 

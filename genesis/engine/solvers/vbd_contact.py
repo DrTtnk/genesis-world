@@ -42,12 +42,21 @@ ROLE_TRIANGLE = 1  # roles 1..3: triangle vertex role - 1
 ROLE_EDGE_A = 4  # roles 4..5: endpoint of the first edge
 ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
 
+# the two kinds of contact pair, as a compile-time switch of the geometry shared by the search and the filter
+POINT_TRIANGLE = 0
+EDGE_EDGE = 1
+
 
 class ContactDiagnostics(NamedTuple):
     """Per-environment contact state of the last substep: candidate pair counts, the largest motion of a tissue
-    and of a rigid contact vertex over the substep (m), the raw error word, and the smallest continuous-collision
-    time of impact since the last `clear_toi()` (1 when no substep was rescaled, and always 1 without
-    `VBDOptions.contact_ccd`)."""
+    and of a rigid contact vertex over the substep (m), the largest distance either of them ended from the swept
+    path the candidate search covered (m), the raw error word, and the smallest continuous-collision time of
+    impact since the last `clear_toi()` (1 when no substep was rescaled, and always 1 without
+    `VBDOptions.contact_ccd`).
+
+    The motion is reported, not bounded: the search follows it. The deviation is what the validity guard holds
+    to `VBDOptions.contact_margin`, so it is the one to read after a `VBD_CONTACT_MOTION_BOUND` failure.
+    """
 
     n_point_pairs: torch.Tensor
     n_edge_pairs: torch.Tensor
@@ -55,6 +64,8 @@ class ContactDiagnostics(NamedTuple):
     max_rigid_motion: torch.Tensor
     errno: torch.Tensor
     min_toi: torch.Tensor
+    max_tissue_deviation: torch.Tensor
+    max_rigid_deviation: torch.Tensor
 
 
 class EnvStatus(NamedTuple):
@@ -227,8 +238,10 @@ class VBDContact:
         self.rule_friction.from_numpy(friction.astype(gs.np_float))
         self.rule_thickness.from_numpy(thickness.astype(gs.np_float))
         self.max_thickness = float(thickness.max())
-        # a candidate is any pair within thickness + margin at the predicted positions; the margin is also the
-        # largest motion a contact vertex may make in one substep without a candidate being missed
+        # A candidate is any pair that comes within thickness + margin anywhere along the substep's sweep, from
+        # the position at its start to the prediction at its end. The margin is also how far the solve may end
+        # from that swept path without a candidate being missed: the search covers the path inflated by one
+        # margin, and by convexity a solve that ends inside the inflation took a path that stays inside it.
         self.margin = self.max_thickness if solver._contact_margin is None else solver._contact_margin
         if not self.margin > 0.0:
             gs.raise_exception(f"VBDOptions.contact_margin must be above zero, got {self.margin}.")
@@ -249,7 +262,15 @@ class VBDContact:
         self.hash_cap = solver._contact_cell_cap
         self.cell_n = qd.field(dtype=gs.qd_int, shape=(self.hash_buckets, solver._B))
         self.cell_v = qd.field(dtype=gs.qd_int, shape=(self.hash_buckets, self.hash_cap, solver._B))
-        self.cell_of = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
+        # the inclusive cell range a contact vertex sweeps over the substep, and its predicted end position: the
+        # grid holds the vertex in every cell of that range, and the pair tests read both ends of the sweep
+        self.cv_lo = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
+        self.cv_hi = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
+        self.cv_pred = qd.Vector.field(3, dtype=gs.qd_float, shape=(self.n_cv, solver._B))
+        # A sweep that spans more cells than this is refused rather than searched: the rasterization is the
+        # product of the three spans, so a body that travels hundreds of cells in one substep would cost more to
+        # search than to simulate. Shorten the substep or widen the margin, which widens the cell with it.
+        self.sweep_cell_cap = solver._contact_sweep_cell_cap
 
         pair_type = qd.types.struct(a=gs.qd_int, b=gs.qd_int, lam=gs.qd_float, k=gs.qd_float)
         self.pair_cap = solver._contact_pair_cap
@@ -265,6 +286,9 @@ class VBDContact:
         self.cv_slot = qd.field(dtype=gs.qd_int, shape=(8 * self.pair_cap, solver._B))
         self.errno = qd.field(dtype=gs.qd_int, shape=solver._B)
         self.max_motion = qd.field(dtype=gs.qd_float, shape=(2, solver._B))
+        # how far the solved position ends from the swept path the search covered, which is the quantity the
+        # validity guard holds to the margin; the travel above is reported but no longer bounded
+        self.max_deviation = qd.field(dtype=gs.qd_float, shape=(2, solver._B))
         # the substep's conservative time of impact, and the smallest one since it was last cleared
         self.toi = qd.field(dtype=gs.qd_float, shape=solver._B)
         self.min_toi = qd.field(dtype=gs.qd_float, shape=solver._B)
@@ -353,6 +377,7 @@ class VBDContact:
 
     def diagnostics(self):
         motion = qd_to_torch(self.max_motion, transpose=True)
+        deviation = qd_to_torch(self.max_deviation, transpose=True)
         return ContactDiagnostics(
             qd_to_torch(self.n_pt),
             qd_to_torch(self.n_ee),
@@ -360,6 +385,8 @@ class VBDContact:
             motion[:, 1],
             qd_to_torch(self.errno),
             qd_to_torch(self.min_toi),
+            deviation[:, 0],
+            deviation[:, 1],
         )
 
     def clear_toi(self):
@@ -789,6 +816,109 @@ def func_cell_hash(c, buckets):
 
 
 @qd.func
+def func_pair_distance(x0, x1, x2, x3, kind: qd.template()):
+    """Clamped closest-point distance of a pair: the point x0 against the triangle (x1, x2, x3), or the edge
+    (x0, x1) against the edge (x2, x3). The same quantities the contact rules are written on."""
+    distance = gs.qd_float(0.0)
+    if qd.static(kind == POINT_TRIANGLE):
+        w = func_point_triangle_weights(x0, x1, x2, x3)
+        distance = (x0 - w[0] * x1 - w[1] * x2 - w[2] * x3).norm()
+    else:
+        s, t = func_segment_parameters(x0, x1, x2, x3)
+        distance = (x0 + s * (x1 - x0) - x2 - t * (x3 - x2)).norm()
+    return distance
+
+
+@qd.func
+def func_sweep_bound(p0, p1, p2, p3, kind: qd.template()):
+    """Lipschitz constant of a pair's clamped distance over a linear sweep with these endpoint displacements.
+
+    The distance does not depend on the pair's common translation, so the mean displacement is removed, and what
+    remains bounds how fast the distance can change: |d(t2) - d(t1)| <= bound * |t2 - t1|. The additive CCD of
+    `vbd_accd.py` advances on the same quantity.
+    """
+    mean = 0.25 * (p0 + p1 + p2 + p3)
+    q0 = p0 - mean
+    q1 = p1 - mean
+    q2 = p2 - mean
+    q3 = p3 - mean
+    bound = gs.qd_float(0.0)
+    if qd.static(kind == POINT_TRIANGLE):
+        bound = q0.norm() + qd.max(q1.norm(), qd.max(q2.norm(), q3.norm()))
+    else:
+        bound = qd.max(q0.norm(), q1.norm()) + qd.max(q2.norm(), q3.norm())
+    return bound
+
+
+@qd.func
+def func_swept_lower_bound(d0, d1, bound):
+    """Lower bound of a pair's distance over the whole sweep, from its two endpoint distances and the Lipschitz
+    constant between them.
+
+    The distance is above both d0 - bound t and d1 - bound (1 - t), and the smallest value that pair of lines
+    allows is their crossing when it falls inside the substep, and the nearer endpoint otherwise. A pair whose
+    bound here is inside the layer is collected even though both of its endpoints are outside it, which is the
+    pair the endpoint search used to miss.
+    """
+    lower = qd.min(d0, d1)
+    if bound > qd.abs(d0 - d1):
+        lower = 0.5 * (d0 + d1 - bound)
+    return lower
+
+
+@qd.func
+def func_point_segment_distance(x, a, b):
+    """Distance from a point to the clamped segment (a, b)."""
+    ab = b - a
+    denom = ab.dot(ab)
+    s = gs.qd_float(0.0)
+    if denom > 0.0:
+        s = qd.max(0.0, qd.min(1.0, (x - a).dot(ab) / denom))
+    return (x - a - s * ab).norm()
+
+
+@qd.func
+def func_sweep_cells(x_prev, x_pred, cell_size):
+    """Inclusive cell range of a vertex's sweep: the grid holds it in every cell of this box."""
+    return func_cell(qd.min(x_prev, x_pred), cell_size), func_cell(qd.max(x_prev, x_pred), cell_size)
+
+
+@qd.func
+def func_is_canonical_cell(cv, i_b, cell, lo, contact: qd.template()):
+    """Whether `cell` is the one cell of a searched range through which this vertex is accepted.
+
+    A swept vertex sits in every cell of its own range, so a search would otherwise find it once per shared cell
+    and collect the same pair that many times. The componentwise largest of the two ranges' lower corners lies in
+    both exactly when they overlap, so accepting only there yields each pair once and loses none. It also rejects
+    a vertex that only shares the cell's hash bucket, since that vertex is not inside the searched cell.
+    """
+    canonical = qd.max(contact.cv_lo[cv, i_b], lo)
+    return (cell == canonical).all() and (cell <= contact.cv_hi[cv, i_b]).all()
+
+
+@qd.func
+def func_is_first_entry(cv, h, slot, i_b, contact: qd.template()):
+    """Whether this is the first slot of the bucket that holds this vertex.
+
+    Two cells of one swept vertex can hash to the same bucket, which puts the vertex in it twice, and both
+    entries then pass the canonical-cell test, since that test reads the searched cell and not the entry.
+    Keeping the first of them is what stops the pair being collected twice, and a pair collected twice would be
+    held by twice its rule stiffness.
+    """
+    is_first = True
+    for earlier in range(slot):
+        if contact.cell_v[h, earlier, i_b] == cv:
+            is_first = False
+    return is_first
+
+
+@qd.func
+def func_sweep_overlaps(cv, i_b, lo, hi, contact: qd.template()):
+    """Whether a vertex's swept cell range meets a searched cell range."""
+    return (contact.cv_hi[cv, i_b] >= lo).all() and (contact.cv_lo[cv, i_b] <= hi).all()
+
+
+@qd.func
 def func_shares_tetrahedron(cv_a, cv_b, solver: qd.template(), contact: qd.template()):
     """Whether two tissue contact vertices belong to one tetrahedron (or are the same vertex)."""
     shares = cv_a == cv_b
@@ -813,26 +943,46 @@ def func_may_collide(cv_a, cv_b, contact: qd.template()):
 
 @qd.kernel
 def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), dyn_state: DynState):
-    """Rigid vertex positions from the link poses, the hash grid of the predicted positions, then the candidate
+    """Rigid vertex positions from the link poses, the hash grid of the substep's sweeps, then the candidate
     pairs of the substep and the per-vertex lists of the pairs they take part in."""
     for i_r, i_b in qd.ndrange(contact.n_rv, solver._B):
         i_l = contact.rv_link[i_r]
+        pos = dyn_state.links.pos[i_l, i_b]
+        quat = dyn_state.links.quat[i_l, i_b]
+        if qd.static(solver.has_rigid_attachment):
+            # A free body's pose for this substep is the one the attachment predicted from its velocity; the
+            # rigid solver's own table still holds the pose of the previous substep, because the solve commits
+            # back to it only at the end. Searching from that stale pose gives a free body a sweep of zero
+            # length and hands the whole of its travel to the validity guard, which is what refused every large
+            # step of the python head. A fixed or prescribed link is not in this table and keeps its own pose.
+            if solver.rigid_attachment.free_slot[i_l] >= 0:
+                pos = solver.rigid_attachment.link_pose[i_l, i_b].pos
+                quat = solver.rigid_attachment.link_pose[i_l, i_b].quat
         contact.rv_pos_prev[i_r, i_b] = contact.rv_pos[i_r, i_b]
-        contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(
-            contact.rv_local[i_r], dyn_state.links.pos[i_l, i_b], dyn_state.links.quat[i_l, i_b]
-        )
+        contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(contact.rv_local[i_r], pos, quat)
     for h, i_b in qd.ndrange(contact.hash_buckets, solver._B):
         contact.cell_n[h, i_b] = 0
     for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
         contact.cv_slot_n[cv, i_b] = 0
-        cell = func_cell(func_cv_pos(f, cv, i_b, solver, contact), contact.cell)
-        contact.cell_of[cv, i_b] = cell
-        h = func_cell_hash(cell, contact.hash_buckets)
-        slot = qd.atomic_add(contact.cell_n[h, i_b], 1)
-        if slot < contact.hash_cap:
-            contact.cell_v[h, slot, i_b] = cv
+        pred = func_cv_pos(f, cv, i_b, solver, contact)
+        prev = func_cv_pos_prev(f, cv, i_b, solver, contact)
+        contact.cv_pred[cv, i_b] = pred
+        lo, hi = func_sweep_cells(prev, pred, contact.cell)
+        contact.cv_lo[cv, i_b] = lo
+        contact.cv_hi[cv, i_b] = hi
+        span = (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1)
+        if span > contact.sweep_cell_cap:
+            qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_SWEEP)
         else:
-            qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
+            for ci in range(lo[0], hi[0] + 1):
+                for cj in range(lo[1], hi[1] + 1):
+                    for ck in range(lo[2], hi[2] + 1):
+                        h = func_cell_hash(qd.Vector([ci, cj, ck], dt=gs.qd_int), contact.hash_buckets)
+                        slot = qd.atomic_add(contact.cell_n[h, i_b], 1)
+                        if slot < contact.hash_cap:
+                            contact.cell_v[h, slot, i_b] = cv
+                        else:
+                            qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
     for i_b in range(solver._B):
         contact.n_pt[i_b] = 0
         contact.n_ee[i_b] = 0
@@ -843,8 +993,13 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
             a = func_cv_pos(f, tri[0], i_b, solver, contact)
             b = func_cv_pos(f, tri[1], i_b, solver, contact)
             c = func_cv_pos(f, tri[2], i_b, solver, contact)
-            lo = func_cell(qd.min(qd.min(a, b), c) - reach, contact.cell)
-            hi = func_cell(qd.max(qd.max(a, b), c) + reach, contact.cell)
+            a0 = func_cv_pos_prev(f, tri[0], i_b, solver, contact)
+            b0 = func_cv_pos_prev(f, tri[1], i_b, solver, contact)
+            c0 = func_cv_pos_prev(f, tri[2], i_b, solver, contact)
+            low = qd.min(qd.min(qd.min(a, b), c), qd.min(qd.min(a0, b0), c0))
+            high = qd.max(qd.max(qd.max(a, b), c), qd.max(qd.max(a0, b0), c0))
+            lo = func_cell(low - reach, contact.cell)
+            hi = func_cell(high + reach, contact.cell)
             for ci in range(lo[0], hi[0] + 1):
                 for cj in range(lo[1], hi[1] + 1):
                     for ck in range(lo[2], hi[2] + 1):
@@ -852,15 +1007,22 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                         h = func_cell_hash(cell, contact.hash_buckets)
                         for slot in range(qd.min(contact.cell_n[h, i_b], contact.hash_cap)):
                             cv = contact.cell_v[h, slot, i_b]
-                            if (contact.cell_of[cv, i_b] == cell).all() and func_may_collide(cv, tri[0], contact):
+                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_first_entry(
+                                cv, h, slot, i_b, contact
+                            )
+                            if is_new and func_may_collide(cv, tri[0], contact):
                                 is_adjacent = False
                                 for j in qd.static(range(3)):
                                     if func_shares_tetrahedron(cv, tri[j], solver, contact):
                                         is_adjacent = True
                                 if not is_adjacent:
                                     x = func_cv_pos(f, cv, i_b, solver, contact)
-                                    w = func_point_triangle_weights(x, a, b, c)
-                                    d = (x - w[0] * a - w[1] * b - w[2] * c).norm()
+                                    x0 = func_cv_pos_prev(f, cv, i_b, solver, contact)
+                                    d = func_swept_lower_bound(
+                                        func_pair_distance(x0, a0, b0, c0, POINT_TRIANGLE),
+                                        func_pair_distance(x, a, b, c, POINT_TRIANGLE),
+                                        func_sweep_bound(x - x0, a - a0, b - b0, c - c0, POINT_TRIANGLE),
+                                    )
                                     h_rule = contact.rule_thickness[
                                         contact.cv_info[cv].group, contact.cv_info[tri[0]].group
                                     ]
@@ -880,8 +1042,10 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
             ea = contact.edge_cv[i_e]
             a = func_cv_pos(f, ea[0], i_b, solver, contact)
             b = func_cv_pos(f, ea[1], i_b, solver, contact)
-            lo = func_cell(qd.min(a, b) - reach, contact.cell)
-            hi = func_cell(qd.max(a, b) + reach, contact.cell)
+            a0 = func_cv_pos_prev(f, ea[0], i_b, solver, contact)
+            b0 = func_cv_pos_prev(f, ea[1], i_b, solver, contact)
+            lo = func_cell(qd.min(qd.min(a, b), qd.min(a0, b0)) - reach, contact.cell)
+            hi = func_cell(qd.max(qd.max(a, b), qd.max(a0, b0)) + reach, contact.cell)
             for ci in range(lo[0], hi[0] + 1):
                 for cj in range(lo[1], hi[1] + 1):
                     for ck in range(lo[2], hi[2] + 1):
@@ -889,15 +1053,16 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                         h = func_cell_hash(cell, contact.hash_buckets)
                         for slot in range(qd.min(contact.cell_n[h, i_b], contact.hash_cap)):
                             cv = contact.cell_v[h, slot, i_b]
-                            if (contact.cell_of[cv, i_b] == cell).all():
+                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_first_entry(
+                                cv, h, slot, i_b, contact
+                            )
+                            if is_new:
                                 for c_e in range(contact.cv_edge_offset[cv], contact.cv_edge_offset[cv + 1]):
                                     j_e = contact.cv_edge[c_e]
                                     eb = contact.edge_cv[j_e]
                                     # an edge is reached through both endpoints: accept it through its first one, or
-                                    # through the second when the first lies outside the searched cells
-                                    first = contact.cell_of[eb[0], i_b]
-                                    is_first_inside = (first >= lo).all() and (first <= hi).all()
-                                    is_accepted = cv == eb[0] or not is_first_inside
+                                    # through the second when the first sweeps outside the searched cells
+                                    is_accepted = cv == eb[0] or not func_sweep_overlaps(eb[0], i_b, lo, hi, contact)
                                     if j_e > i_e and is_accepted and func_may_collide(ea[0], eb[0], contact):
                                         is_adjacent = False
                                         for j in qd.static(range(2)):
@@ -907,8 +1072,13 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                         if not is_adjacent:
                                             c = func_cv_pos(f, eb[0], i_b, solver, contact)
                                             d = func_cv_pos(f, eb[1], i_b, solver, contact)
-                                            s, t = func_segment_parameters(a, b, c, d)
-                                            dist = (a + s * (b - a) - c - t * (d - c)).norm()
+                                            c0 = func_cv_pos_prev(f, eb[0], i_b, solver, contact)
+                                            d0 = func_cv_pos_prev(f, eb[1], i_b, solver, contact)
+                                            dist = func_swept_lower_bound(
+                                                func_pair_distance(a0, b0, c0, d0, EDGE_EDGE),
+                                                func_pair_distance(a, b, c, d, EDGE_EDGE),
+                                                func_sweep_bound(a - a0, b - b0, c - c0, d - d0, EDGE_EDGE),
+                                            )
                                             h_rule = contact.rule_thickness[
                                                 contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
                                             ]
@@ -1086,11 +1256,19 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
     for kind, i_b in qd.ndrange(2, solver._B):
         if not solver.env_failed[i_b]:
             contact.max_motion[kind, i_b] = 0.0
+            contact.max_deviation[kind, i_b] = 0.0
     for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
         if not solver.env_failed[i_b]:
-            motion = (func_cv_pos(f, cv, i_b, solver, contact) - func_cv_pos_prev(f, cv, i_b, solver, contact)).norm()
-            qd.atomic_max(contact.max_motion[contact.cv_info[cv].kind, i_b], motion)
-            if motion > contact.margin:
+            # The search covered the segment from the start of the substep to the prediction, inflated by one
+            # margin. The solved position is the end of the path actually taken, and by convexity that whole path
+            # stays inside the inflation when its end does, so this distance, and not the travel, is what decides
+            # whether a pair could have been missed. Rescaling by a time of impact lands on the segment itself.
+            pos = func_cv_pos(f, cv, i_b, solver, contact)
+            prev = func_cv_pos_prev(f, cv, i_b, solver, contact)
+            deviation = func_point_segment_distance(pos, prev, contact.cv_pred[cv, i_b])
+            qd.atomic_max(contact.max_motion[contact.cv_info[cv].kind, i_b], (pos - prev).norm())
+            qd.atomic_max(contact.max_deviation[contact.cv_info[cv].kind, i_b], deviation)
+            if deviation > contact.margin:
                 qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_MOTION_BOUND)
     for i_b in range(solver._B):
         if contact.errno[i_b] != 0 and not solver.env_failed[i_b]:

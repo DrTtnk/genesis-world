@@ -1034,13 +1034,15 @@ def test_a_tissue_outside_every_contact_rule_is_not_held_to_the_motion_bound():
 
 @pytest.mark.parametrize("margin", [None, 5e-3])
 def test_the_candidate_margin_can_be_raised_above_the_contact_thickness(margin, show_viewer):
-    """Thickness and margin answer different questions, and tying them together caps the speed of a scene.
+    """Thickness and margin answer different questions, and tying them together caps what a scene may do.
 
     A thin tissue pad rigidly carried by a fast body moves much further per substep than the physical contact
     layer is thick: the python head's 0.5 mm articular pads reach 2 m/s on a falling bone, which is 200 um per
     substep against a 200 um layer. The thickness must stay at the geometry's scale, so the margin is raised
-    instead. The physics is unchanged: with the default margin this scene fails the motion bound, with a raised
-    one it runs and the tissue still rests on the table rather than passing through it.
+    instead. Since the search became swept, the travel itself is no longer what the margin has to cover: this
+    box falls 4 mm a substep under either margin without a complaint, and the default one gives out at the
+    impact, where a single penalty sweep cannot hold 4 mm of approach inside a 0.2 mm layer and the response
+    leaves the region the search covered. The raised margin absorbs that response, and the box lands.
     """
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
@@ -1068,7 +1070,8 @@ def test_the_candidate_margin_can_be_raised_above_the_contact_thickness(margin, 
     lowest = float(falling.get_positions()[..., 2].min())
     print(f"margin {scene.vbd_solver.contact.margin} m: failed={failed}, lowest vertex {1000 * lowest:.3f} mm")
     if margin is None:
-        assert failed, "the default margin is the thickness, and this scene outruns it"
+        assert failed, "the default margin is the thickness, and this scene's impact outruns it"
+        assert lowest < 0.01, "and it must have failed at the table, not somewhere in the air above it"
     else:
         assert not failed
         assert lowest > -1e-3, "the raised margin must not let the box pass through the table"

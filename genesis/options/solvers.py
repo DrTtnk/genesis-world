@@ -977,6 +977,12 @@ class VBDOptions(Options):
     contact_cell_cap : int, optional
         Largest number of contact vertices per hash-grid cell. Overflow fails the substep; raise it for meshes much
         finer than the contact thickness. Defaults to 64.
+    contact_sweep_cell_cap : int, optional
+        Largest number of hash-grid cells one contact vertex may sweep in a substep. The search follows each
+        vertex from the start of the substep to its predicted end, and writes it into every cell of that box, so
+        the work per vertex is the product of the three cell spans. A sweep past this cap fails the substep
+        instead of being searched: shorten the substep, or raise the margin, which raises the cell size with it.
+        Defaults to 512.
     contact_k_max_ratio : float, optional
         Upper bound of a contact pair's stiffness as a multiple of its rule stiffness, separately from
         `constraint_k_max_ratio`, which governs attachments and ligaments. A hard attachment wants a high cap so
@@ -996,12 +1002,14 @@ class VBDOptions(Options):
         rule thickness, so the scene's coarsest rule never decides for its finest; a value here overrides that
         for every pair at once.
     contact_margin : float, optional
-        How far beyond the contact thickness (m) a pair is still collected as a candidate, and therefore the
-        largest distance a contact vertex may travel in one substep before the substep fails as possibly having
-        missed a collision. It is not a physical layer: the thickness alone decides where a pair pushes. Raise it
-        when something light and fast rides on something heavy, such as a thin tissue pad on a falling bone, where
-        the thickness that suits the geometry would otherwise cap the speed. Larger values cost candidate pairs and
-        a coarser hash grid. Defaults to the largest rule thickness.
+        How far beyond the contact thickness (m) a pair is still collected as a candidate, measured anywhere
+        along the substep's sweep from the position at its start to the prediction at its end. It is therefore
+        also the largest distance the solve may end from that swept path before the substep fails as possibly
+        having missed a collision. It is not a physical layer: the thickness alone decides where a pair pushes,
+        and it is not a speed limit either, because the search follows the travel instead of bounding it. Raise
+        it when the solve itself moves a vertex far off the path the prediction took, which is a stiff contact
+        or attachment reacting within the substep. Larger values cost candidate pairs and a coarser hash grid.
+        Defaults to the largest rule thickness.
     contact_ccd : bool, optional
         Whether a substep is rescaled so that no contact pair reaches `contact_ccd_gap`, instead of being refused
         when a pair crosses. After the primal solve every candidate pair is swept from the pose at the start of
@@ -1059,6 +1067,7 @@ class VBDOptions(Options):
     max_dual_steps: PositiveInt = 200
     contact_pair_cap: PositiveInt = 65536
     contact_cell_cap: PositiveInt = 64
+    contact_sweep_cell_cap: PositiveInt = 512
     contact_margin: Optional[float] = None
     contact_crossing_depth: Optional[float] = None
     contact_k_max_ratio: Optional[float] = None
