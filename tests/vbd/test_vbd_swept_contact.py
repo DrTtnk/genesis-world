@@ -25,8 +25,10 @@ from genesis.engine.solvers.vbd_contact import (
     EDGE_EDGE,
     POINT_TRIANGLE,
     func_cell_hash,
+    func_edge_edge_geometry,
     func_is_canonical_cell,
     func_is_own_cell,
+    func_point_triangle_geometry,
     func_pair_distance,
     func_sweep_bound,
     func_swept_lower_bound,
@@ -313,6 +315,67 @@ def test_edges_that_slide_across_each_other_in_contact_are_not_a_crossing():
     print(f"sliding in contact: failed={bool(status.is_failed[0])}, errno={int(status.errno[0])}")
     assert not bool(status.is_failed[0]), (
         f"two bars sliding across each other in contact are not a crossing (errno {int(status.errno[0])})")
+
+
+@qd.kernel
+def kernel_contact_normals(pts: qd.template(), out_n: qd.template(), out_d: qd.template(), n_cases: int,
+                           kind: qd.template()):
+    """The normal and distance the contact geometry reports for four points, with no scene around it."""
+    for i in range(n_cases):
+        if qd.static(kind == POINT_TRIANGLE):
+            d, n, w = func_point_triangle_geometry(pts[i, 0], pts[i, 1], pts[i, 2], pts[i, 3])
+            out_d[i] = d
+            out_n[i] = n
+        else:
+            dist, n, s, t = func_edge_edge_geometry(pts[i, 0], pts[i, 1], pts[i, 2], pts[i, 3])
+            out_d[i] = dist
+            out_n[i] = n
+
+
+def _normals(cases, kind):
+    n_cases = len(cases)
+    pts = qd.Vector.field(3, dtype=gs.qd_float, shape=(n_cases, 4))
+    out_n = qd.Vector.field(3, dtype=gs.qd_float, shape=(n_cases,))
+    out_d = qd.field(dtype=gs.qd_float, shape=(n_cases,))
+    pts.from_numpy(np.asarray(cases, dtype=np.float32))
+    kernel_contact_normals(pts, out_n, out_d, n_cases, kind)
+    return qd_to_torch(out_n).cpu().numpy(), qd_to_torch(out_d).cpu().numpy()
+
+
+def test_a_point_resting_exactly_on_a_face_still_has_a_normal():
+    """A penalty solve drives surfaces into contact, so a point landing exactly on a triangle is an ordinary
+    state and not a degenerate input. The offset between them is then the zero vector, which has a length but
+    no direction, and dividing by that length gave a non-finite normal: a head36 run with the continuous filter
+    on died of it at frame 9. The triangle still has a normal, and that is the direction the pair pushes along.
+    The three cases are the interior of the face, a point exactly on an edge of it, and one exactly on a
+    corner, because the weights take a different branch for each."""
+    tri = [[0.0, 0.0, 0.0], [0.02, 0.0, 0.0], [0.0, 0.02, 0.0]]
+    cases = [
+        [[0.005, 0.005, 0.0]] + tri,   # interior
+        [[0.010, 0.000, 0.0]] + tri,   # on an edge
+        [[0.000, 0.000, 0.0]] + tri,   # on a corner
+    ]
+    n, d = _normals(cases, POINT_TRIANGLE)
+    print(f"point on face: distances {d.tolist()}, normals {n.tolist()}")
+    assert np.isfinite(n).all(), f"a point on the face must still get a normal, got {n.tolist()}"
+    assert np.isfinite(d).all()
+    assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-5), "and it must be a unit vector"
+
+
+def test_two_edges_touching_exactly_still_have_a_normal():
+    """The same for the edge pair: the closest points coincide, the offset has no direction, and the common
+    perpendicular of the two edges is the one the geometry still defines."""
+    cases = [
+        # crossed, touching exactly at the origin
+        [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, -0.01, 0.0], [0.0, 0.01, 0.0]],
+        # crossed, touching exactly, tilted so no axis is special
+        [[-0.01, -0.01, 0.0], [0.01, 0.01, 0.0], [-0.01, 0.01, 0.0], [0.01, -0.01, 0.0]],
+    ]
+    n, d = _normals(cases, EDGE_EDGE)
+    print(f"edges touching: distances {d.tolist()}, normals {n.tolist()}")
+    assert np.isfinite(n).all(), f"two edges that touch must still get a normal, got {n.tolist()}"
+    assert np.allclose(d, 0.0, atol=1e-7), "the fixture must really put them at zero distance"
+    assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-5), "and it must be a unit vector"
 
 
 def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():

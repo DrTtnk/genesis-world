@@ -46,6 +46,12 @@ ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
 POINT_TRIANGLE = 0
 EDGE_EDGE = 1
 
+# Below this separation (m) the offset between two closest points is taken to have no direction of its own, and
+# the geometry's own normal is used instead: the face's for a point-triangle pair, the common perpendicular for
+# an edge-edge one. Positions are single precision, so on a body two metres from the origin the last bit is
+# already about 0.3 micrometres, and a separation of a nanometre carries no direction worth reading.
+CONTACT_DEGENERATE_EPS = 1e-9
+
 
 # VBD_CONTACT_MOTION_BOUND no longer marks a refused substep (see kernel_end_contact): it marks that this
 # substep's safe bound ran out, which the next kernel_begin_contact reads to decide to rebuild. Every other bit
@@ -658,6 +664,54 @@ def func_segment_parameters(a, b, c, d):
 
 
 @qd.func
+def func_point_triangle_geometry(x, a, b, c):
+    """Distance, unit normal and barycentric weights of a point against a triangle. The distance is signed over
+    the face while the projection is interior, and unsigned once it falls on an edge or a corner, where the
+    face has no side to be on.
+
+    The normal is the direction of the offset between the two closest points, and the offset stops having one
+    when they coincide. A penalty solve drives surfaces together, so a point landing exactly on a face is an
+    ordinary state rather than a degenerate input, and dividing the zero offset by its zero length turned it
+    into a non-finite normal: a head36 run with the continuous filter on ended at frame 9 that way. The
+    triangle still has a normal there, and it is the direction the pair should push along. A triangle with no
+    area has none, and that is left to read as non-finite, because a mesh that carries one is broken.
+    """
+    w = func_point_triangle_weights(x, a, b, c)
+    rel = x - w[0] * a - w[1] * b - w[2] * c
+    face = (b - a).cross(c - a).normalized()
+    d = rel.norm()
+    n = face
+    if d > CONTACT_DEGENERATE_EPS:
+        n = rel / d
+    if w[0] > 0.0 and w[1] > 0.0 and w[2] > 0.0:
+        n = face
+        d = rel.dot(n)
+    return d, n, w
+
+
+@qd.func
+def func_edge_edge_geometry(a, b, c, d):
+    """Distance, unit normal from the second edge towards the first, and closest-point parameters of two edges.
+
+    As above, the offset has no direction once the closest points coincide. What the pair still has is the
+    common perpendicular of the two edges, signed to agree with the offset between their midpoints so that it
+    keeps pointing the way the offset did. Two edges that touch *and* are parallel have neither, and that is
+    left to read as non-finite.
+    """
+    s, t = func_segment_parameters(a, b, c, d)
+    rel = a + s * (b - a) - c - t * (d - c)
+    dist = rel.norm()
+    n = rel / dist
+    if dist <= CONTACT_DEGENERATE_EPS:
+        perp = (b - a).cross(d - c)
+        if perp.norm() > CONTACT_DEGENERATE_EPS:
+            n = perp.normalized()
+            if n.dot((a + b) - (c + d)) < 0.0:
+                n = -n
+    return dist, n, s, t
+
+
+@qd.func
 def func_pt_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     """Current distance, unit normal and closest-point weights of a point-triangle pair, with the rule thickness.
     Over the face the distance is signed by the outward triangle normal, so a point behind the surface is pushed
@@ -670,13 +724,7 @@ def func_pt_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template())
     a = func_cv_pos(f, tri[0], i_b, solver, contact)
     b = func_cv_pos(f, tri[1], i_b, solver, contact)
     c = func_cv_pos(f, tri[2], i_b, solver, contact)
-    w = func_point_triangle_weights(x, a, b, c)
-    rel = x - w[0] * a - w[1] * b - w[2] * c
-    d = rel.norm()
-    n = rel / d
-    if w[0] > 0.0 and w[1] > 0.0 and w[2] > 0.0:
-        n = (b - a).cross(c - a).normalized()
-        d = rel.dot(n)
+    d, n, w = func_point_triangle_geometry(x, a, b, c)
     h = contact.rule_thickness[contact.cv_info[cv_x].group, contact.cv_info[tri[0]].group]
     return d, n, w, h
 
@@ -691,10 +739,7 @@ def func_ee_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template())
     b = func_cv_pos(f, ea[1], i_b, solver, contact)
     c = func_cv_pos(f, eb[0], i_b, solver, contact)
     d = func_cv_pos(f, eb[1], i_b, solver, contact)
-    s, t = func_segment_parameters(a, b, c, d)
-    rel = a + s * (b - a) - c - t * (d - c)
-    dist = rel.norm()
-    n = rel / dist
+    dist, n, s, t = func_edge_edge_geometry(a, b, c, d)
     h = contact.rule_thickness[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
     return dist, n, s, t, h
 
