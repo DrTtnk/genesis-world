@@ -978,8 +978,11 @@ class VBDOptions(Options):
         counted separately). Memory grows with it; a substep that finds more pairs fails with an error instead of
         dropping contacts. Defaults to 65536.
     contact_cell_cap : int, optional
-        Largest number of contact vertices per hash-grid cell. Overflow fails the substep; raise it for meshes much
-        finer than the contact thickness. Defaults to 64.
+        Largest number of contact vertices a hash bucket may hold. Overflow fails the substep rather than
+        dropping a vertex silently. It has to be read together with `contact_cell_size`, because a cell sized
+        off the mesh holds far more vertices than one sized off the contact layer did: on the python head the
+        0.8 mm cell peaked at 8 vertices a bucket while the 3.1 mm cell reaches 61, and a settling pose crosses
+        64. Defaults to 256, which is 31 MB of grid on a 15 thousand vertex scene.
     contact_sweep_cell_cap : int, optional
         Largest number of hash-grid cells one contact vertex may sweep in a substep. The search follows each
         vertex from the start of the substep to its predicted end, and writes it into every cell of that box, so
@@ -1088,7 +1091,7 @@ class VBDOptions(Options):
     max_sweeps: PositiveInt = 400
     max_dual_steps: PositiveInt = 200
     contact_pair_cap: PositiveInt = 65536
-    contact_cell_cap: PositiveInt = 64
+    contact_cell_cap: PositiveInt = 256
     contact_sweep_cell_cap: PositiveInt = 512
     contact_margin: Optional[float] = None
     contact_margin_max: Optional[float] = None
