@@ -819,19 +819,25 @@ def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact:
     for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
         i_r = contact.link_rv[c]
         cv = contact.rv_cv[i_r]
-        force, hessian = func_contact_cv_terms(f, cv, i_b, solver, contact)
-        r = contact.rv_pos[i_r, i_b] - origin
-        jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
-        for row in qd.static(range(3)):
-            jacobian[row, row] = 1.0
-        jacobian[0, 4] = r[2]
-        jacobian[0, 5] = -r[1]
-        jacobian[1, 3] = -r[2]
-        jacobian[1, 5] = r[0]
-        jacobian[2, 3] = r[1]
-        jacobian[2, 4] = -r[0]
-        force6 += jacobian.transpose() @ force
-        hessian6 += jacobian.transpose() @ hessian @ jacobian
+        # A vertex the search gave no pair contributes an exactly zero force and an exactly zero block, so the
+        # two Jacobian products below add nothing to either accumulator: skipping it changes no bit of the
+        # result, it only declines to compute one. This loop runs on a single thread, once a free body, once a
+        # sweep, and on the python head 286 of the 15224 rigid contact vertices carry a pair, so without the
+        # test 98 percent of it builds a 3x6 Jacobian and multiplies through it to add zero.
+        if contact.cv_slot_offset[cv + 1, i_b] > contact.cv_slot_offset[cv, i_b]:
+            force, hessian = func_contact_cv_terms(f, cv, i_b, solver, contact)
+            r = contact.rv_pos[i_r, i_b] - origin
+            jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
+            for row in qd.static(range(3)):
+                jacobian[row, row] = 1.0
+            jacobian[0, 4] = r[2]
+            jacobian[0, 5] = -r[1]
+            jacobian[1, 3] = -r[2]
+            jacobian[1, 5] = r[0]
+            jacobian[2, 3] = r[1]
+            jacobian[2, 4] = -r[0]
+            force6 += jacobian.transpose() @ force
+            hessian6 += jacobian.transpose() @ hessian @ jacobian
     return force6, hessian6
 
 
@@ -845,10 +851,13 @@ def func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver: qd.template(), cont
         if contact.dof_moves_link[i_d, i_l]:
             for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
                 i_r = contact.link_rv[c]
-                force_v, hessian_v = func_contact_cv_terms(f, contact.rv_cv[i_r], i_b, solver, contact)
-                jacobian = axis.cross(contact.rv_pos[i_r, i_b] - pivot)
-                force += jacobian.dot(force_v)
-                curvature += jacobian.dot(hessian_v @ jacobian)
+                cv = contact.rv_cv[i_r]
+                # zero contributes nothing here either, for the same reason as in func_contact_link_terms
+                if contact.cv_slot_offset[cv + 1, i_b] > contact.cv_slot_offset[cv, i_b]:
+                    force_v, hessian_v = func_contact_cv_terms(f, cv, i_b, solver, contact)
+                    jacobian = axis.cross(contact.rv_pos[i_r, i_b] - pivot)
+                    force += jacobian.dot(force_v)
+                    curvature += jacobian.dot(hessian_v @ jacobian)
     return force, curvature
 
 
