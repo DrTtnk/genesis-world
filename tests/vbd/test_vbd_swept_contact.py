@@ -27,6 +27,7 @@ from genesis.engine.solvers.vbd_contact import (
     func_cell_hash,
     func_is_canonical_cell,
     func_is_own_cell,
+    func_edges_swapped_sides,
     func_pair_distance,
     func_sweep_bound,
     func_swept_lower_bound,
@@ -271,6 +272,62 @@ def test_a_tunnelling_block_without_the_filter_is_still_refused():
           f"lowest {1000 * lowest:.3f} mm")
     assert bool(status.is_failed[0]), "a block the penalty cannot hold must not be reported as a taken substep"
     assert int(status.errno[0]) != 0
+
+
+@qd.kernel
+def kernel_edges_swapped_sides(starts: qd.template(), ends: qd.template(), swapped: qd.template(), n: int):
+    """The side test of the crossing check, over real coordinates, with no scene around it."""
+    for i in range(n):
+        swapped[i] = 1 if func_edges_swapped_sides(
+            starts[i, 0], starts[i, 1], starts[i, 2], starts[i, 3],
+            ends[i, 0], ends[i, 1], ends[i, 2], ends[i, 3],
+        ) else 0
+
+
+def _side_test(cases):
+    """Run the side test on a list of (start quadruple, end quadruple) coordinate pairs."""
+    n = len(cases)
+    starts = qd.Vector.field(3, dtype=gs.qd_float, shape=(n, 4))
+    ends = qd.Vector.field(3, dtype=gs.qd_float, shape=(n, 4))
+    swapped = qd.field(dtype=gs.qd_int, shape=(n,))
+    starts.from_numpy(np.asarray([case[0] for case in cases], dtype=np.float32))
+    ends.from_numpy(np.asarray([case[1] for case in cases], dtype=np.float32))
+    kernel_edges_swapped_sides(starts, ends, swapped, n)
+    return qd_to_torch(swapped).cpu().numpy().astype(bool)
+
+
+def test_two_edges_resting_against_each_other_do_not_swap_sides_on_rounding():
+    """The python head reported a crossing at substep 357 of a run in which nothing was behind anything: the
+    closest pair in the scene sat at 0.199447 mm against a 0.2 mm layer, which is 99.72 percent of it.
+
+    Two bone surfaces that rest against each other meet along nearly parallel edges, and the side test reads
+    the sign of (b - a) x (d - c) . (a - c), whose magnitude carries a factor of the sine of the angle between
+    the edges. Near parallel that product is rounding noise, and its sign flips for free, so every resting
+    contact was one rounding error away from being called a crossing. These edges are parallel to a
+    microradian, hold the measured gap, and slide a realistic 40 um along each other.
+    """
+    gap = 0.000199447  # the distance the head36 failure actually measured
+    skew = 1e-6  # a microradian of misalignment, far below any real articulation
+    cases = []
+    for direction in (+1.0, -1.0):
+        lower = [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0]]
+        upper0 = [[-0.01, -0.005, gap], [0.01, 0.005 + direction * skew, gap]]
+        upper1 = [[-0.01 + 4e-5, -0.005, gap], [0.01 + 4e-5, 0.005 - direction * skew, gap]]
+        cases.append(([lower[0], lower[1], upper0[0], upper0[1]],
+                      [lower[0], lower[1], upper1[0], upper1[1]]))
+    swapped = _side_test(cases)
+    assert not swapped.any(), f"a resting contact must not read as a crossing (swapped: {swapped.tolist()})"
+
+
+def test_two_edges_that_really_pass_through_each_other_still_swap_sides():
+    """The guard is not being disabled, only kept off the noise floor. These edges are perpendicular and one
+    passes cleanly through the other's plane over the substep, which is the event the test exists to catch."""
+    cases = [(
+        [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, -0.01, 0.002], [0.0, 0.01, 0.002]],
+        [[-0.01, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, -0.01, -0.002], [0.0, 0.01, -0.002]],
+    )]
+    swapped = _side_test(cases)
+    assert swapped.all(), "two edges that pass through each other must still read as a crossing"
 
 
 def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():

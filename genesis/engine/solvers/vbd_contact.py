@@ -46,6 +46,15 @@ ROLE_EDGE_B = 6  # roles 6..7: endpoint of the second edge
 POINT_TRIANGLE = 0
 EDGE_EDGE = 1
 
+# How far off zero the side test's triple product has to be, relative to the product of the three vector
+# magnitudes that scale it, before a change of its sign is read as two edges having swapped sides. The
+# normalised quantity is the sine of the angle between the edges times the cosine of the angle their offset
+# makes with the common normal, so this is the smallest misalignment the test is willing to believe. Single
+# precision positions carry about seven digits and the product is a difference of nearly equal numbers, so a
+# thousandth of a degree of skew is already at the noise floor; two edges that genuinely cross are orders
+# above it.
+CROSSING_SIDE_FLOOR = 1e-5
+
 # VBD_CONTACT_MOTION_BOUND no longer marks a refused substep (see kernel_end_contact): it marks that this
 # substep's safe bound ran out, which the next kernel_begin_contact reads to decide to rebuild. Every other bit
 # is a genuine failure and must still latch the environment, which is what this mask keeps in the aggregate check.
@@ -1273,22 +1282,46 @@ def func_accumulate_reaction(f, cv, force, i_b, solver: qd.template(), contact: 
 
 
 @qd.func
+def func_edges_swapped_sides(a0, b0, c0, d0, a1, b1, c1, d1):
+    """Whether two edges swapped sides over the substep: the sign of the triple product
+    (b - a) x (d - c) . (a - c) at the start against its sign at the end.
+
+    The product carries a factor of the sine of the angle between the two edges, so for edges that are nearly
+    parallel it is the difference of nearly equal numbers and its sign is rounding noise. Two surfaces resting
+    against each other meet along nearly parallel edges, which put every load-bearing contact of the python
+    head one rounding error away from being reported as a crossing: at substep 357 of a head36 run the closest
+    pair in the scene sat at 99.72 percent of its contact layer, with nothing anywhere behind anything, and the
+    substep was refused. A sign change therefore counts only when the quantity that changed sign was itself
+    meaningfully non-zero, measured against the magnitude the three vectors give it. A real crossing is a long
+    way from the floor on both sides of the substep, because the edges leave and enter at a definite angle.
+    """
+    swapped = False
+    side0 = (b0 - a0).cross(d0 - c0).dot(a0 - c0)
+    side1 = (b1 - a1).cross(d1 - c1).dot(a1 - c1)
+    if side0 * side1 < 0.0:
+        scale0 = (b0 - a0).norm() * (d0 - c0).norm() * (a0 - c0).norm()
+        scale1 = (b1 - a1).norm() * (d1 - c1).norm() * (a1 - c1).norm()
+        floor = gs.qd_float(CROSSING_SIDE_FLOOR)
+        if qd.abs(side0) > floor * scale0 and qd.abs(side1) > floor * scale1:
+            swapped = True
+    return swapped
+
+
+@qd.func
 def func_edges_crossed(f, i_b, ea, eb, s, t, solver: qd.template(), contact: qd.template()):
-    """Whether two edges whose closest points are interior swapped sides over the substep: the sign of the
-    triple product (b - a) x (d - c) . (a - c) is compared at the start and at the end of the substep."""
+    """Whether two edges whose closest points are interior swapped sides over the substep."""
     crossed = False
     if s > 0.0 and s < 1.0 and t > 0.0 and t < 1.0:
-        a0 = func_cv_pos_prev(f, ea[0], i_b, solver, contact)
-        b0 = func_cv_pos_prev(f, ea[1], i_b, solver, contact)
-        c0 = func_cv_pos_prev(f, eb[0], i_b, solver, contact)
-        d0 = func_cv_pos_prev(f, eb[1], i_b, solver, contact)
-        a1 = func_cv_pos(f, ea[0], i_b, solver, contact)
-        b1 = func_cv_pos(f, ea[1], i_b, solver, contact)
-        c1 = func_cv_pos(f, eb[0], i_b, solver, contact)
-        d1 = func_cv_pos(f, eb[1], i_b, solver, contact)
-        side0 = (b0 - a0).cross(d0 - c0).dot(a0 - c0)
-        side1 = (b1 - a1).cross(d1 - c1).dot(a1 - c1)
-        crossed = side0 * side1 < 0.0
+        crossed = func_edges_swapped_sides(
+            func_cv_pos_prev(f, ea[0], i_b, solver, contact),
+            func_cv_pos_prev(f, ea[1], i_b, solver, contact),
+            func_cv_pos_prev(f, eb[0], i_b, solver, contact),
+            func_cv_pos_prev(f, eb[1], i_b, solver, contact),
+            func_cv_pos(f, ea[0], i_b, solver, contact),
+            func_cv_pos(f, ea[1], i_b, solver, contact),
+            func_cv_pos(f, eb[0], i_b, solver, contact),
+            func_cv_pos(f, eb[1], i_b, solver, contact),
+        )
     return crossed
 
 

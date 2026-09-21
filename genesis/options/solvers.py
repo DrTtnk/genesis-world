@@ -957,8 +957,11 @@ class VBDOptions(Options):
         fast fixed-sweep path, which is what a solver-level adjoint differentiates. Defaults to True.
     self_collision_thickness : float, optional
         Distance at which two vertices of the body push each other apart. Zero, the default, disables
-        self-collision entirely. Vertices sharing a tetrahedron are always exempt. The present
-        implementation compares every pair, so it is for small scenes until a broad phase exists.
+        self-collision entirely. Vertices sharing a tetrahedron are always exempt. The search is a spatial
+        hash of the predicted positions, one cell a vertex, read back over the eight cells around the
+        vertex's own lower corner, so a pair is found when the two vertices *end* the substep within about a
+        cell of each other. It is not swept, unlike the search between separate bodies, so a surface that
+        folds onto itself faster than a cell a substep can pass through undetected.
     violation_tol : float, optional
         Under `requires_grad`, the relative constraint violation each substep converges to: strain for a distance
         constraint, radians for an angle constraint. Defaults to 1e-6.
