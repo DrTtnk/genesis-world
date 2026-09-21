@@ -378,6 +378,47 @@ def test_two_edges_touching_exactly_still_have_a_normal():
     assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=1e-5), "and it must be a unit vector"
 
 
+def test_a_vertex_accumulates_its_contacts_in_an_order_the_gpu_did_not_choose():
+    """A contact pair gets its index from `qd.atomic_add`, which completes in a different thread order every
+    run, and each vertex then accumulates its force and Hessian by walking its slot list in that order. Float
+    addition is not associative, so from the first substep at which one vertex carries two simultaneously
+    active contacts the two runs round differently. On the python head that first bit of difference arrives
+    around substep 122 and reaches 49 mm by substep 440.
+
+    The set is never in doubt, only the order, so the fix is to put each vertex's list in an order that comes
+    from the mesh rather than from the race: pair kind, then the two topology indices, then the role. This
+    checks that invariant directly, because checking it by running twice would prove nothing on a backend
+    whose atomics happen to be ordered."""
+    scene = _two_block_scene(0.0)
+    contact = scene.vbd_solver.contact
+    slots = qd_to_torch(contact.cv_slot)[:, 0].cpu().numpy()
+    offsets = qd_to_torch(contact.cv_slot_offset)[:, 0].cpu().numpy()
+    pt_a = qd_to_torch(contact.pt_pairs.a)[:, 0].cpu().numpy()
+    pt_b = qd_to_torch(contact.pt_pairs.b)[:, 0].cpu().numpy()
+    ee_a = qd_to_torch(contact.ee_pairs.a)[:, 0].cpu().numpy()
+    ee_b = qd_to_torch(contact.ee_pairs.b)[:, 0].cpu().numpy()
+    cap = contact.pair_cap
+
+    def key(code):
+        role, i_p = int(code) % 8, int(code) // 8
+        if i_p >= cap:
+            i_p -= cap
+            return (1, int(ee_a[i_p]), int(ee_b[i_p]), role)
+        return (0, int(pt_a[i_p]), int(pt_b[i_p]), role)
+
+    populated, longest = 0, 0
+    for cv in range(contact.n_cv):
+        lo, hi = int(offsets[cv]), int(offsets[cv + 1])
+        if hi - lo < 2:
+            continue
+        populated += 1
+        longest = max(longest, hi - lo)
+        keys = [key(slots[i]) for i in range(lo, hi)]
+        assert keys == sorted(keys), f"contact vertex {cv} accumulates in collection order: {keys}"
+    print(f"vertices carrying two or more contacts: {populated}, longest list {longest}")
+    assert populated > 0, "the fixture must give some vertex more than one contact, or this proves nothing"
+
+
 def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():
     """A batch does not stop when one environment latches: its other environments keep stepping, and the kernel
     that rebuilds the contact buffers used to rebuild them for the failed environment too. The vertex a failure

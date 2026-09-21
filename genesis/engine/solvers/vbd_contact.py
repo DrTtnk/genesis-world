@@ -1298,12 +1298,63 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                 for j in qd.static(range(2)):
                     func_register_slot(ea[j], 8 * (i_p + contact.pair_cap) + ROLE_EDGE_A + j, i_b, contact)
                     func_register_slot(eb[j], 8 * (i_p + contact.pair_cap) + ROLE_EDGE_B + j, i_b, contact)
+    # A pair takes its index from an atomic, so a vertex's list is filled in whatever order the GPU finished
+    # those threads in, and func_contact_cv_terms sums the list in that order. Float addition is not
+    # associative, so from the first substep at which one vertex carries two simultaneously active contacts,
+    # two runs of one binary round differently: on the python head that is about substep 122 and a couple of
+    # last bits, which the scene then multiplies by roughly ten a frame until two identical runs stand 49 mm
+    # apart at 100 ms. Sorting each list on the mesh's own indices takes the race out of the sum. The lists are
+    # short and mostly empty, and finding the pairs they name was the expensive part.
+    for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            lo = contact.cv_slot_offset[cv, i_b]
+            hi = contact.cv_slot_offset[cv + 1, i_b]
+            for i in range(lo + 1, hi):
+                code = contact.cv_slot[i, i_b]
+                j = i - 1
+                while j >= lo and func_slot_precedes(code, contact.cv_slot[j, i_b], i_b, contact):
+                    contact.cv_slot[j + 1, i_b] = contact.cv_slot[j, i_b]
+                    j -= 1
+                contact.cv_slot[j + 1, i_b] = code
 
 
 @qd.func
 def func_register_slot(cv, code, i_b, contact: qd.template()):
     slot = contact.cv_slot_offset[cv, i_b] + qd.atomic_add(contact.cv_slot_n[cv, i_b], 1)
     contact.cv_slot[slot, i_b] = code
+
+
+@qd.func
+def func_slot_identity(code, i_b, contact: qd.template()):
+    """The pair a slot belongs to, named by the mesh rather than by the order the search collected it in."""
+    role = code % 8
+    i_p = code // 8
+    kind = 0
+    a = 0
+    b = 0
+    if i_p >= contact.pair_cap:
+        kind = 1
+        a = contact.ee_pairs[i_p - contact.pair_cap, i_b].a
+        b = contact.ee_pairs[i_p - contact.pair_cap, i_b].b
+    else:
+        a = contact.pt_pairs[i_p, i_b].a
+        b = contact.pt_pairs[i_p, i_b].b
+    return kind, a, b, role
+
+
+@qd.func
+def func_slot_precedes(code_x, code_y, i_b, contact: qd.template()):
+    """Whether one slot sorts before another: pair kind, then the two topology indices, then the role."""
+    kind_x, a_x, b_x, role_x = func_slot_identity(code_x, i_b, contact)
+    kind_y, a_y, b_y, role_y = func_slot_identity(code_y, i_b, contact)
+    precedes = role_x < role_y
+    if kind_x != kind_y:
+        precedes = kind_x < kind_y
+    elif a_x != a_y:
+        precedes = a_x < a_y
+    elif b_x != b_y:
+        precedes = b_x < b_y
+    return precedes
 
 
 @qd.func
