@@ -129,6 +129,17 @@ class VBDRigidAttachment:
         self.vert_anchor_offset.from_numpy(np.cumsum(counts).astype(gs.np_int))
         self.vert_anchor = qd.field(dtype=gs.qd_int, shape=max(len(pairs), 1))
         self.vert_anchor.from_numpy(np.array([slot for _, slot in pairs] or [0], dtype=gs.np_int))
+        # A link reaches its own attachments the same way. The alternative is the scan this replaces: one thread
+        # a body a sweep over every attachment in the scene to find the few that name the link. A stable sort
+        # keeps each link's attachments in ascending order, which is the order the scan visited them in, so the
+        # wrench and the block are summed as before.
+        by_link = np.argsort(links_idx, kind="stable")
+        self.link_attachment_offset = qd.field(dtype=gs.qd_int, shape=self.rigid.n_links + 1)
+        self.link_attachment_offset.from_numpy(
+            np.concatenate(([0], np.cumsum(np.bincount(links_idx, minlength=self.rigid.n_links)))).astype(gs.np_int)
+        )
+        self.link_attachment = qd.field(dtype=gs.qd_int, shape=max(self.n_attachments, 1))
+        self.link_attachment.from_numpy(by_link.astype(gs.np_int) if self.n_attachments else np.zeros(1, gs.np_int))
         self.info.verts.from_numpy(verts)
         self.info.weights.from_numpy(weights)
         self.info.link.from_numpy(links_idx)
@@ -257,20 +268,20 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
         hessian[i, i] = state.mass / solver._substep_dt**2
         for j in qd.static(range(3)):
             hessian[i + 3, j + 3] = inertia_h[i, j]
-    for i_a in range(attachment.n_attachments):
-        if attachment.info[i_a].link == i_l:
-            soft_force, soft_hessian, rigid_force, rigid_hessian = func_attachment_blocks(
-                func_attachment_point(f + 1, i_a, i_b, solver, attachment),
-                state.pos,
-                state.quat,
-                attachment.info[i_a].local_pos,
-                attachment.state[i_a, i_b].multiplier,
-                attachment.state[i_a, i_b].stiffness,
-                attachment.previous_error[i_a, i_b],
-                attachment.alpha,
-            )
-            force += rigid_force
-            hessian += rigid_hessian
+    for c in range(attachment.link_attachment_offset[i_l], attachment.link_attachment_offset[i_l + 1]):
+        i_a = attachment.link_attachment[c]
+        soft_force, soft_hessian, rigid_force, rigid_hessian = func_attachment_blocks(
+            func_attachment_point(f + 1, i_a, i_b, solver, attachment),
+            state.pos,
+            state.quat,
+            attachment.info[i_a].local_pos,
+            attachment.state[i_a, i_b].multiplier,
+            attachment.state[i_a, i_b].stiffness,
+            attachment.previous_error[i_a, i_b],
+            attachment.alpha,
+        )
+        force += rigid_force
+        hessian += rigid_hessian
     if qd.static(solver.has_contact):
         force_c, hessian_c = func_contact_link_terms(f, i_l, i_b, state.pos, solver, solver.contact)
         force += force_c
