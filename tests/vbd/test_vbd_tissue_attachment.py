@@ -79,9 +79,10 @@ def test_a_box_bound_to_a_hanging_box_is_caught_instead_of_falling():
     assert gap < 2e-4, "the two anchors must stay together within the constraint tolerance"
 
 
-def test_a_rest_offset_between_the_anchors_is_stress_free():
+@pytest.mark.parametrize("n_iterations", [8, 32])
+def test_a_rest_offset_between_the_anchors_is_stress_free(n_iterations):
     """The anchors bind where they are: nothing moves without gravity even though the points do not coincide."""
-    scene, a, b = _two_boxes(gravity=(0.0, 0.0, 0.0))
+    scene, a, b = _two_boxes(gravity=(0.0, 0.0, 0.0), n_iterations=n_iterations)
     tet_a, tet_b = _extreme_tet(a, (0, 0, -1)), _extreme_tet(b, (0, 0, 1))
     w = (0.25, 0.25, 0.25, 0.25)
     scene.vbd_solver.add_tissue_attachment(TissueAnchor(a, tet_a, w), TissueAnchor(b, tet_b, w))

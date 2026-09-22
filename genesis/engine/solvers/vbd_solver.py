@@ -889,16 +889,6 @@ class VBDSolver(Solver):
             edge = float(np.linalg.norm(pos0[edge_v[:, 1], 0] - pos0[edge_v[:, 0], 0], axis=1).mean())
             unit = float(self.verts_info.mass.to_numpy().max()) / self._substep_dt**2 * edge
             self._force_noise = unit * (1e-13 if gs.np_float == np.float64 else 1e-6)
-            # The sweep kernel inlines one copy of the whole per-vertex solve for every colour of every sweep, so the
-            # compiler's memory grows with their product. At 8 colours and 16 sweeps it reached 160 GB and the machine
-            # had to be rescued; fail here instead, with the two numbers that caused it.
-            unrolled = self._n_iterations * self._n_colors
-            if unrolled > 96:  # 70 has always compiled; 128 on the constrained snake reached 160 GB
-                gs.raise_exception(
-                    f"VBD would inline {unrolled} copies of the vertex solve ({self._n_iterations} sweeps x "
-                    f"{self._n_colors} colours). Compiling that needs tens of gigabytes. Use fewer sweeps, or more "
-                    f"substeps instead of more sweeps."
-                )
             if (self._n_triangles or self._n_stencils) and self._sim.requires_grad:
                 gs.raise_exception("Shell elements have no adjoint yet, so they cannot be used with requires_grad.")
             attached_entities = [
@@ -906,6 +896,22 @@ class VBDSolver(Solver):
             ]
             if attached_entities:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
+            # Articulated and gradient paths statically inline every sweep and colour. The ordinary forward path
+            # launches the same colour kernel once per Python sweep, so only colours contribute to compile size.
+            is_static_unrolled = self._sim.requires_grad or (
+                self.rigid_attachment is not None and self.rigid_attachment.is_articulated
+            )
+            if is_static_unrolled:
+                unrolled = self._n_iterations * self._n_colors
+                inline_shape = f"{self._n_iterations} sweeps x {self._n_colors} colours"
+            else:
+                unrolled = self._n_colors
+                inline_shape = f"{self._n_colors} colour copies; {self._n_iterations} sweeps run at runtime"
+            if unrolled > 96:  # 70 has always compiled; 128 on the constrained snake reached 160 GB
+                gs.raise_exception(
+                    f"VBD would inline {unrolled} copies of the vertex solve ({inline_shape}). Compiling that needs "
+                    f"tens of gigabytes. Reduce the statically unrolled solver work."
+                )
             if self._tissue_attachment_pairs:
                 if self._sim.requires_grad:
                     gs.raise_exception("Tissue attachments have no adjoint yet, so they cannot be used with requires_grad.")

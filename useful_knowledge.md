@@ -60,3 +60,33 @@ Lessons from wrong assumptions, recorded as they were found.
   scene with *zero* free bodies pays the same 5.16 ms, which is what showed the label was guessed rather than
   read. Attribute a kernel by removing the suspected work and re-measuring, not by matching the name to the
   nearest plausible loop in the source.
+
+## A `maxvolume` above the shape's own volume refines nothing
+
+`gs.morphs.Box(size=(0.01, 0.01, 0.01), maxvolume=4e-7)` produces **6 tetrahedra and 8 vertices**: the box is
+1e-6 m^3, tetgen's six default tets are already 1.67e-7 each, and the constraint is satisfied without a single
+refinement. The entity then has no interior vertex at all, so a test that attaches four vertices and pins four
+more is exercising a rigid cube, not tissue.
+
+`tests/vbd/test_vbd_attachment_stiffness.py` uses that value, so its "tiny tissue block" is those six tets, and
+its 0.062 mm result says less about the attachment penalty than it appears to. `maxvolume=5e-9` on the same box
+gives 383 tets.
+
+Check the tetrahedralisation log (`Mesh tetrahedra:`) rather than trusting the parameter.
+
+## The head36 attachment failure is not the per-sweep dual update
+
+`func_update_attachment_dual` advances the augmented-Lagrangian multiplier *and* the stiffness ramp once per
+sweep on the forward path, which looked like an outer-loop step wired as an inner one -- especially beside the
+gradient path's own comment that "a dual update on an unconverged iterate overshoots at the stiffness cap and
+limit-cycles instead of converging". Astra's head36 traces fit it: the attachments sitting at the stiffness cap
+rose 259 -> 322 -> 341 of 474 as sweeps went 12 -> 48 -> 192.
+
+Measured, it is not the cause. `tests/vbd/test_vbd_attachment_convergence.py` hangs a pinned-tissue, free-bone,
+tissue, free-bone chain at head36's 0.25 ms substep for 100 ms and reports the peak raw attachment gap:
+
+    CPU float64   12 sweeps 0.0034 mm | 48 sweeps 0.0001 mm | 192 sweeps 0.0000 mm
+    GPU float32   12 sweeps 0.0066 mm | 48 sweeps 0.0001 mm | 192 sweeps 0.0000 mm
+
+More sweeps converges, monotonically, on both backends. A plausible mechanism plus a matching trend in the
+failing scene is not evidence: the trend has to be reproduced in isolation before the mechanism is believed.
