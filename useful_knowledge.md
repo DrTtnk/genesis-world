@@ -90,3 +90,33 @@ tissue, free-bone chain at head36's 0.25 ms substep for 100 ms and reports the p
 
 More sweeps converges, monotonically, on both backends. A plausible mechanism plus a matching trend in the
 failing scene is not evidence: the trend has to be reproduced in isolation before the mechanism is believed.
+
+## VBD tet vertex mass is uniform per entity, not lumped per element
+
+`vbd_entity.py` sets `mass = rho * total_rest_volume / n_vertices` and hands that one scalar
+to `_kernel_add_elements`, so every vertex of a tet entity carries the same mass. It is not
+the usual `rho * V_tet / 4` lumped onto each corner.
+
+Reconstructing it the lumped way still reproduces `_k_start` exactly, because both schemes
+give an entity the same total mass and `_k_start` is a mean over all vertices. The agreement
+is therefore not evidence that the reconstruction is right. Only the extremes differ, and
+they differ a lot: on head36 the lumped reconstruction reports a lightest vertex of
+2.46e-12 kg and a spread of 190,987 to 1, while the engine's actual formula gives 4.37e-08 kg
+and 461 to 1.
+
+Check a reconstruction against a statistic that the two candidate formulas disagree about,
+not one they share.
+
+## A per-vertex mass is a meshing number, not a physical one
+
+Because the mass is `rho * V / n_vertices`, two objects of identical density differ in vertex
+mass by whatever their resolutions differ by. On head36, with `rho = 1050` everywhere:
+
+    fascia27.geniohyoideus...  232 verts, 342 tets, V 9.66e-9 m^3  ->  4.37e-08 kg a vertex
+    palatine_maxilla_tie.R       6 verts,   4 tets, V 1.15e-7 m^3  ->  2.01e-05 kg a vertex
+
+461 to 1, entirely from how finely each was meshed. Anything scaled off a mean vertex mass -
+`_k_start` is - therefore inherits the mesh resolution of whichever population dominates the
+vertex count. On head36 that is the fine fascia, which carry no attachments at all, while
+every one of the 262 attachment-carrying tissues has exactly 6 vertices and is among the
+heaviest per vertex in the model.
