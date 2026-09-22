@@ -120,3 +120,25 @@ mass by whatever their resolutions differ by. On head36, with `rho = 1050` every
 vertex count. On head36 that is the fine fascia, which carry no attachments at all, while
 every one of the 262 attachment-carrying tissues has exactly 6 vertices and is among the
 heaviest per vertex in the model.
+
+## An augmented Lagrangian's per-substep gain does not depend on how often the dual is updated
+
+On head36 the attachment multipliers diverge: their sum reaches 311.90 N against 0.0432 N
+of tissue weight, a factor of 7,200, growing by a median 1.0783 a substep against an
+`alpha * gamma` decay of 0.9405, so a net 1.0142 compounding over 400 substeps.
+
+`func_update_attachment_dual` runs once a sweep, which looked like the cause: twelve dual
+updates a substep where the gradient path does exact Uzawa with one. Moving it to one a
+substep changed the gain from 1.07833 to 1.07852 - by 0.02 percent. Each update simply
+becomes about twelve times larger, because the error it sees has not been relieved by the
+intermediate corrections. The gain is set by the error over a substep, and the error adapts
+to the cadence.
+
+The change is not neutral, it just does not address the divergence: inversion records fall
+from 407 of 866 to 16, the worst tetrahedron from J = -39.73 to -0.571, and attachments at
+the stiffness cap from 257 to 39, while attachments over 1 mm rise from 38 to 243 and the
+peak gap only falls from 12.208 mm to 7.739 mm. Catastrophic failures are traded for
+uniform compliance.
+
+If a dual scheme diverges, measure the gain per outer step before changing the cadence.
+The cadence redistributes the same total.
