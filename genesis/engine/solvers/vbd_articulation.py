@@ -45,9 +45,10 @@ def kernel_sweeps_articulation(
             for i_a, i_b in qd.ndrange(solver.tissue_attachment.n_attachments, solver._B):
                 if not solver.env_failed[i_b]:
                     func_update_tissue_attachment_dual(f, i_a, i_b, solver, solver.tissue_attachment)
-        # see _kernel_sweeps in vbd_solver.py: no dual update after the last sweep
+        # see _kernel_sweeps in vbd_solver.py: no dual update after the last sweep. Here the sweep index is a
+        # static one, so the guard can stay outside the loop without serialising it.
         if qd.static(solver.has_contact and sweep < solver._n_iterations - 1):
-            func_contact_dual_update(f, solver._constraint_dual_relaxation, solver, solver.contact)
+            func_contact_dual_update(f, solver._constraint_dual_relaxation, True, solver, solver.contact)
 
 
 @qd.kernel

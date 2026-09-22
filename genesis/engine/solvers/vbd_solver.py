@@ -1955,8 +1955,9 @@ class VBDSolver(Solver):
             # the pairs restart from zero next substep, so the dual update after the last sweep would only skew
             # the reported reactions away from the forces the sweep applied
             if qd.static(self.has_contact):
-                if sweep < self._n_iterations - 1:
-                    func_contact_dual_update(f, self._constraint_dual_relaxation, self, self.contact)
+                func_contact_dual_update(
+                    f, self._constraint_dual_relaxation, sweep < self._n_iterations - 1, self, self.contact
+                )
 
     @qd.func
     def _func_sweep(self, f, sweep):

@@ -1358,11 +1358,15 @@ def func_slot_precedes(code_x, code_y, i_b, contact: qd.template()):
 
 
 @qd.func
-def func_contact_dual_update(f, w, solver: qd.template(), contact: qd.template()):
+def func_contact_dual_update(f, w, active, solver: qd.template(), contact: qd.template()):
     """Relaxed multiplier update lam <- min(lam + w k C, 0) and the stiffness ramp of every candidate pair (Giles et
-    al. 2025 Eq. 11 to 13 with the inequality clamp), after a primal sweep."""
+    al. 2025 Eq. 11 to 13 with the inequality clamp), after a primal sweep.
+
+    Whether the update runs is carried into the loop rather than wrapped around it. Only a top-level loop is
+    parallelised; nested inside runtime control flow the same loop becomes one thread walking the whole pair
+    capacity, which costs the capacity rather than the contacts and dwarfs everything else in the sweep."""
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
-        if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
+        if active and i_p < qd.min(contact.n_pt[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
             d, n, weights, h = func_pt_geometry(f, i_p, i_b, solver, contact)
             k = contact.pt_pairs[i_p, i_b].k
             contact.pt_pairs[i_p, i_b].lam = qd.min(contact.pt_pairs[i_p, i_b].lam + w * k * (d - h), 0.0)
@@ -1373,7 +1377,7 @@ def func_contact_dual_update(f, w, solver: qd.template(), contact: qd.template()
             contact.pt_pairs[i_p, i_b].k = qd.min(
                 k + k0 / solver._constraint_tol * qd.max(h - d, 0.0), solver._contact_k_max_ratio * k0
             )
-        if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
+        if active and i_p < qd.min(contact.n_ee[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
             d, n, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
             k = contact.ee_pairs[i_p, i_b].k
             contact.ee_pairs[i_p, i_b].lam = qd.min(contact.ee_pairs[i_p, i_b].lam + w * k * (d - h), 0.0)

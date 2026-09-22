@@ -43,3 +43,20 @@ Lessons from wrong assumptions, recorded as they were found.
   one" and is safe to embed as a kernel literal; `0xFFFFFFFF & ~expr` is not** — the masked value can exceed the
   literal range of a kernel's default `i32` and raises `QuadrantsTypeError: Integer literal ... exceeded the
   range of default_ip`.
+
+- **A top-level `ndrange` nested inside runtime control flow is not parallelised; it runs on one thread.**
+  `func_contact_dual_update` iterates `ndrange(contact.pair_cap, B)` and was called under
+  `if sweep < self._n_iterations - 1:` inside `_kernel_sweeps`. Quadrants parallelises only top-level loops, so
+  the whole 65,536-slot pair capacity was walked serially on eleven of every twelve sweeps. Measured on a scene
+  with 248 actual pairs: 64.42 ms a substep at the default capacity, exactly linear in `contact_pair_cap`
+  (1024 to 4.00 ms, 4096 to 6.88, 16384 to 18.40), and 2.51 ms flat once the guard was carried into the loop
+  body instead. The profiler's own `min 0.004 / avg 5.164 / max 5.719 ms` gave the diagnosis away: the minimum
+  is the one sweep a substep where the condition is false and the loop is skipped. Carry such a condition into
+  the loop as a value; never wrap the loop in it. A static `qd.static(...)` guard is fine, because it is
+  resolved at compile time and the loop stays top-level.
+
+- **A profile line's name is not its cause.** The 5.25 ms serial kernel in the head36 profile was reported as
+  the free-body Gauss-Seidel loop in both the performance plan and the review reply. A shell-and-one-collider
+  scene with *zero* free bodies pays the same 5.16 ms, which is what showed the label was guessed rather than
+  read. Attribute a kernel by removing the suspected work and re-measuring, not by matching the name to the
+  nearest plausible loop in the source.
