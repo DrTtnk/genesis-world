@@ -227,6 +227,12 @@ class VBDContact:
         self.link_rv = qd.field(dtype=gs.qd_int, shape=max(self.n_rv, 1))
         if self.n_rv:
             self.link_rv.from_numpy(order.astype(gs.np_int))
+        # The same list, narrowed each substep to the vertices a pair actually reads, in the same order and at
+        # the same offsets. A rigid block is assembled on one thread once a body once a sweep, so walking the
+        # whole surface there to find the few vertices that carry a pair costs the walk many times over; this is
+        # built once, in parallel, and read in its place.
+        self.link_active = qd.field(dtype=gs.qd_int, shape=(max(self.n_rv, 1), solver._B))
+        self.link_active_n = qd.field(dtype=gs.qd_int, shape=(max(rigid.n_links, 1), solver._B))
         # dof_moves_link[i_d, i_l]: the hinge coordinate i_d lies between link i_l and the root
         # both dimensions are floored at one: a scene whose only contact is tissue against tissue has no
         # rigid link and no rigid dof, and a zero-width field is refused by the backend
@@ -861,28 +867,26 @@ def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact:
     vertex of link i_l, for a free link with the world-frame rotation increment of the attachment block."""
     force6 = qd.Vector.zero(gs.qd_float, 6)
     hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
-    for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
-        i_r = contact.link_rv[c]
+    # A vertex the search gave no pair contributes an exactly zero force and an exactly zero block, so leaving it
+    # out changes no bit of the result. `link_active` holds the rest, in the order `link_rv` has them, which is
+    # what keeps the sum below independent of anything but the mesh.
+    base = contact.link_rv_offset[i_l]
+    for c in range(base, base + contact.link_active_n[i_l, i_b]):
+        i_r = contact.link_active[c, i_b]
         cv = contact.rv_cv[i_r]
-        # A vertex the search gave no pair contributes an exactly zero force and an exactly zero block, so the
-        # two Jacobian products below add nothing to either accumulator: skipping it changes no bit of the
-        # result, it only declines to compute one. This loop runs on a single thread, once a free body, once a
-        # sweep, and on the python head 286 of the 15224 rigid contact vertices carry a pair, so without the
-        # test 98 percent of it builds a 3x6 Jacobian and multiplies through it to add zero.
-        if contact.cv_slot_offset[cv + 1, i_b] > contact.cv_slot_offset[cv, i_b]:
-            force, hessian = func_contact_cv_terms(f, cv, i_b, solver, contact)
-            r = contact.rv_pos[i_r, i_b] - origin
-            jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
-            for row in qd.static(range(3)):
-                jacobian[row, row] = 1.0
-            jacobian[0, 4] = r[2]
-            jacobian[0, 5] = -r[1]
-            jacobian[1, 3] = -r[2]
-            jacobian[1, 5] = r[0]
-            jacobian[2, 3] = r[1]
-            jacobian[2, 4] = -r[0]
-            force6 += jacobian.transpose() @ force
-            hessian6 += jacobian.transpose() @ hessian @ jacobian
+        force, hessian = func_contact_cv_terms(f, cv, i_b, solver, contact)
+        r = contact.rv_pos[i_r, i_b] - origin
+        jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
+        for row in qd.static(range(3)):
+            jacobian[row, row] = 1.0
+        jacobian[0, 4] = r[2]
+        jacobian[0, 5] = -r[1]
+        jacobian[1, 3] = -r[2]
+        jacobian[1, 5] = r[0]
+        jacobian[2, 3] = r[1]
+        jacobian[2, 4] = -r[0]
+        force6 += jacobian.transpose() @ force
+        hessian6 += jacobian.transpose() @ hessian @ jacobian
     return force6, hessian6
 
 
@@ -894,15 +898,15 @@ def func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver: qd.template(), cont
     curvature = gs.qd_float(0.0)
     for i_l in range(contact.dof_moves_link.shape[1]):
         if contact.dof_moves_link[i_d, i_l]:
-            for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
-                i_r = contact.link_rv[c]
+            # the same narrowed list as in func_contact_link_terms, for the same reason
+            base = contact.link_rv_offset[i_l]
+            for c in range(base, base + contact.link_active_n[i_l, i_b]):
+                i_r = contact.link_active[c, i_b]
                 cv = contact.rv_cv[i_r]
-                # zero contributes nothing here either, for the same reason as in func_contact_link_terms
-                if contact.cv_slot_offset[cv + 1, i_b] > contact.cv_slot_offset[cv, i_b]:
-                    force_v, hessian_v = func_contact_cv_terms(f, cv, i_b, solver, contact)
-                    jacobian = axis.cross(contact.rv_pos[i_r, i_b] - pivot)
-                    force += jacobian.dot(force_v)
-                    curvature += jacobian.dot(hessian_v @ jacobian)
+                force_v, hessian_v = func_contact_cv_terms(f, cv, i_b, solver, contact)
+                jacobian = axis.cross(contact.rv_pos[i_r, i_b] - pivot)
+                force += jacobian.dot(force_v)
+                curvature += jacobian.dot(hessian_v @ jacobian)
     return force, curvature
 
 
@@ -922,6 +926,35 @@ def func_refresh_link_vertices(i_l, i_b, pos, quat, contact: qd.template()):
     for c in range(contact.link_rv_offset[i_l], contact.link_rv_offset[i_l + 1]):
         i_r = contact.link_rv[c]
         contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(contact.rv_local[i_r], pos, quat)
+
+
+@qd.func
+def func_refresh_link_active_vertices(i_l, i_b, pos, quat, contact: qd.template()):
+    """The same refresh, over `link_active` alone, for use between the sweeps.
+
+    Between the sweeps a rigid contact vertex is reached only through a candidate pair, so moving the rest of the
+    link's surface changes no result. What this does not maintain is the whole surface at the end of the substep,
+    which the next substep's swept search starts from: `func_settle_free_vertex` brings that current once, in
+    parallel, after the last sweep."""
+    base = contact.link_rv_offset[i_l]
+    for c in range(base, base + contact.link_active_n[i_l, i_b]):
+        i_r = contact.link_active[c, i_b]
+        contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(contact.rv_local[i_r], pos, quat)
+
+
+@qd.func
+def func_settle_free_vertex(active, i_r, i_b, solver: qd.template(), contact: qd.template()):
+    """Bring one free body's contact vertex to the pose its block solved, whether or not a pair reads it.
+
+    The counterpart of `func_refresh_link_active_vertices`. `active` is a value rather than a condition wrapped
+    around the caller's loop, so that loop stays top level, and so parallel."""
+    i_l = contact.rv_link[i_r]
+    if active and not solver.env_failed[i_b] and solver.rigid_attachment.free_slot[i_l] >= 0:
+        contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(
+            contact.rv_local[i_r],
+            solver.rigid_attachment.link_pose[i_l, i_b].pos,
+            solver.rigid_attachment.link_pose[i_l, i_b].quat,
+        )
 
 
 @qd.func
@@ -1316,6 +1349,20 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                     contact.cv_slot[j + 1, i_b] = contact.cv_slot[j, i_b]
                     j -= 1
                 contact.cv_slot[j + 1, i_b] = code
+    # Which of a link's rigid contact vertices carry a pair is fixed for the substep, so the rigid blocks read it
+    # from here instead of rediscovering it. One thread a link keeps each list in `link_rv` order, so the wrench
+    # and the 6x6 block are summed in the mesh's order rather than a thread's.
+    for i_l, i_b in qd.ndrange(contact.link_active_n.shape[0], solver._B):
+        if not solver.env_failed[i_b]:
+            base = contact.link_rv_offset[i_l]
+            n = 0
+            for c in range(base, contact.link_rv_offset[i_l + 1]):
+                i_r = contact.link_rv[c]
+                cv = contact.rv_cv[i_r]
+                if contact.cv_slot_offset[cv + 1, i_b] > contact.cv_slot_offset[cv, i_b]:
+                    contact.link_active[base + n, i_b] = i_r
+                    n += 1
+            contact.link_active_n[i_l, i_b] = n
 
 
 @qd.func

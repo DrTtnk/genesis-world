@@ -46,6 +46,7 @@ from genesis.engine.solvers.vbd_contact import (
     VBDContact,
     func_contact_dual_update,
     func_contact_vertex_terms,
+    func_settle_free_vertex,
     kernel_begin_contact,
     kernel_end_contact,
     kernel_prescribe_links,
@@ -1948,6 +1949,11 @@ class VBDSolver(Solver):
                 for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
                     if not self.env_failed[i_b]:
                         func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
+                if qd.static(self.has_contact):
+                    # A sweep moves only the vertices a pair reads; the rest of each free body's surface is
+                    # settled here, after the last sweep, because the next substep's swept search starts from it.
+                    for i_r, i_b in qd.ndrange(self.contact.n_rv, self._B):
+                        func_settle_free_vertex(sweep == self._n_iterations - 1, i_r, i_b, self, self.contact)
             if qd.static(self.has_tissue_attachment):
                 for i_a, i_b in qd.ndrange(self.tissue_attachment.n_attachments, self._B):
                     if not self.env_failed[i_b]:
