@@ -550,6 +550,8 @@ class VBDEntity(Entity):
     def get_rod_state(self):
         """Cross-section scale, segment frames and director velocity for this rod entity."""
         index = self._solver._rod_entities.index(self)
+        if self._solver.rod_native is not None:
+            return self._solver.rod_native.get_states()[index]
         return self._solver._rod_models[index].get_state()
 
     def set_friction_frame(self, tangent):

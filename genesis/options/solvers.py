@@ -1063,6 +1063,10 @@ class VBDOptions(Options):
         advancing (its positions, prescribed motion and multipliers freeze) until it is reset. True stops the
         program at the first failure, which suits a single environment; False lets the other environments of a
         batch continue and leaves reading `VBDSolver.env_status()` to the caller. Defaults to True.
+    rod_solver : str, optional
+        How VIPER rods are solved. "reference" is the serial Torch block solver of `vbd_rod.RodModel` (CPU or CUDA,
+        float64, one environment); "native" solves the same blocks on the device, coloured and batched
+        (`vbd_rod_native`). Defaults to "reference".
     max_inverted_duration : float, optional
         Longest simulated time (s) an environment may hold at least one inverted tet (signed volume over signed
         rest volume at or below zero) without a break before it is latched as failed, through the same mechanism
@@ -1105,6 +1109,7 @@ class VBDOptions(Options):
     contact_ccd_iterations: PositiveInt = 64
     raise_on_env_failure: StrictBool = True
     max_inverted_duration: PositiveFloat = 0.0625
+    rod_solver: Literal["reference", "native"] = "reference"
 
 
 class SFOptions(Options):

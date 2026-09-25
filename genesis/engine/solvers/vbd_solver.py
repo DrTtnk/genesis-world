@@ -84,6 +84,14 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
 )
 from genesis.engine.solvers.vbd_rod import RodAttachment, RodModel, RodParameters, quat_matrix, quat_multiply
 from genesis.engine.solvers.vbd_rod_contact import RodContact
+from genesis.engine.solvers.vbd_rod_native import (
+    VBDRodNative,
+    func_rod_node_terms,
+    func_solve_rod_frame,
+    func_solve_rod_scales,
+    kernel_rod_begin,
+    kernel_rod_end,
+)
 from genesis.engine.solvers.vbd_rod_bundle import RodBundleLinks, RodBundleView
 from genesis.engine.solvers.vbd_tissue_attachment import (
     VBDTissueAttachment,
@@ -259,6 +267,8 @@ class VBDSolver(Solver):
         self._mtu_units = []
         self._mtu_restraints = []
         self._rod_models = []
+        self._rod_native = options.rod_solver == "native"
+        self.rod_native = None
         self._rod_entities = []
         self._rod_bundle_specs = []
         self._rod_bundle_links = ()
@@ -271,6 +281,10 @@ class VBDSolver(Solver):
     @property
     def has_rigid_attachment(self):
         return self.rigid_attachment is not None
+
+    @property
+    def has_rod_native(self):
+        return self.rod_native is not None
 
     @property
     def has_tissue_attachment(self):
@@ -542,7 +556,14 @@ class VBDSolver(Solver):
         errno = int(qd_to_torch(self.tissue_errno).max())
         if self.contact is not None:
             errno |= int(qd_to_torch(self.contact.errno).max())
+        if self.rod_native is not None:
+            errno |= int(qd_to_torch(self.rod_native.errno).max())
         messages = []
+        if errno & ErrorCode.VBD_ROD_INVALID:
+            messages.append("A native rod reached a non-finite frame, a non-positive scale, or a segment reversed "
+                            "against its frame.")
+        if errno & ErrorCode.VBD_ROD_LINE_SEARCH:
+            messages.append("A native rod block's line search failed to decrease the incremental potential.")
         if errno & ErrorCode.VBD_TISSUE_PERSISTENT_INVERSION:
             messages.append(
                 "A tet stayed inverted (J/J0 <= 0) for longer without a break than "
@@ -789,6 +810,9 @@ class VBDSolver(Solver):
         instead, which makes the term Jacobi rather than Gauss-Seidel and is a change to the physics rather
         than to the bookkeeping. It is left open deliberately."""
         bonds = []
+        if self._rod_native:
+            for entity in self._rod_entities:
+                bonds.extend([entity.v_start + i, entity.v_start + i + 1] for i in range(entity.n_vertices - 1))
         for (entity_a, verts_a, weights_a), (entity_b, verts_b, weights_b) in self._tissue_attachment_pairs:
             bond = {int(entity_a.v_start + v) for v, w in zip(verts_a, weights_a) if w != 0.0}
             bond |= {int(entity_b.v_start + v) for v, w in zip(verts_b, weights_b) if w != 0.0}
@@ -902,7 +926,12 @@ class VBDSolver(Solver):
         self._n_vfaces = self.n_vfaces
 
         if any(isinstance(entity.material, gs.materials.VBD.Rod) for entity in self._entities):
-            if self._sim.requires_grad or self._B != 1 or gs.device.type not in ("cpu", "cuda") or gs.tc_float != torch.float64:
+            if self._rod_native:
+                if self._sim.requires_grad:
+                    gs.raise_exception("Native rods have no adjoint yet, so they cannot be used with requires_grad.")
+                if self._rod_bundle_specs:
+                    gs.raise_exception("Rod bundle links are not implemented for native rods yet.")
+            elif self._sim.requires_grad or self._B != 1 or gs.device.type not in ("cpu", "cuda") or gs.tc_float != torch.float64:
                 gs.raise_exception(
                     "The passive rod reference requires CPU or CUDA, precision=64, one environment, and no adjoint."
                 )
@@ -956,7 +985,11 @@ class VBDSolver(Solver):
             for entity in self._entities:
                 entity._add_to_solver()
 
-            if self._rod_models:
+            if self._rod_models and self._rod_native:
+                for entity, model in zip(self._rod_entities, self._rod_models):
+                    kernel_set_rod_mass(entity.v_start, model.mass, self.verts_info)
+                self.rod_native = VBDRodNative(self, self._rod_entities, self._rod_models)
+            elif self._rod_models:
                 self.rod_vertex = qd.field(dtype=gs.qd_int, shape=self._n_vertices)
                 mask = np.zeros(self._n_vertices, dtype=gs.np_int)
                 for entity, model in zip(self._rod_entities, self._rod_models):
@@ -1112,6 +1145,8 @@ class VBDSolver(Solver):
             mesh_rules = [rule for rule in self._contact_rules if not rod_groups.intersection(rule[:2])]
             if self._rod_models and mesh_rules and self._contact_ccd:
                 gs.raise_exception("Mixed rod/mesh scenes require contact_ccd=False; mesh rescaling cannot change committed rod states.")
+            if rod_rules and self._rod_native:
+                gs.raise_exception("Rod contact is not implemented for native rods yet.")
             if rod_rules:
                 if rod_groups.intersection(mesh_groups):
                     gs.raise_exception("Rod and mesh contact groups must be distinct.")
@@ -1776,6 +1811,12 @@ class VBDSolver(Solver):
             force -= qd.cast(stiffness * w_bend * c_i * residual, self._acc)
             K += qd.cast(stiffness * w_bend * c_i * c_i, self._acc) * qd.Matrix.identity(self._acc, 3)
 
+        if qd.static(self.has_rod_native):
+            if self.rod_native.seg_prev[i_v] >= 0 or self.rod_native.seg_next[i_v] >= 0:
+                force_r, H_r = func_rod_node_terms(f, i_v, i_b, self, self.rod_native)
+                force += qd.cast(force_r, self._acc)
+                K += qd.cast(H_r, self._acc)
+
         kd_h = qd.cast(self._damping / self._substep_dt, self._acc)
         force -= kd_h * (K0 @ qd.cast(x - self.verts[f, i_v, i_b].pos, self._acc) + damp)
         H = m_h2 * qd.Matrix.identity(self._acc, 3) + K + kd_h * K0
@@ -2180,6 +2221,17 @@ class VBDSolver(Solver):
         """
         if True:
             self._func_sweep(f, sweep)
+            if qd.static(self.has_rod_native):
+                # frames in two colours, then each rod's coupled scales, after the vertices of the same sweep
+                for c in qd.static(range(2)):
+                    for k, i_b in qd.ndrange(
+                        (self.rod_native.frame_offsets[c], self.rod_native.frame_offsets[c + 1]), self._B
+                    ):
+                        if not self.env_failed[i_b]:
+                            func_solve_rod_frame(f, self.rod_native.frame_perm[k], i_b, self, self.rod_native)
+                for r, i_b in qd.ndrange(self.rod_native.n_rods, self._B):
+                    if not self.env_failed[i_b]:
+                        func_solve_rod_scales(f, r, i_b, self, self.rod_native)
             if qd.static(self.has_rigid_attachment):
                 # one block per free body, in order: the bodies couple only through the soft elements, so this
                 # is Gauss-Seidel over blocks and a later body already sees the earlier one's new pose
@@ -2512,7 +2564,7 @@ class VBDSolver(Solver):
         sweeps to a relative force tolerance, one dual update, until the relative constraint violation is below its
         own tolerance too. (A dual update on an unconverged iterate overshoots at the stiffness cap and limit-cycles
         instead of converging.)"""
-        if self._rod_models:
+        if self._rod_models and not self._rod_native:
             pos = torch.empty((self._B, self._n_vertices, 3), dtype=gs.tc_float)
             velocity = torch.empty_like(pos)
             self._kernel_get_state(f, pos, velocity)
@@ -3908,7 +3960,11 @@ class VBDSolver(Solver):
                         f"More than {self._hash_cap} vertices in one self-collision grid cell of "
                         f"{self._self_cell:.4f} m. Raise the cell capacity or the cell size."
                     )
+            if self.rod_native is not None:
+                kernel_rod_begin(self, self.rod_native)
             self.solve(f)
+            if self.rod_native is not None:
+                kernel_rod_end(f, self._sim.cur_substep_global, self, self.rod_native)
             if self.contact is not None and self._contact_ccd:
                 # before the velocities: they are the pose difference over the substep, so the rescaled pose
                 # carries the rescaled velocity with it
@@ -4051,10 +4107,13 @@ class VBDSolver(Solver):
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
             envs_idx = sanitize_index(envs_idx, -1, self._B, 0, "envs_idx")
-            if len(state.rod_states) != len(self._rod_models):
-                gs.raise_exception("Rod snapshot entity count differs from the scene.")
-            for model, rod_state in zip(self._rod_models, state.rod_states):
-                model.set_state(rod_state)
+            if self.rod_native is not None:
+                self.rod_native.set_states(state.rod_states, envs_idx)
+            else:
+                if len(state.rod_states) != len(self._rod_models):
+                    gs.raise_exception("Rod snapshot entity count differs from the scene.")
+                for model, rod_state in zip(self._rod_models, state.rod_states):
+                    model.set_state(rod_state)
             kernel_set_vertex_state(f, envs_idx, state.pos, state.vel, self.verts)
             kernel_set_muscle_state(envs_idx, state.muscle_actuation, self.muscle_actu)
             if self.rigid_attachment is not None:
@@ -4097,7 +4156,10 @@ class VBDSolver(Solver):
                 "An environment failed a contact step; its state is diagnostic only. Reset it before taking a snapshot."
             )
         state = VBDSolverState(self._scene)
-        state.rod_states = tuple(model.get_state() for model in self._rod_models)
+        state.rod_states = (
+            self.rod_native.get_states() if self.rod_native is not None
+            else tuple(model.get_state() for model in self._rod_models)
+        )
         if self.mtu is not None:
             state.mtu_state = self.mtu.get_snapshot()
         self._kernel_get_state(f, state.pos, state.vel)
