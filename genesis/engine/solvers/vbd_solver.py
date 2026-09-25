@@ -253,7 +253,7 @@ class VBDSolver(Solver):
                 f"VBDOptions.contact_ccd_scale must lie in (0, 1), got {self._contact_ccd_scale}."
             )
         self._raise_on_env_failure = options.raise_on_env_failure
-        self._max_inverted_substeps = options.max_consecutive_inverted_substeps
+        self._max_inverted_duration = options.max_inverted_duration
         self.mtu = None
         self._has_glue = False
         self._mtu_units = []
@@ -545,8 +545,8 @@ class VBDSolver(Solver):
         messages = []
         if errno & ErrorCode.VBD_TISSUE_PERSISTENT_INVERSION:
             messages.append(
-                "A tet stayed inverted (J/J0 <= 0) for more consecutive substeps than "
-                "VBDOptions.max_consecutive_inverted_substeps allows: the inversion did not recover."
+                "A tet stayed inverted (J/J0 <= 0) for longer without a break than "
+                "VBDOptions.max_inverted_duration allows: the inversion did not recover."
             )
         if errno & ErrorCode.VBD_CONTACT_CROSSING:
             messages.append("A contact pair crossed its surface within one substep: the penalty did not hold it.")
@@ -2453,7 +2453,7 @@ class VBDSolver(Solver):
                     self.inverted_streak[i_b] += 1
                 else:
                     self.inverted_streak[i_b] = 0
-                if self.inverted_streak[i_b] > self._max_inverted_substeps:
+                if self.inverted_streak[i_b] * self._substep_dt > self._max_inverted_duration:
                     qd.atomic_or(self.tissue_errno[i_b], ErrorCode.VBD_TISSUE_PERSISTENT_INVERSION)
                     self.env_failed[i_b] = 1
                     self.failed_substep[i_b] = substep_global

@@ -1063,13 +1063,14 @@ class VBDOptions(Options):
         advancing (its positions, prescribed motion and multipliers freeze) until it is reset. True stops the
         program at the first failure, which suits a single environment; False lets the other environments of a
         batch continue and leaves reading `VBDSolver.env_status()` to the caller. Defaults to True.
-    max_consecutive_inverted_substeps : int, optional
-        Largest number of consecutive substeps an environment may hold at least one inverted tet (signed volume
-        over signed rest volume at or below zero) before it is latched as failed, through the same mechanism as a
-        contact failure. The stable neo-Hookean material stays well-posed through a brief inversion and often
+    max_inverted_duration : float, optional
+        Longest simulated time (s) an environment may hold at least one inverted tet (signed volume over signed
+        rest volume at or below zero) without a break before it is latched as failed, through the same mechanism
+        as a contact failure. The stable neo-Hookean material stays well-posed through a brief inversion and often
         recovers it on its own (a fast bulge, a transient overlap), so this is permissive by default; it exists to
-        catch a tet that never recovers, not to flag every transient one. Defaults to 1000, about a quarter of a
-        second of substeps at a typical dt and substep count.
+        catch a tet that never recovers, not to flag every transient one. A duration rather than a substep count,
+        so the allowance does not change with the substep. Defaults to 0.0625, the 1000 substeps of 62.5 us the
+        python head was judged by.
     """
 
     dt: PositiveFloat | None = None
@@ -1103,7 +1104,7 @@ class VBDOptions(Options):
     contact_ccd_gap: NonNegativeFloat = 0.0
     contact_ccd_iterations: PositiveInt = 64
     raise_on_env_failure: StrictBool = True
-    max_consecutive_inverted_substeps: PositiveInt = 1000
+    max_inverted_duration: PositiveFloat = 0.0625
 
 
 class SFOptions(Options):

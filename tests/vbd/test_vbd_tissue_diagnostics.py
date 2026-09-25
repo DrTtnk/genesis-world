@@ -35,16 +35,16 @@ def _tet_volume_ratio(pos0, pos1, elems):
     return vol1 / vol0
 
 
-def _tube_scene(n_iterations, damping, max_consecutive_inverted_substeps=1000, n_envs=None, raise_on_env_failure=True):
+def _tube_scene(n_iterations, damping, max_inverted_duration=5.0, n_envs=None, raise_on_env_failure=True, substeps=1):
     ring_path = "/tmp/vbd_tissue_diagnostics_ring.obj"
     trimesh.creation.annulus(r_min=R_MIN, r_max=R_MAX, height=HEIGHT, sections=SECTIONS).export(ring_path)
     scene = gs.Scene(
-        sim_options=gs.options.SimOptions(dt=5e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        sim_options=gs.options.SimOptions(dt=5e-3, substeps=substeps, gravity=(0.0, 0.0, 0.0)),
         vbd_options=gs.options.VBDOptions(
             n_iterations=n_iterations,
             floor_height=-10.0,
             damping=damping,
-            max_consecutive_inverted_substeps=max_consecutive_inverted_substeps,
+            max_inverted_duration=max_inverted_duration,
             raise_on_env_failure=raise_on_env_failure,
         ),
         show_viewer=False,
@@ -95,7 +95,7 @@ def test_inverted_tet_count_matches_a_numpy_computation_from_positions_and_elems
 def test_transient_inversion_recovers_without_latching():
     """A brief inversion (the wall overshoots, then settles) must not trip the latch: the environment keeps
     stepping and the inverted count returns to zero on its own."""
-    scene, body = _tube_scene(n_iterations=8, damping=0.05, max_consecutive_inverted_substeps=10)
+    scene, body = _tube_scene(n_iterations=8, damping=0.05, max_inverted_duration=0.05)
     center = np.zeros((1, 3))
     vel = np.zeros((1, 3))
     radii = [R_MIN * 2.2, R_MIN * 2.0, R_MIN * 1.6, R_MIN * 1.2, R_MIN * 0.9]
@@ -134,7 +134,7 @@ def test_persistent_inversion_latches_while_its_peer_continues(precision):
     """
     peer_at_rest_atol = 1e-9 if precision == "64" else 2.6e-9
     scene, body = _tube_scene(
-        n_iterations=2, damping=0.005, max_consecutive_inverted_substeps=5, n_envs=2, raise_on_env_failure=False
+        n_iterations=2, damping=0.005, max_inverted_duration=0.025, n_envs=2, raise_on_env_failure=False
     )
     center = np.zeros((2, 3))
     vel = np.zeros((2, 3))
@@ -185,3 +185,26 @@ def test_diagnostic_reports_a_clean_state_when_nothing_inverts():
         assert int(diag.n_inverted[0]) == 0
         assert float(diag.min_j_ratio[0]) == pytest.approx(1.0, abs=1e-4)
     assert not bool(scene.vbd_solver.env_status().is_failed[0])
+
+
+@pytest.mark.parametrize("substeps", [1, 4])
+def test_the_inversion_limit_is_a_duration_whatever_the_substep(substeps):
+    """The limit was a count of substeps, so the same persistent inversion was allowed 1000 x 62.5 us = 62.5 ms at
+    the python head's 160 substeps and a whole second at 10. As a duration it latches at the same simulated time
+    at any substep: here 25 ms after the fold, give or take one step."""
+    scene, _ = _tube_scene(n_iterations=2, damping=0.005, max_inverted_duration=0.025, raise_on_env_failure=False,
+                           substeps=substeps)
+    center, vel = np.zeros((1, 3)), np.zeros((1, 3))
+    onset = None
+    for step in range(40):
+        scene.vbd_solver.set_bolus(center, np.array([R_MIN * 6.0]), vel, 0.0)
+        scene.step()
+        if onset is None and int(scene.vbd_solver.tissue_diagnostics().n_inverted[0]) > 0:
+            onset = step
+        if bool(scene.vbd_solver.env_status().is_failed[0]):
+            break
+    status = scene.vbd_solver.env_status()
+    assert bool(status.is_failed[0]) and onset is not None
+    latched_after = (int(status.failed_substep[0]) + 1) * 5e-3 / substeps - onset * 5e-3
+    print(f"{substeps} substeps a step: latched {1e3 * latched_after:.2f} ms after the inversion began")
+    assert 0.025 <= latched_after <= 0.025 + 2 * 5e-3
