@@ -511,3 +511,64 @@ def test_a_link_anchor_needs_exactly_one_of_local_and_world():
         LinkAnchor(Fake(), local_pos=(0.0, 0.0, 0.0), world_pos=(0.0, 0.0, 0.0))
     with pytest.raises(gs.GenesisException, match="three coordinates"):
         LinkAnchor(Fake(), world_pos=(0.0, 0.0))
+
+
+def test_a_ligament_on_a_free_body_that_the_solver_does_not_own_is_refused():
+    """Link forces reach a free body only through its VBD block, and VBD takes the bodies over only when a rigid
+    attachment exists. Without one the rigid solver integrated the body alone and the ligament acted on nothing:
+    a Head39 variant with its attachments removed fell as if the 279 bands were not there."""
+    from genesis.engine.solvers.vbd_mtu import LinkAnchor
+
+    scene, _ = tissue_only_scene()
+    skull = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.02, 0.01), pos=(0.0, 0.0, 0.1), fixed=True),
+                             material=gs.materials.Rigid(rho=1000.0))
+    bone = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.01, 0.005), pos=(0.0, 0.0, 0.08)),
+                            material=gs.materials.Rigid(rho=1000.0))
+    scene.vbd_solver.add_ligament(
+        [LinkAnchor(skull.links[0], local_pos=(0.0, 0.0, -0.005)), LinkAnchor(bone.links[0], local_pos=(0.0, 0.0, 0.0025))],
+        stiffness=1e3, slack_length=0.0125,
+    )
+    with pytest.raises(gs.GenesisException, match="free rigid link"):
+        scene.build()
+
+
+def test_a_route_on_a_free_body_is_measured_at_the_pose_the_body_has_now():
+    """The anchors of a free link must follow the pose VBD is solving, not the rigid solver's table, which still
+    holds the pose of the previous substep until the commit. Read from the table, every anchor of a free body
+    lagged by v h: the other bodies' blocks were pulled toward where it had been, and the reported length of a
+    band on a falling bone was the length one substep ago."""
+    from genesis.engine.solvers.vbd_mtu import LinkAnchor
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=2e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=8, floor_height=-10.0),
+        show_viewer=False,
+    )
+    patch = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.004, 0.004, 0.004), pos=(0.03, 0.0, 0.1), nobisect=False, maxvolume=4e-9),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3),
+    )
+    skull = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.02, 0.01), pos=(0.0, 0.0, 0.1), fixed=True),
+                             material=gs.materials.Rigid(rho=1000.0))
+    bone = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.01, 0.005), pos=(0.0, 0.0, 0.08)),
+                            material=gs.materials.Rigid(rho=1000.0))
+    rest = tensor_to_array(patch.init_positions)
+    patch.add_rigid_attachments([int(v) for v in np.argsort(-rest[:, 2])[:4]], skull.links[0])
+    local_skull, local_bone = np.array([0.0, 0.0, -0.005]), np.array([0.0, 0.0, 0.0025])
+    scene.vbd_solver.add_ligament(
+        [LinkAnchor(skull.links[0], local_pos=tuple(local_skull)), LinkAnchor(bone.links[0], local_pos=tuple(local_bone))],
+        stiffness=1e3, slack_length=1.0,  # never taut: the bone falls freely and only the geometry is under test
+    )
+    scene.build()
+    for _ in range(20):
+        scene.step()
+    top = tensor_to_array(skull.get_pos()) + local_skull
+    quat = tensor_to_array(bone.get_quat())
+    bottom = tensor_to_array(bone.get_pos()) + gs.utils.geom.quat_to_R(quat) @ local_bone
+    reported = float(scene.vbd_solver.mtu_state().route_length[0, 0])
+    speed = float(np.linalg.norm(tensor_to_array(bone.get_vel())))
+    print(f"reported {1e3 * reported:.4f} mm, geometric {1e3 * np.linalg.norm(top - bottom):.4f} mm, "
+          f"one substep of travel {1e3 * speed * 2e-3:.4f} mm")
+    assert speed * 2e-3 > 1e-4, "fixture sanity check: the bone must be moving by a measurable amount a substep"
+    assert_allclose(reported, np.linalg.norm(top - bottom), tol=1e-9)

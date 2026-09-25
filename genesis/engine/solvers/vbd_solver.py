@@ -1146,6 +1146,16 @@ class VBDSolver(Solver):
             if self._mtu_units:
                 if self._sim.requires_grad:
                     gs.raise_exception("Muscle-tendon units have no adjoint, so they cannot be used with requires_grad.")
+                if self.rigid_attachment is None and any(
+                    isinstance(anchor, LinkAnchor) and not anchor.link.is_fixed
+                    for _, anchors, _, _ in self._mtu_units
+                    for anchor in anchors
+                ):
+                    gs.raise_exception(
+                        "A muscle-tendon unit or ligament is anchored on a free rigid link, but no rigid attachment "
+                        "hands the free bodies to VBD: the rigid solver would integrate them and the unit would "
+                        "pull on nothing. Attach tissue to a rigid body to couple them."
+                    )
                 self.mtu = VBDMTU(self, self._mtu_units, self._mtu_restraints)
                 kernel_reset_mtu(torch.arange(self._B, dtype=torch.int32), self.mtu)
             elif self._mtu_restraints:
