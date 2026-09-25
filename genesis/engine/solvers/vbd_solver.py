@@ -74,6 +74,7 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     VBDRigidAttachment,
     func_attachment_point,
     func_attachment_pose,
+    func_glue_point,
     func_solve_attachment_link,
     func_update_attachment_dual,
     kernel_begin_attachment,
@@ -254,6 +255,7 @@ class VBDSolver(Solver):
         self._raise_on_env_failure = options.raise_on_env_failure
         self._max_inverted_substeps = options.max_consecutive_inverted_substeps
         self.mtu = None
+        self._has_glue = False
         self._mtu_units = []
         self._mtu_restraints = []
         self._rod_models = []
@@ -1060,7 +1062,8 @@ class VBDSolver(Solver):
             if (self._n_triangles or self._n_stencils) and self._sim.requires_grad:
                 gs.raise_exception("Shell elements have no adjoint yet, so they cannot be used with requires_grad.")
             attached_entities = [
-                entity for entity in self._entities if entity._rigid_links or entity._barycentric_links
+                entity for entity in self._entities
+                if entity._rigid_links or entity._barycentric_links or entity._glued_links
             ]
             if self._rod_models and self._sim.rigid_solver.is_active:
                 if not attached_entities and any(not link.is_fixed for link in self._sim.rigid_solver.links):
@@ -1072,6 +1075,16 @@ class VBDSolver(Solver):
                     gs.raise_exception("The rod reference supports free and fixed links only.")
             if attached_entities:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
+                self._has_glue = self.rigid_attachment.has_glue
+            if self._has_glue:
+                if self._contact_ccd:
+                    gs.raise_exception("Rigid glue cannot be combined with contact_ccd: its rescale moves a glued "
+                                       "vertex apart from the bone that carries it.")
+                if self._damping > 0.0:
+                    gs.raise_exception("Rigid glue needs damping = 0: the Rayleigh damping couples a vertex to its "
+                                       "neighbours' motion, which the bone block does not assemble.")
+                if self._sim.requires_grad:
+                    gs.raise_exception("Rigid glue has no adjoint yet, so it cannot be used with requires_grad.")
             # Articulated and gradient paths statically inline every sweep and colour. The ordinary forward path
             # launches the same colour kernel once per Python sweep, so only colours contribute to compile size.
             is_static_unrolled = self._sim.requires_grad or (
@@ -1160,6 +1173,20 @@ class VBDSolver(Solver):
                 kernel_reset_mtu(torch.arange(self._B, dtype=torch.int32), self.mtu)
             elif self._mtu_restraints:
                 gs.raise_exception("Rotary restraints were declared without any muscle-tendon unit.")
+            if self._has_glue:
+                # The bone block assembles a glued vertex's inertia and tetrahedra only. Every other force a vertex
+                # can carry reaches it through the vertex solve, which a glued vertex never runs, so it would be lost.
+                glued = self.rigid_attachment.glue_link.to_numpy() >= 0
+                carriers = []
+                if self.contact is not None:
+                    carriers.append(("contact", self.contact.vertex_cv.to_numpy()[: self._n_vertices] >= 0))
+                if self.mtu is not None:
+                    carriers.append(("a muscle-tendon or ligament anchor", np.diff(self.mtu.vert_anchor_offset.to_numpy()) > 0))
+                if self.tissue_attachment is not None:
+                    carriers.append(("a tissue attachment", np.diff(self.tissue_attachment.vert_anchor_offset.to_numpy()) > 0))
+                for name, carries in carriers:
+                    if (glued & carries).any():
+                        gs.raise_exception(f"A glued vertex cannot also carry {name} yet: its force would be lost.")
             self.reset_grad()  # after the constraint fields exist: it snapshots the multipliers the first window starts from
 
     def _init_self_collision(self, elems, tris, bends):
@@ -1986,7 +2013,10 @@ class VBDSolver(Solver):
         """One Newton step of vertex i_v, then the dual updates of the constraints it owns (relaxation w, stiffness
         ramp on or off), recording their multipliers for the adjoint when `record` is set. w = 0 skips the duals.
         `sweep` is the index of this sweep within the substep, for the replay buffer."""
-        if not self.verts_info[i_v].pinned and not self.env_failed[i_b]:
+        is_glued = False
+        if qd.static(self._has_glue):
+            is_glued = self.rigid_attachment.glue_link[i_v] >= 0
+        if not self.verts_info[i_v].pinned and not is_glued and not self.env_failed[i_b]:
             force, H, K_unused = self._func_vertex_system(f, i_v, i_b)
             dx = H.inverse() @ force
             if qd.static(self._record_sweeps):
@@ -2047,6 +2077,10 @@ class VBDSolver(Solver):
                 self.verts[f + 1, i_v, i_b].pos = self.pin_target[i_v, i_b]
             else:
                 self.verts[f + 1, i_v, i_b].pos = self._func_inertia_target(f, i_v, i_b)
+                if qd.static(self._has_glue):
+                    # a glued vertex rides at its link's pose, which kernel_begin_attachment has just predicted
+                    if self.rigid_attachment.glue_link[i_v] >= 0:
+                        self.verts[f + 1, i_v, i_b].pos = func_glue_point(i_v, i_b, self.rigid_attachment)
 
     @qd.kernel
     def _kernel_solve_color(self, f: qd.i32, lo: qd.i32, hi: qd.i32):

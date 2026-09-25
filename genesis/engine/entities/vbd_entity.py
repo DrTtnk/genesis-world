@@ -148,6 +148,8 @@ class VBDEntity(Entity):
         self._barycentric_links = []
         self._barycentric_verts = np.empty((0, 4), dtype=gs.np_int)
         self._barycentric_weights = np.empty((0, 4), dtype=gs.np_float)
+        self._glued_links = []
+        self._glued_vertices_idx = np.empty(0, dtype=gs.np_int)
         self.sample()
 
         self.init_tgt_vars()
@@ -588,8 +590,38 @@ class VBDEntity(Entity):
         combined = np.concatenate((self._rigid_vertices_idx, vertices_idx))
         if len(np.unique(combined)) != len(combined):
             gs.raise_exception("A vertex can have only one rigid attachment.")
+        if np.isin(vertices_idx, self._glued_vertices_idx).any():
+            gs.raise_exception("A glued vertex cannot also carry a rigid attachment.")
         self._rigid_links.extend([link] * len(vertices_idx))
         self._rigid_vertices_idx = combined
+
+    def add_rigid_glue(self, vertices_idx, link):
+        """Carry vertices rigidly with a rigid link: each keeps its rest offset in the link's frame and has no
+        degrees of freedom of its own.
+
+        The coupling is two-way. The link moves the glued vertices, and the tissue's forces on them (elasticity,
+        inertia and gravity of their mass) enter the link's own block, assembled per element so that two glued
+        vertices of one tetrahedron keep their cross curvature. There is no multiplier to converge, unlike
+        `add_rigid_attachments`, whose augmented Lagrangian needs far more sweeps than a 1 ms substep can afford
+        to pass a light load correctly. A glued vertex cannot also carry a rigid attachment. Declare before
+        scene.build().
+        """
+        if self._scene.is_built:
+            gs.raise_exception("Declare VBD rigid glue before scene.build().")
+        if link.entity.scene is not self._scene:
+            gs.raise_exception("The glued rigid link must belong to the same scene.")
+        if link.entity.solver is not self._sim.rigid_solver:
+            gs.raise_exception("The glue target must belong to the rigid solver.")
+        vertices_idx = tensor_to_array(vertices_idx)
+        if vertices_idx.ndim != 1 or vertices_idx.dtype.kind not in "iu" or not len(vertices_idx):
+            gs.raise_exception("vertices_idx must be a nonempty one-dimensional integer array.")
+        if (vertices_idx < 0).any() or (vertices_idx >= self.n_vertices).any():
+            gs.raise_exception("vertices_idx must index this VBD entity.")
+        combined = np.concatenate((self._glued_vertices_idx, self._rigid_vertices_idx, vertices_idx))
+        if len(np.unique(combined)) != len(combined):
+            gs.raise_exception("A vertex can be glued to one link only, and not also carry a rigid attachment.")
+        self._glued_links.extend([link] * len(vertices_idx))
+        self._glued_vertices_idx = np.concatenate((self._glued_vertices_idx, vertices_idx))
 
     def add_barycentric_attachments(self, anchors, link):
         """Attach material points to a rigid link with the same two-way augmented-Lagrangian force as

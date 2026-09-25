@@ -87,8 +87,9 @@ def test_a_light_bone_settles_on_a_plate_at_a_millisecond_substep():
     assert reaction == pytest.approx(BONE_WEIGHT, rel=0.02), "the layer must carry the weight, no more and no less"
 
 
-@pytest.mark.xfail(strict=True, reason="the attachment of a patch riding on the bone pulls it down with about ten "
-                   "times the patch's weight at a 1 ms substep; its dual update runs after the last sweep too")
+@pytest.mark.xfail(strict=True, reason="at ten sweeps the attached patch's own mesh has not converged at a 1 ms "
+                   "substep (its vertices' m/h^2 is ~1/500 of their element stiffness) and pulls on the bone; the "
+                   "reaction is exact at 160 sweeps")
 def test_a_bone_carrying_attached_tissue_loads_the_plate_with_both_weights():
     """The same bone with a tissue patch attached on top of it. At rest the plate carries both, which is only true
     if the attachment passes the patch's weight to the bone, no more."""
@@ -100,3 +101,54 @@ def test_a_bone_carrying_attached_tissue_loads_the_plate_with_both_weights():
     assert not bool(status.is_failed[0])
     assert np.abs(speeds).max() < 1e-3
     assert reaction == pytest.approx(weight, rel=0.02)
+
+
+def _two_bones_falling(contact_ccd):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=DT, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=10, floor_height=-1e3, contact_margin=THICKNESS, contact_k_max_ratio=4.0,
+            contact_ccd=contact_ccd, raise_on_env_failure=False,
+        ),
+        show_viewer=False,
+    )
+    plate = scene.add_entity(morph=gs.morphs.Box(size=(0.1, 0.06, 0.004), pos=(0.0, 0.0, PLATE_TOP - 0.002),
+                                                 fixed=True), material=gs.materials.Rigid(rho=1500.0))
+    # the lander hits the plate at 0.44 m/s, 0.44 mm a substep against the 0.2 mm layer; the other is still in
+    # free fall 30 mm up and 40 mm away when that happens
+    lander = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.01, 0.003), pos=(-0.02, 0.0, 0.0115)),
+                              material=gs.materials.Rigid(rho=1500.0))
+    faller = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.01, 0.003), pos=(0.02, 0.0, 0.06)),
+                              material=gs.materials.Rigid(rho=1500.0))
+    patch = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.003, 0.003, 0.003), pos=(0.045, 0.025, 0.0015), nobisect=False, maxvolume=4e-9),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.4, collision_group=3),
+    )
+    rest = tensor_to_array(patch.init_positions)
+    patch.add_rigid_attachments([int(v) for v in np.argsort(rest[:, 2])[:4]], plate.links[0])
+    solver = scene.sim.vbd_solver
+    solver.add_rigid_collider(plate.links[0], collision_group=0)
+    solver.add_rigid_collider(lander.links[0], collision_group=1)
+    solver.add_rigid_collider(faller.links[0], collision_group=2)
+    for group in (1, 2):
+        solver.add_contact_rule(0, group, stiffness=1e5, friction=0.1, thickness=THICKNESS)
+    scene.build()
+    return scene, lander, faller
+
+
+@pytest.mark.required
+def test_a_fast_landing_is_stopped_by_the_layer_without_a_continuous_filter():
+    """0.44 mm of approach a substep against a 0.2 mm layer. The swept candidate search finds the pair before the
+    bone reaches it, and with the block's contact curvature exact the Newton step stops the bone within the
+    substep, so no filter is needed; the distant bone, touching nothing, keeps exactly its free fall."""
+    scene, lander, faller = _two_bones_falling(contact_ccd=False)
+    for step in range(80):
+        scene.step()
+        t = DT * (step + 1)
+        assert float(tensor_to_array(faller.get_vel())[2]) == pytest.approx(-9.81 * t, rel=1e-6)
+    status = scene.vbd_solver.env_status()
+    height = float(tensor_to_array(lander.get_pos())[2]) - 0.0015 - PLATE_TOP
+    print(f"failed={bool(status.is_failed[0])} errno={int(status.errno[0])}; lander {1e3 * height:.4f} mm up")
+    assert not bool(status.is_failed[0]), f"the lander crossed the plate (errno {int(status.errno[0])})"
+    assert 0.0 < height < THICKNESS * 1.05

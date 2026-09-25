@@ -56,6 +56,13 @@ class VBDRigidAttachment:
                 ):
                     gs.raise_exception(f"Link {link.name} is neither free nor fixed, so VBD cannot own it.")
         links_idx = np.array([link.idx for link in links], dtype=gs.np_int)
+        glued_links = [link for entity in entities for link in entity._glued_links]
+        if not self.is_articulated:
+            for link in glued_links:
+                if free_slot[link.idx] < 0 and any(
+                    joint.type != gs.JOINT_TYPE.FIXED for joint in self.rigid.links[link.idx].joints
+                ):
+                    gs.raise_exception(f"Link {link.name} is neither free nor fixed, so VBD cannot glue to it.")
 
         verts_pieces, weights_pieces, positions_pieces = [], [], []
         for entity in entities:
@@ -75,9 +82,9 @@ class VBDRigidAttachment:
                 weights_pieces.append(w)
                 init = tensor_to_array(entity.init_positions)
                 positions_pieces.append(np.einsum("ac,acd->ad", w, init[v]))
-        verts = np.concatenate(verts_pieces).astype(gs.np_int)
-        weights = np.concatenate(weights_pieces).astype(gs.np_float)
-        positions = np.concatenate(positions_pieces).astype(gs.np_float)
+        verts = np.concatenate(verts_pieces or [np.zeros((0, 4))]).astype(gs.np_int)
+        weights = np.concatenate(weights_pieces or [np.zeros((0, 4))]).astype(gs.np_float)
+        positions = np.concatenate(positions_pieces or [np.zeros((0, 3))]).astype(gs.np_float)
 
         self.n_attachments = len(verts)
         self.alpha = 0.95
@@ -97,9 +104,9 @@ class VBDRigidAttachment:
             inertia=gs.qd_mat3,
             mass=gs.qd_float,
         )
-        self.info = info_type.field(shape=self.n_attachments, layout=qd.Layout.SOA)
-        self.state = state_type.field(shape=(self.n_attachments, solver._B), layout=qd.Layout.SOA)
-        self.previous_error = qd.Vector.field(3, dtype=gs.qd_float, shape=(self.n_attachments, solver._B))
+        self.info = info_type.field(shape=max(self.n_attachments, 1), layout=qd.Layout.SOA)
+        self.state = state_type.field(shape=(max(self.n_attachments, 1), solver._B), layout=qd.Layout.SOA)
+        self.previous_error = qd.Vector.field(3, dtype=gs.qd_float, shape=(max(self.n_attachments, 1), solver._B))
         self.link_state = link_type.field(shape=(max(self.n_free, 1), solver._B), layout=qd.Layout.SOA)
         # One pose table for every link, free or fixed, so an attachment reads its link's pose the same way in
         # both paths and a fixed link needs no special case.
@@ -140,10 +147,12 @@ class VBDRigidAttachment:
         )
         self.link_attachment = qd.field(dtype=gs.qd_int, shape=max(self.n_attachments, 1))
         self.link_attachment.from_numpy(by_link.astype(gs.np_int) if self.n_attachments else np.zeros(1, gs.np_int))
-        self.info.verts.from_numpy(verts)
-        self.info.weights.from_numpy(weights)
-        self.info.link.from_numpy(links_idx)
-        self.info.local_pos.from_numpy(local.astype(gs.np_float))
+        if self.n_attachments:
+            self.info.verts.from_numpy(verts)
+            self.info.weights.from_numpy(weights)
+            self.info.link.from_numpy(links_idx)
+            self.info.local_pos.from_numpy(local.astype(gs.np_float))
+        self._build_glue(solver, entities, link_positions, link_quaternions, free_slot)
         self.state.multiplier.fill(0.0)
         self.state.stiffness.fill(solver._k_start)
         self.coordinate_info = None
@@ -166,6 +175,173 @@ class VBDRigidAttachment:
                         break
                     link = self.rigid.links[link.parent_idx]
             self.affects.from_numpy(affects)
+
+    def _build_glue(self, solver, entities, link_positions, link_quaternions, free_slot):
+        """Glued vertices (`VBDEntity.add_rigid_glue`): which link carries each, its offset in that link's frame, and
+        per link the glued vertices and the tetrahedra that touch them, with a mask of the corners it carries."""
+        glued, glue_links = [], []
+        for entity in entities:
+            if len(entity._glued_vertices_idx):
+                if entity._n_triangles or entity._n_stencils:
+                    gs.raise_exception("Rigid glue supports tetrahedral tissue only, not shells.")
+                glued_local = set(int(v) for v in entity._glued_vertices_idx)
+                for pair in np.concatenate((entity._distance_constraints, entity._angle_constraints[:, :2]), axis=0):
+                    if glued_local.intersection(int(v) for v in pair):
+                        gs.raise_exception("A glued vertex cannot also carry a distance or angle constraint.")
+                glued.append(entity.v_start + entity._glued_vertices_idx)
+                glue_links.extend(link.idx for link in entity._glued_links)
+        glued = np.concatenate(glued or [np.zeros(0)]).astype(gs.np_int)
+        glue_links = np.array(glue_links, dtype=gs.np_int)
+        self.n_glued = len(glued)
+        self.has_glue = self.n_glued > 0
+        self.glue_link = qd.field(dtype=gs.qd_int, shape=solver.n_vertices)
+        self.glue_local = qd.Vector.field(3, dtype=gs.qd_float, shape=solver.n_vertices)
+        link_of = np.full(solver.n_vertices, -1, dtype=gs.np_int)
+        local = np.zeros((solver.n_vertices, 3), dtype=gs.np_float)
+        if self.has_glue:
+            if self.is_articulated:
+                gs.raise_exception("Rigid glue is not supported on articulated links yet.")
+            barycentric = np.concatenate(
+                [entity.v_start + entity._barycentric_verts for entity in entities if len(entity._barycentric_verts)]
+                or [np.zeros((0, 4), dtype=gs.np_int)]
+            )
+            if np.isin(glued, barycentric).any():
+                gs.raise_exception("A glued vertex cannot also carry a barycentric attachment.")
+            rest = np.zeros((solver.n_vertices, 3), dtype=gs.np_float)
+            for entity in entities:
+                rest[entity.v_start : entity.v_start + entity.n_vertices] = tensor_to_array(entity.init_positions)
+            link_of[glued] = glue_links
+            local[glued] = gu.inv_transform_by_quat(
+                rest[glued] - link_positions[glue_links], link_quaternions[glue_links]
+            )
+        self.glue_link.from_numpy(link_of)
+        self.glue_local.from_numpy(local)
+        # per link, its glued vertices
+        order = np.argsort(glue_links, kind="stable")
+        self.link_glue_vert_offset = qd.field(dtype=gs.qd_int, shape=self.rigid.n_links + 1)
+        self.link_glue_vert_offset.from_numpy(
+            np.concatenate(([0], np.cumsum(np.bincount(glue_links, minlength=self.rigid.n_links)))).astype(gs.np_int)
+        )
+        self.link_glue_vert = qd.field(dtype=gs.qd_int, shape=max(self.n_glued, 1))
+        self.link_glue_vert.from_numpy(glued[order] if self.n_glued else np.zeros(1, dtype=gs.np_int))
+        # per link, every tetrahedron with a corner it carries, and which corners
+        entries = {}
+        if self.has_glue and solver._n_elements:
+            elems = solver.elems_info.v.to_numpy()[: solver._n_elements]
+            carried = link_of[elems]  # (n_elems, 4)
+            for i_e, corners in enumerate(carried):
+                for i_l in set(int(c) for c in corners if c >= 0):
+                    mask = sum(1 << r for r in range(4) if corners[r] == i_l)
+                    entries.setdefault(i_l, []).append((i_e, mask))
+        counts = np.zeros(self.rigid.n_links, dtype=gs.np_int)
+        flat_elem, flat_mask = [], []
+        for i_l in range(self.rigid.n_links):
+            for i_e, mask in entries.get(i_l, []):
+                flat_elem.append(i_e)
+                flat_mask.append(mask)
+            counts[i_l] = len(entries.get(i_l, []))
+        self.link_glue_elem_offset = qd.field(dtype=gs.qd_int, shape=self.rigid.n_links + 1)
+        self.link_glue_elem_offset.from_numpy(np.concatenate(([0], np.cumsum(counts))).astype(gs.np_int))
+        self.link_glue_elem = qd.field(dtype=gs.qd_int, shape=max(len(flat_elem), 1))
+        self.link_glue_elem.from_numpy(np.array(flat_elem or [0], dtype=gs.np_int))
+        self.link_glue_mask = qd.field(dtype=gs.qd_int, shape=max(len(flat_mask), 1))
+        self.link_glue_mask.from_numpy(np.array(flat_mask or [0], dtype=gs.np_int))
+
+
+@qd.func
+def func_rigid_jacobian(r):
+    """3x6 Jacobian of a point at offset r from a body's origin under (translation, world rotation increment)."""
+    jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
+    for row in qd.static(range(3)):
+        jacobian[row, row] = 1.0
+    jacobian[0, 4] = r[2]
+    jacobian[0, 5] = -r[1]
+    jacobian[1, 3] = -r[2]
+    jacobian[1, 5] = r[0]
+    jacobian[2, 3] = r[1]
+    jacobian[2, 4] = -r[0]
+    return jacobian
+
+
+@qd.func
+def func_glue_point(i_v, i_b, attachment: qd.template()):
+    """World position of glued vertex i_v at its link's current pose."""
+    i_l = attachment.glue_link[i_v]
+    return gu.qd_transform_by_trans_quat(
+        attachment.glue_local[i_v], attachment.link_pose[i_l, i_b].pos, attachment.link_pose[i_l, i_b].quat
+    )
+
+
+@qd.func
+def func_refresh_glue(f, i_l, i_b, pos, quat, solver: qd.template(), attachment: qd.template()):
+    """Place the vertices glued to link i_l at the given pose."""
+    for c in range(attachment.link_glue_vert_offset[i_l], attachment.link_glue_vert_offset[i_l + 1]):
+        i_v = attachment.link_glue_vert[c]
+        solver.verts[f + 1, i_v, i_b].pos = gu.qd_transform_by_trans_quat(attachment.glue_local[i_v], pos, quat)
+
+
+@qd.func
+def func_glue_link_terms(f, i_l, i_b, origin, solver: qd.template(), attachment: qd.template()):
+    """Wrench about `origin` and 6x6 block that the vertices glued to link i_l bring to its block: the inertia and
+    gravity of their mass, and the stable neo-Hookean and fibre forces of every tetrahedron that touches them.
+
+    Per element, the curvature between two glued corners r and s is the tetrahedron's own Gauss-Newton block
+    V mu (w_r . w_s) I + V lam q_r q_s^T (q = cof w), plus V k (w0_r . a)(w0_s . a) u u^T for a fibre, carried
+    through both corners' rigid Jacobians: the same blocks the vertex solve uses on its diagonal, so a glued
+    corner and a free one see one law. Summing each corner's diagonal alone would drop the cross terms, which is
+    the underestimate `func_contact_link_terms` documents."""
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
+    inv_h2 = 1.0 / (solver._substep_dt * solver._substep_dt)
+    for c in range(attachment.link_glue_vert_offset[i_l], attachment.link_glue_vert_offset[i_l + 1]):
+        i_v = attachment.link_glue_vert[c]
+        m_h2 = solver.verts_info[i_v].mass * inv_h2
+        x = solver.verts[f + 1, i_v, i_b].pos
+        J = func_rigid_jacobian(x - origin)
+        force6 += J.transpose() @ (-m_h2 * (x - solver._func_inertia_target(f, i_v, i_b)))
+        hessian6 += m_h2 * J.transpose() @ J
+    identity = qd.Matrix.identity(gs.qd_float, 3)
+    for c in range(attachment.link_glue_elem_offset[i_l], attachment.link_glue_elem_offset[i_l + 1]):
+        i_e = attachment.link_glue_elem[c]
+        mask = attachment.link_glue_mask[c]
+        v = solver.elems_info[i_e].v
+        F, B = solver._func_deformation(f + 1, i_e, i_b)
+        mu = solver.elems_info[i_e].mu
+        lam = solver.elems_info[i_e].lam
+        cof = solver._func_cofactor(F)
+        P = mu * F + lam * (F.determinant() - (1.0 + mu / lam)) * cof
+        V = solver.elems_info[i_e].vol_rest
+        k_fiber = solver.elems_info[i_e].k_fiber
+        B0 = solver.elems_info[i_e].B_rest
+        a = solver.elems_info[i_e].fiber
+        p0 = solver.verts[f + 1, v[0], i_b].pos
+        Ds = qd.Matrix.cols(
+            [solver.verts[f + 1, v[1], i_b].pos - p0, solver.verts[f + 1, v[2], i_b].pos - p0,
+             solver.verts[f + 1, v[3], i_b].pos - p0]
+        )
+        u = (Ds @ B0) @ a
+        u_hat = u.normalized()
+        for r in qd.static(range(4)):
+            if (mask >> r) & 1:
+                w_r = solver._func_vertex_weight_static(B, r)
+                J_r = func_rigid_jacobian(solver.verts[f + 1, v[r], i_b].pos - origin)
+                f_r = -V * (P @ w_r)
+                if k_fiber > 0.0:
+                    f_fib, _, _ = solver._func_fiber_terms(f + 1, i_e, i_b, solver._func_vertex_weight_static(B0, r))
+                    f_r += f_fib
+                force6 += J_r.transpose() @ f_r
+                for s_ in qd.static(range(4)):
+                    if (mask >> s_) & 1:
+                        w_s = solver._func_vertex_weight_static(B, s_)
+                        J_s = func_rigid_jacobian(solver.verts[f + 1, v[s_], i_b].pos - origin)
+                        block = V * mu * w_r.dot(w_s) * identity + V * lam * (cof @ w_r).outer_product(cof @ w_s)
+                        if k_fiber > 0.0:
+                            block += (
+                                V * k_fiber * solver._func_vertex_weight_static(B0, r).dot(a)
+                                * solver._func_vertex_weight_static(B0, s_).dot(a) * u_hat.outer_product(u_hat)
+                            )
+                        hessian6 += J_r.transpose() @ block @ J_s
+    return force6, hessian6
 
 
 @qd.func
@@ -282,6 +458,10 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
         )
         force += rigid_force
         hessian += rigid_hessian
+    if qd.static(attachment.has_glue):
+        force_g, hessian_g = func_glue_link_terms(f, i_l, i_b, state.pos, solver, attachment)
+        force += force_g
+        hessian += hessian_g
     if qd.static(solver.has_contact):
         force_c, hessian_c = func_contact_link_terms(f, i_l, i_b, state.pos, solver, solver.contact)
         force += force_c
@@ -298,6 +478,10 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
     attachment.link_state[i_f, i_b].quat = func_quaternion_update(state.quat, increment[3:6])
     attachment.link_pose[i_l, i_b].pos = attachment.link_state[i_f, i_b].pos
     attachment.link_pose[i_l, i_b].quat = attachment.link_state[i_f, i_b].quat
+    if qd.static(attachment.has_glue):
+        func_refresh_glue(
+            f, i_l, i_b, attachment.link_state[i_f, i_b].pos, attachment.link_state[i_f, i_b].quat, solver, attachment
+        )
     if qd.static(solver.has_contact):
         func_refresh_link_active_vertices(
             i_l, i_b, attachment.link_state[i_f, i_b].pos, attachment.link_state[i_f, i_b].quat, solver.contact
