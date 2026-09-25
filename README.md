@@ -331,3 +331,33 @@ Pruned from Simulation Interface (same logic — labels/paths still valid):
 | [Close kinematic chain](./examples/rigid/closed_loop.py) | [Advanced: muscle](./examples/tutorials/advanced_muscle.py) | [Advanced: hybrid robot](./examples/tutorials/advanced_hybrid_robot.py) |
 | <img src="https://raw.githubusercontent.com/YilingQiao/Genesis/readme-assets/videos/rigid_closed_loop.webp" width="240"> | <img src="https://raw.githubusercontent.com/YilingQiao/Genesis/readme-assets/videos/tutorials_advanced_muscle.webp" width="240"> | <img src="https://raw.githubusercontent.com/YilingQiao/Genesis/readme-assets/videos/tutorials_advanced_hybrid_robot.webp" width="240"> |
 -->
+
+### Rod reference (local VBD development)
+
+`gs.morphs.Rod` and `gs.materials.VBD.Rod` provide a VIPER rod reference
+through native scene stepping and snapshots. Use CPU or CUDA, precision 64, one
+environment and `VBDOptions(floor_height=-float("inf"))`. The reference uses
+Torch block Gauss-Newton with reciprocal free-link attachments through
+`rod.add_rigid_attachments(vertices_idx, link)`. Use the native VBD free-link
+restrictions above. Frictionless normal contact supports tapered rod pairs
+and rigid or deformable triangle surfaces using a clearance barrier. Set the rod material
+`collision_group`, then use `add_contact_rule` and `add_rigid_collider`. Initial
+clearance must be positive. Contact uses conservative displacement and swept-path
+checks, including when the mesh-only `contact_ccd` option is off. It rejects
+uncertifiable steps; it does not promise arbitrary-timestep stability. Free mesh
+links currently require native attachment ownership somewhere in the scene.
+Mixed rod/tet stepping, material-point attachments, native Hill activation and
+elastic transverse/diagonal bundle links are supported. Declare links with
+`solver.add_rod_bundle_link(entity_a, node_a, entity_b, node_b, stiffness, rest_length)`.
+CUDA runs the float64 Torch reference; contact searches remain on CPU. Optimized
+GPU rod kernels, friction and articulated rod coupling remain pending.
+Tet/shell surface contact applies reciprocal barycentric forces and bounds surface
+motion before commit. Rod block AD caches invariant weights and skips constant
+rows; `tests/vbd/benchmark_vbd_rod_blocks.py` compares complete sweeps with the
+original test oracle. Block termination uses machine precision in the stored coordinate
+metric (quaternion tangent and coupled scale-vector norms). Captured rotated-rest
+cases are checked in `test_vbd_rod_reference.py`. Run its tests with:
+
+```sh
+python -m pytest tests/vbd/test_vbd_rod.py tests/vbd/test_vbd_rod_reference.py tests/vbd/test_vbd_rod_attachment.py tests/vbd/test_vbd_rod_contact.py tests/vbd/test_vbd_rod_contact_scene.py tests/vbd/test_vbd_rod_integration.py tests/vbd/test_vbd_rod_bundle.py --backend cpu -n 0
+```

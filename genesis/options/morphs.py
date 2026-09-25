@@ -889,6 +889,18 @@ class MeshSet(Mesh):
     eulers: tuple[Vec3FType, ...] = Field(default=(), strict=False)
 
 
+class Rod(Morph):
+    """Polyline with a reference radius and scalar-first segment frames.
+
+    Each frame's third axis must follow its rest segment. The reference scale is
+    one at every vertex. Rendering uses exported centreline/frame/radius states.
+    """
+
+    verts: NDArrayType
+    frames: NDArrayType
+    radius: PositiveFloat
+
+
 class TetMesh(Morph):
     """
     Morph built from an explicit tetrahedral mesh: no tetrahedralization, no fill.

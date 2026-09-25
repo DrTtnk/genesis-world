@@ -186,7 +186,7 @@ class Simulator(RBC):
             entity = self.pbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.FEM.Base):
             entity = self.fem_solver.add_entity(self.n_entities, material, morph, surface, name=name)
-        elif isinstance(material, gs.materials.VBD.Base):
+        elif isinstance(material, (gs.materials.VBD.Base, gs.materials.VBD.Rod)):
             entity = self.vbd_solver.add_entity(self.n_entities, material, morph, surface, name=name)
         elif isinstance(material, gs.materials.Hybrid):
             # Note that adding to solver is handled in the hybrid entity

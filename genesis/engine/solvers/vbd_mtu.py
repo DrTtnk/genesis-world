@@ -135,6 +135,18 @@ class MTUState(NamedTuple):
     tension: torch.Tensor
 
 
+class MTUSnapshot(NamedTuple):
+    """Complete evolving state of every muscle-tendon unit, in [environment, unit] order."""
+
+    initialised: torch.Tensor
+    excitation: torch.Tensor
+    activation: torch.Tensor
+    fibre: torch.Tensor
+    fibre_previous: torch.Tensor
+    length: torch.Tensor
+    tension: torch.Tensor
+
+
 class VBDMTU:
     def __init__(self, solver, units, restraints):
         self.solver = solver
@@ -330,6 +342,38 @@ class VBDMTU:
             route_length=length,
             fibre_velocity=(fibre - previous) / self.solver._substep_dt,
             tension=qd_to_torch(self.state.tension, transpose=True, copy=True),
+        )
+
+    def get_snapshot(self):
+        return MTUSnapshot(
+            initialised=qd_to_torch(self.state.initialised, transpose=True, copy=True).contiguous(),
+            excitation=qd_to_torch(self.state.excitation, transpose=True, copy=True).contiguous(),
+            activation=qd_to_torch(self.state.activation, transpose=True, copy=True).contiguous(),
+            fibre=qd_to_torch(self.state.fibre, transpose=True, copy=True).contiguous(),
+            fibre_previous=qd_to_torch(self.state.fibre_previous, transpose=True, copy=True).contiguous(),
+            length=qd_to_torch(self.state.length, transpose=True, copy=True).contiguous(),
+            tension=qd_to_torch(self.state.tension, transpose=True, copy=True).contiguous(),
+        )
+
+    def set_snapshot(self, snapshot, envs_idx):
+        expected_shape = (self.solver._B, self.n_units)
+        fields = snapshot[1:]
+        if snapshot.initialised.shape != expected_shape or any(field.shape != expected_shape for field in fields):
+            raise ValueError(f"MTU snapshot fields must have shape {expected_shape}.")
+        if not bool(torch.isfinite(torch.stack([field.to(torch.float64) for field in fields])).all()):
+            raise ValueError("MTU snapshot values must be finite.")
+        if not bool(((snapshot.initialised == 0) | (snapshot.initialised == 1)).all()):
+            raise ValueError("MTU snapshot initialized flags must be zero or one.")
+        kernel_set_mtu_snapshot(
+            envs_idx,
+            snapshot.initialised,
+            snapshot.excitation,
+            snapshot.activation,
+            snapshot.fibre,
+            snapshot.fibre_previous,
+            snapshot.length,
+            snapshot.tension,
+            self,
         )
 
     def anchor_forces(self):
@@ -629,3 +673,26 @@ def kernel_reset_mtu(envs_idx: qd.types.ndarray(), mtu: qd.template()):
         mtu.state[i_m, i_b].fibre_previous = mtu.unit[i_m].fibre0
         mtu.state[i_m, i_b].length = 0.0
         mtu.state[i_m, i_b].tension = 0.0
+
+
+@qd.kernel
+def kernel_set_mtu_snapshot(
+    envs_idx: qd.types.ndarray(),
+    initialised: qd.types.ndarray(),
+    excitation: qd.types.ndarray(),
+    activation: qd.types.ndarray(),
+    fibre: qd.types.ndarray(),
+    fibre_previous: qd.types.ndarray(),
+    length: qd.types.ndarray(),
+    tension: qd.types.ndarray(),
+    mtu: qd.template(),
+):
+    for i_m, i in qd.ndrange(mtu.n_units, envs_idx.shape[0]):
+        i_b = envs_idx[i]
+        mtu.state[i_m, i_b].initialised = initialised[i_b, i_m]
+        mtu.state[i_m, i_b].excitation = excitation[i_b, i_m]
+        mtu.state[i_m, i_b].activation = activation[i_b, i_m]
+        mtu.state[i_m, i_b].fibre = fibre[i_b, i_m]
+        mtu.state[i_m, i_b].fibre_previous = fibre_previous[i_b, i_m]
+        mtu.state[i_m, i_b].length = length[i_b, i_m]
+        mtu.state[i_m, i_b].tension = tension[i_b, i_m]

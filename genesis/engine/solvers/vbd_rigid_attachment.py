@@ -290,6 +290,9 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
         force_m, hessian_m = func_mtu_link_terms(f, i_l, i_b, state.pos, solver, solver.mtu)
         force += force_m
         hessian += hessian_m
+    if qd.static(solver.has_rod_contact):
+        force += solver._rod_contacts[0].force[i_l]
+        hessian += solver._rod_contacts[0].hessian[i_l]
     increment = func_ldlt6_solve(hessian, force)
     attachment.link_state[i_f, i_b].pos += increment[:3]
     attachment.link_state[i_f, i_b].quat = func_quaternion_update(state.quat, increment[3:6])

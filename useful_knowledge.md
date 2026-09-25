@@ -142,3 +142,19 @@ uniform compliance.
 
 If a dual scheme diverges, measure the gain per outer step before changing the cadence.
 The cadence redistributes the same total.
+
+A new rod pose test caught an omitted `morph.pos` translation. Rod sampling must add the requested translation before the existing VBD mesh-centroid rotation/offset transform. Segment frames use the same composed rotation.
+
+A translated/rotated rest rod exposed an optimizer termination bug: Armijo backtracking demanded a decrease from a step below floating-point coordinate precision. The block solver now terminates those converged blocks before line search; eight random rotated/rest cases exercise this boundary.
+
+- Distinguish a closest-contact gap estimate from its conservative dual lower bound. They are different observables; carry both explicitly rather than silently changing the meaning of the distance returned to callers. Run engine tests from genesis-fork so its pytest options are available.
+
+- Rod/tissue and Hill coupling: 12 sweeps leave 10.69 um attachment gap and 0.220 um centre-of-mass drift in the new one-step gates. Check iteration convergence before accepting the coupled reference; do not relax the 10 um/0.1 um assertions.
+
+- Engine pytest defaults CUDA to FP32 while CPU uses FP64. Rod reference CUDA validation must explicitly request precision64; backend selection alone does not preserve precision.
+
+- Native scene build left a warm constraint state in the one-sweep fixture (nonzero multiplier and ramped stiffness). A dual-update oracle must include the existing warm-start decay; assuming initial multipliers zero caused the small post-fix mismatch. Keep the strict accepted-geometry tolerance.
+
+## Rod block stopping metrics
+
+The Cayley angular step has quaternion tangent norm half its angular norm. A machine-precision stopping test must use that stored coordinate metric. Coupled radius nodes use their vector norm. Head40/41 captured rotation and scale rest cases reproduced Armijo failures before these changes; energy and admissibility checks stay unchanged.

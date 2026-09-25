@@ -483,7 +483,7 @@ class Scene(RBC):
                     f"Unsupported `surface.vis_mode` for material {material}: '{surface.vis_mode}'. Expected one of: ['visual']."
                 )
 
-        elif isinstance(material, gs.materials.VBD.Base):
+        elif isinstance(material, (gs.materials.VBD.Base, gs.materials.VBD.Rod)):
             if surface.vis_mode is None:
                 surface.vis_mode = "visual"
 

@@ -289,6 +289,8 @@ class VBDSolverState:
         self._vel = gs.zeros((scene.sim._B, scene.sim.vbd_solver.n_vertices, 3), **args)
         self.attachment_multiplier = None
         self.attachment_stiffness = None
+        self.rod_states = ()
+        self.mtu_state = None
         self.tissue_attachment_multiplier = None
         self.tissue_attachment_stiffness = None
         self.muscle_actuation = None

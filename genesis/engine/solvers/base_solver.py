@@ -251,7 +251,7 @@ class Solver(RBC):
 
     def get_gravity(self, envs_idx=None):
         tensor = qd_to_torch(self._gravity, envs_idx, transpose=True, copy=True)
-        return tensor[0] if self.n_envs == 0 else tensor
+        return tensor[0] if self._sim.n_envs == 0 else tensor
 
     def _iter_data_manager_tensors(self):
         """Yield (store name, tensor) for every tensor reachable from the data manager, descending through the

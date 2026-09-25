@@ -20,11 +20,10 @@ Muscle actuation changes the rest shape, not the energy: a tet with fiber `m` an
 uses `B_a = B A`, `A = (1/s) m m^T + sqrt(s) (I - m m^T)`, `s = 1 - a gain`, `det A = 1`.
 """
 
+import itertools
 from typing import NamedTuple
 
 import networkx as nx
-import itertools
-
 import numpy as np
 import torch
 
@@ -32,15 +31,15 @@ import quadrants as qd
 
 import genesis as gs
 from genesis.engine.entities.vbd_entity import VBDEntity
-from genesis.engine.solvers.vbd_articulation import (
-    kernel_begin_articulation,
-    kernel_end_articulation,
-    kernel_sweeps_articulation,
-)
 from genesis.engine.solvers.vbd_accd import (
     kernel_accd_rescale_links,
     kernel_accd_rescale_verts,
     kernel_accd_toi,
+)
+from genesis.engine.solvers.vbd_articulation import (
+    kernel_begin_articulation,
+    kernel_end_articulation,
+    kernel_sweeps_articulation,
 )
 from genesis.engine.solvers.vbd_contact import (
     VBDContact,
@@ -54,26 +53,7 @@ from genesis.engine.solvers.vbd_contact import (
     kernel_set_prescribed_state,
     kernel_set_prescribed_targets,
 )
-from genesis.engine.solvers.vbd_rigid import func_attachment_soft_system
-from genesis.engine.solvers.vbd_rigid_attachment import (
-    VBDRigidAttachment,
-    func_attachment_point,
-    func_attachment_pose,
-    func_solve_attachment_link,
-    func_update_attachment_dual,
-    kernel_begin_attachment,
-    kernel_end_attachment,
-    kernel_set_attachment_state,
-    kernel_set_vertex_state,
-)
 from genesis.engine.solvers.vbd_contact import EnvStatus
-from genesis.engine.solvers.vbd_tissue_attachment import (
-    VBDTissueAttachment,
-    func_tissue_attachment_vertex_terms,
-    func_update_tissue_attachment_dual,
-    kernel_begin_tissue_attachment,
-    kernel_set_tissue_attachment_state,
-)
 from genesis.engine.solvers.vbd_mtu import (
     HillParameters,
     LinkAnchor,
@@ -89,9 +69,31 @@ from genesis.engine.solvers.vbd_mtu import (
     kernel_reset_mtu,
     kernel_set_excitation,
 )
+from genesis.engine.solvers.vbd_rigid import func_attachment_soft_system
+from genesis.engine.solvers.vbd_rigid_attachment import (
+    VBDRigidAttachment,
+    func_attachment_point,
+    func_attachment_pose,
+    func_solve_attachment_link,
+    func_update_attachment_dual,
+    kernel_begin_attachment,
+    kernel_end_attachment,
+    kernel_set_attachment_state,
+    kernel_set_vertex_state,
+)
+from genesis.engine.solvers.vbd_rod import RodAttachment, RodModel, RodParameters, quat_matrix, quat_multiply
+from genesis.engine.solvers.vbd_rod_contact import RodContact
+from genesis.engine.solvers.vbd_rod_bundle import RodBundleLinks, RodBundleView
+from genesis.engine.solvers.vbd_tissue_attachment import (
+    VBDTissueAttachment,
+    func_tissue_attachment_vertex_terms,
+    func_update_tissue_attachment_dual,
+    kernel_begin_tissue_attachment,
+    kernel_set_tissue_attachment_state,
+)
 from genesis.engine.states.solvers import VBDSolverState
 from genesis.utils.array_class import ErrorCode
-from genesis.utils.misc import qd_to_torch, sanitize_index
+from genesis.utils.misc import qd_to_torch, sanitize_index, tensor_to_array
 
 from .base_solver import Solver
 
@@ -110,6 +112,86 @@ def kernel_set_muscle_state(envs_idx: qd.types.ndarray(), state: qd.types.ndarra
     for i_g, i_b_ in qd.ndrange(actuation.shape[0], envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         actuation[i_g, i_b] = state[i_b, i_g]
+
+
+@qd.kernel
+def kernel_set_rod_mass(start: int, mass: qd.types.ndarray(), verts_info: qd.template()):
+    for i in range(mass.shape[0]):
+        verts_info[start + i].mass = mass[i]
+
+
+@qd.kernel
+def kernel_rod_vertex_coupling(f: int, vertex: int, force: qd.types.ndarray(), hessian: qd.types.ndarray(), solver: qd.template()):
+    value = gs.qd_vec3(0.0, 0.0, 0.0)
+    curvature = qd.Matrix.zero(gs.qd_float, 3, 3)
+    if qd.static(solver.has_mtu):
+        force_m, hessian_m = func_mtu_vertex_terms(f, vertex, 0, solver, solver.mtu)
+        value += force_m
+        curvature += hessian_m
+    if qd.static(solver.has_tissue_attachment):
+        force_a, hessian_a = func_tissue_attachment_vertex_terms(f, vertex, 0, solver, solver.tissue_attachment)
+        value += force_a
+        curvature += hessian_a
+    for i in qd.static(range(3)):
+        force[i] = value[i]
+        for j in qd.static(range(3)):
+            hessian[i, j] = curvature[i, j]
+
+
+@qd.kernel
+def kernel_sweep_nonrod(f: int, sweep: int, solver: qd.template()):
+    for c in qd.static(range(solver._n_colors)):
+        for k, i_b in qd.ndrange((solver._color_offsets[c], solver._color_offsets[c + 1]), solver._B):
+            vertex = solver.color_perm[k]
+            if not solver.rod_vertex[vertex]:
+                relaxation = solver._constraint_dual_relaxation
+                if qd.static(solver.has_rod_contact):
+                    relaxation = 0.0
+                solver._func_solve_vertex(f, vertex, i_b, relaxation, 1.0, False, sweep)
+
+
+@qd.kernel
+def kernel_update_accepted_surface_duals(f: int, solver: qd.template()):
+    for i_c, i_b in qd.ndrange(solver._n_constraints, solver._B):
+        if not solver.env_failed[i_b]:
+            solver._func_dual_update(f, i_c, i_b, solver._constraint_dual_relaxation, 1.0)
+    for i_c, i_b in qd.ndrange(solver._n_angle_constraints, solver._B):
+        if not solver.env_failed[i_b]:
+            solver._func_angle_dual_update(f, i_c, i_b, solver._constraint_dual_relaxation, 1.0)
+
+
+@qd.kernel
+def kernel_finish_mixed_contact(f: int, sweep: int, solver: qd.template()):
+    if qd.static(solver.has_rigid_attachment):
+        for i_r, i_b in qd.ndrange(solver.contact.n_rv, solver._B):
+            func_settle_free_vertex(sweep == solver._n_iterations - 1, i_r, i_b, solver, solver.contact)
+    func_contact_dual_update(f, solver._constraint_dual_relaxation, sweep < solver._n_iterations - 1, solver, solver.contact)
+
+
+@qd.kernel
+def kernel_update_rod_tissue_dual(f: int, solver: qd.template()):
+    for i_a, i_b in qd.ndrange(solver.tissue_attachment.n_attachments, solver._B):
+        if not solver.env_failed[i_b]:
+            func_update_tissue_attachment_dual(f, i_a, i_b, solver, solver.tissue_attachment)
+
+
+@qd.kernel
+def kernel_sweep_rod_attachment(f: int, solver: qd.template(), attachment: qd.template()):
+    for i_b in range(solver._B):
+        if not solver.env_failed[i_b]:
+            for i_f in range(attachment.n_free):
+                func_solve_attachment_link(f, i_f, i_b, solver, attachment)
+    if qd.static(not solver.has_rod_contact):
+        for i_a, i_b in qd.ndrange(attachment.n_attachments, solver._B):
+            if not solver.env_failed[i_b]:
+                func_update_attachment_dual(f, i_a, i_b, solver, attachment)
+
+
+@qd.kernel
+def kernel_update_rod_attachment_dual(f: int, solver: qd.template(), attachment: qd.template()):
+    for i_a, i_b in qd.ndrange(attachment.n_attachments, solver._B):
+        if not solver.env_failed[i_b]:
+            func_update_attachment_dual(f, i_a, i_b, solver, attachment)
 
 
 @qd.data_oriented
@@ -174,6 +256,15 @@ class VBDSolver(Solver):
         self.mtu = None
         self._mtu_units = []
         self._mtu_restraints = []
+        self._rod_models = []
+        self._rod_entities = []
+        self._rod_bundle_specs = []
+        self._rod_bundle_links = ()
+        self._rod_contacts = ()
+
+    @property
+    def has_rod_contact(self):
+        return bool(self._rod_contacts)
 
     @property
     def has_rigid_attachment(self):
@@ -272,6 +363,25 @@ class VBDSolver(Solver):
         if not stiffness > 0.0 or not thickness > 0.0 or friction < 0.0:
             gs.raise_exception("A contact rule needs stiffness > 0, thickness > 0 and friction >= 0.")
         self._contact_rules.append((int(group_a), int(group_b), float(stiffness), float(friction), float(thickness)))
+
+    def add_rod_bundle_link(self, entity_a, node_a, entity_b, node_b, stiffness, rest_length):
+        """Declare an elastic distance tie. Diagonal ties provide bundle shear stiffness."""
+        if self._scene.is_built:
+            gs.raise_exception("Declare rod bundle links before scene.build().")
+        for entity, node in ((entity_a, node_a), (entity_b, node_b)):
+            if entity.scene is not self._scene or not isinstance(entity.material, gs.materials.VBD.Rod):
+                gs.raise_exception("Bundle links require rod entities in this scene.")
+            if not isinstance(node, int) or not 0 <= node < entity.n_vertices:
+                gs.raise_exception("Bundle node must be an integer index within its rod.")
+        if entity_a is entity_b:
+            gs.raise_exception("Bundle links must connect distinct rods.")
+        if not 0 < stiffness < float("inf") or not 0 < rest_length < float("inf"):
+            gs.raise_exception("Bundle stiffness and rest length must be finite and positive.")
+        pair = tuple(sorted((entity_a.v_start + node_a, entity_b.v_start + node_b)))
+        if any(spec[0] == pair for spec in self._rod_bundle_specs):
+            gs.raise_exception("Duplicate rod bundle link.")
+        self._rod_bundle_specs.append((pair, rest_length, stiffness))
+        return len(self._rod_bundle_specs) - 1
 
     def _resolve_point_anchor(self, anchor):
         """A `TissueAnchor` or `SurfaceAnchor` as (entity, four vertex indices, four weights), the one form
@@ -789,6 +899,50 @@ class VBDSolver(Solver):
         self._n_vverts = self.n_vverts
         self._n_vfaces = self.n_vfaces
 
+        if any(isinstance(entity.material, gs.materials.VBD.Rod) for entity in self._entities):
+            if self._sim.requires_grad or self._B != 1 or gs.device.type not in ("cpu", "cuda") or gs.tc_float != torch.float64:
+                gs.raise_exception(
+                    "The passive rod reference requires CPU or CUDA, precision=64, one environment, and no adjoint."
+                )
+            if self._prescribed_colliders:
+                gs.raise_exception("Prescribed rigid rod colliders are not implemented.")
+            if (
+                self._floor_height != -float("inf")
+                or self._self_thickness > 0
+                or self._damping > 0
+                or self._mtu_restraints
+            ):
+                gs.raise_exception(
+                    "Rod scenes do not support floor, self-thickness, damping or rotary restraints."
+                )
+            self._rod_entities = [e for e in self._entities if isinstance(e.material, gs.materials.VBD.Rod)]
+            for entity in self._rod_entities:
+                if (
+                    len(entity.distance_constraints)
+                    or len(entity.angle_constraints)
+                ):
+                    gs.raise_exception("Rod extra constraint terms are not implemented.")
+                material = entity.material
+                rotation = torch.tensor(entity.morph.quat, dtype=gs.tc_float)
+                offset = torch.tensor(entity.morph.offset_quat, dtype=gs.tc_float)
+                rotation = quat_multiply(rotation, offset)
+                frames = torch.tensor(entity.morph.frames, dtype=gs.tc_float)
+                frames = quat_multiply(rotation.expand_as(frames), frames)
+                self._rod_models.append(
+                    RodModel(
+                        torch.tensor(tensor_to_array(entity.init_positions), dtype=gs.tc_float),
+                        frames,
+                        entity.morph.radius,
+                        RodParameters(
+                            material.rho,
+                            material.stretch_x,
+                            material.stretch_y,
+                            material.stretch_z,
+                            material.volume,
+                            material.surface_bend,
+                        ),
+                    )
+                )
         if self.is_active:
             self.init_vertex_fields()
             self.init_element_fields()
@@ -799,6 +953,20 @@ class VBDSolver(Solver):
 
             for entity in self._entities:
                 entity._add_to_solver()
+
+            if self._rod_models:
+                self.rod_vertex = qd.field(dtype=gs.qd_int, shape=self._n_vertices)
+                mask = np.zeros(self._n_vertices, dtype=gs.np_int)
+                for entity, model in zip(self._rod_entities, self._rod_models):
+                    kernel_set_rod_mass(entity.v_start, model.mass, self.verts_info)
+                    mask[entity.v_start:entity.v_start + entity.n_vertices] = 1
+                self.rod_vertex.from_numpy(mask)
+                if self._rod_bundle_specs:
+                    self._rod_bundle_links = (RodBundleLinks(
+                        torch.tensor([spec[0] for spec in self._rod_bundle_specs], dtype=torch.int64),
+                        torch.tensor([spec[1] for spec in self._rod_bundle_specs], dtype=gs.tc_float),
+                        torch.tensor([spec[2] for spec in self._rod_bundle_specs], dtype=gs.tc_float),
+                    ),)
 
             elems = np.concatenate([entity._v_start + entity.elems for entity in self._entities]).astype(np.int64)
             tris = np.concatenate(
@@ -894,6 +1062,14 @@ class VBDSolver(Solver):
             attached_entities = [
                 entity for entity in self._entities if entity._rigid_links or entity._barycentric_links
             ]
+            if self._rod_models and self._sim.rigid_solver.is_active:
+                if not attached_entities and any(not link.is_fixed for link in self._sim.rigid_solver.links):
+                    gs.raise_exception("Rod rigid scenes require two-way rigid coupling through attachments.")
+                if any(
+                    joint.type not in (gs.JOINT_TYPE.FREE, gs.JOINT_TYPE.FIXED)
+                    for joint in self._sim.rigid_solver.joints
+                ):
+                    gs.raise_exception("The rod reference supports free and fixed links only.")
             if attached_entities:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
             # Articulated and gradient paths statically inline every sweep and colour. The ordinary forward path
@@ -916,7 +1092,18 @@ class VBDSolver(Solver):
                 if self._sim.requires_grad:
                     gs.raise_exception("Tissue attachments have no adjoint yet, so they cannot be used with requires_grad.")
                 self.tissue_attachment = VBDTissueAttachment(self, self._tissue_attachment_pairs)
-            if self._contact_rules:
+            mesh_entities = [entity for entity in self._entities if entity not in self._rod_entities]
+            rod_groups = {entity.material.collision_group for entity in self._rod_entities}
+            mesh_groups = {entity.material.collision_group for entity in mesh_entities}
+            rod_rules = [rule for rule in self._contact_rules if rod_groups.intersection(rule[:2])]
+            mesh_rules = [rule for rule in self._contact_rules if not rod_groups.intersection(rule[:2])]
+            if self._rod_models and mesh_rules and self._contact_ccd:
+                gs.raise_exception("Mixed rod/mesh scenes require contact_ccd=False; mesh rescaling cannot change committed rod states.")
+            if rod_rules:
+                if rod_groups.intersection(mesh_groups):
+                    gs.raise_exception("Rod and mesh contact groups must be distinct.")
+                self._rod_contacts = (RodContact(self, rod_rules),)
+            if mesh_rules:
                 if self._sim.requires_grad:
                     gs.raise_exception("Mesh contact has no adjoint, so it cannot be used with requires_grad.")
                 rigid = self._sim.rigid_solver
@@ -951,10 +1138,10 @@ class VBDSolver(Solver):
                             f"pose, fix them, or leave the filter off."
                         )
                 self.contact = VBDContact(
-                    self, self._entities, self._rigid_colliders, self._prescribed_colliders, self._contact_rules
+                    self, mesh_entities, self._rigid_colliders, self._prescribed_colliders, mesh_rules
                 )
                 kernel_reset_contact(torch.arange(self._B, dtype=torch.int32), self.contact, rigid.dyn_state)
-            elif self._rigid_colliders or self._prescribed_colliders:
+            elif not rod_rules and (self._rigid_colliders or self._prescribed_colliders):
                 gs.raise_exception("Colliders were declared without any contact rule.")
             if self._mtu_units:
                 if self._sim.requires_grad:
@@ -1729,6 +1916,10 @@ class VBDSolver(Solver):
             force_c, hessian_c = func_contact_vertex_terms(f, i_v, i_b, self, self.contact)
             force += qd.cast(force_c, self._acc)
             H += qd.cast(hessian_c, self._acc)
+        if qd.static(self.has_rod_contact):
+            hessian_r = self._rod_contacts[0].surface_hessian[i_v]
+            force += qd.cast(self._rod_contacts[0].surface_force[i_v] - hessian_r @ (x - self._rod_contacts[0].surface_reference[i_v]), self._acc)
+            H += qd.cast(hessian_r, self._acc)
         if qd.static(self.has_mtu):
             force_m, hessian_m = func_mtu_vertex_terms(f, i_v, i_b, self, self.mtu)
             force += qd.cast(force_m, self._acc)
@@ -2277,6 +2468,111 @@ class VBDSolver(Solver):
         sweeps to a relative force tolerance, one dual update, until the relative constraint violation is below its
         own tolerance too. (A dual update on an unconverged iterate overshoots at the stiffness cap and limit-cycles
         instead of converging.)"""
+        if self._rod_models:
+            pos = torch.empty((self._B, self._n_vertices, 3), dtype=gs.tc_float)
+            velocity = torch.empty_like(pos)
+            self._kernel_get_state(f, pos, velocity)
+            predicted = torch.empty_like(pos)
+            unused_velocity = torch.empty_like(pos)
+            self._kernel_get_state(f + 1, predicted, unused_velocity)
+            pinned = qd_to_torch(self.verts_info.pinned).bool()
+            gravity = self.get_gravity().reshape(-1, 3)[0]
+            if self.has_rod_contact:
+                contact = self._rod_contacts[0]
+                contact.begin(pos[0])
+                for index, (entity, model) in enumerate(zip(self._rod_entities, self._rod_models)):
+                    begin, end = entity.v_start, entity.v_start + entity.n_vertices
+                    target = pos[0, begin:end].clone()
+                    target[pinned[begin:end]] = predicted[0, begin:end][pinned[begin:end]]
+                    view = contact.view(index)
+                    view.refresh(pos[0, begin:end], model.scale)
+                    if not view.allowed(pos[0, begin:end], model.scale, target, model.scale):
+                        gs.raise_exception("Prescribed rod motion exceeds collision clearance; reduce its step.")
+                    predicted[0, begin:end] = target
+                target_surface = pos[0].clone()
+                nonrod = ~qd_to_torch(self.rod_vertex).bool()
+                surface_pins = pinned & nonrod
+                target_surface[surface_pins] = predicted[0, surface_pins]
+                contact.accept_surface_motion(target_surface, prescribed=True)
+                predicted[0, nonrod] = target_surface[nonrod]
+                contact.positions = [predicted[0, e.v_start:e.v_start+e.n_vertices] for e in self._rod_entities]
+                contact.surface_positions = predicted[0].clone()
+            for entity, model in zip(self._rod_entities, self._rod_models):
+                begin, end = entity.v_start, entity.v_start + entity.n_vertices
+                model.begin(pos[0, begin:end], velocity[0, begin:end], self._substep_dt, gravity)
+            if self.has_rigid_attachment:
+                attachment = self.rigid_attachment
+                vertices = qd_to_torch(attachment.info.verts).long()
+                weights = qd_to_torch(attachment.info.weights)
+                links = qd_to_torch(attachment.info.link).long()
+                local = qd_to_torch(attachment.info.local_pos)
+            for sweep in range(self._n_iterations):
+                self._kernel_set_state(f + 1, predicted, velocity)
+                if len(self._rod_entities) != len(self._entities):
+                    if self.has_rod_contact:
+                        contact.surface_positions = predicted[0].clone()
+                        contact.surface_terms()
+                    kernel_sweep_nonrod(f, sweep, self)
+                    self._kernel_get_state(f + 1, predicted, unused_velocity)
+                    if self.has_rod_contact:
+                        contact.accept_surface_motion(predicted[0])
+                        self._kernel_set_state(f + 1, predicted, velocity)
+                        if self._n_constraints or self._n_angle_constraints:
+                            kernel_update_accepted_surface_duals(f, self)
+                if self.has_rigid_attachment:
+                    link_pos = qd_to_torch(attachment.link_pose.pos, transpose=True)[0]
+                    link_quat = qd_to_torch(attachment.link_pose.quat, transpose=True)[0]
+                    stiffness = qd_to_torch(attachment.state.stiffness, transpose=True)[0]
+                    multiplier = qd_to_torch(attachment.state.multiplier, transpose=True)[0]
+                    previous = qd_to_torch(attachment.previous_error, transpose=True)[0]
+                    target = (
+                        link_pos[links]
+                        + (quat_matrix(link_quat[links]) @ local[:, :, None])[:, :, 0]
+                        + attachment.alpha * previous
+                        - multiplier / stiffness[:, None]
+                    )
+                for index, (entity, model) in enumerate(zip(self._rod_entities, self._rod_models)):
+                    begin, end = entity.v_start, entity.v_start + entity.n_vertices
+                    terms = ()
+                    if self.has_rigid_attachment:
+                        selected = (vertices[:, 0] >= begin) & (vertices[:, 0] < end)
+                        terms = (
+                            RodAttachment(vertices[selected] - begin, weights[selected], target[selected], stiffness[selected]),
+                        )
+                    terms += tuple(RodBundleView(link, predicted[0], begin) for link in self._rod_bundle_links)
+                    contacts = (contact.view(index),) if self.has_rod_contact else ()
+                    # This callback must refresh native positions for each vertex,
+                    # because Hill tension and tissue reactions depend on its trial.
+                    def vertex_terms(x, index):
+                        predicted[0, begin:end] = x
+                        self._kernel_set_state(f + 1, predicted, velocity)
+                        force = x.new_zeros(3)
+                        hessian = x.new_zeros((3, 3))
+                        kernel_rod_vertex_coupling(f, begin + index, force, hessian, self)
+                        return force, hessian
+
+                    coupling = (vertex_terms,) if self.has_mtu or self.has_tissue_attachment else ()
+                    predicted[0, begin:end] = model.sweep(
+                        predicted[0, begin:end], pinned[begin:end], terms, contacts, coupling
+                    )
+                self._kernel_set_state(f + 1, predicted, velocity)
+                if self.has_rigid_attachment:
+                    if self.has_rod_contact:
+                        contact.rigid_terms()
+                    kernel_sweep_rod_attachment(f, self, attachment)
+                    if self.has_rod_contact:
+                        contact.accept_rigid_motion()
+                        kernel_update_rod_attachment_dual(f, self, attachment)
+                if self.has_tissue_attachment:
+                    kernel_update_rod_tissue_dual(f, self)
+                if self.has_contact:
+                    kernel_finish_mixed_contact(f, sweep, self)
+            if self.has_rod_contact:
+                contact.validate()
+                contact.validate_sweep()
+            for entity, model in zip(self._rod_entities, self._rod_models):
+                model.end(predicted[0, entity.v_start : entity.v_start + entity.n_vertices])
+            return
         if not self._sim.requires_grad or not self._grad_converge:
             if self.rigid_attachment is not None and self.rigid_attachment.is_articulated:
                 rigid = self.rigid_attachment.rigid
@@ -3482,6 +3778,17 @@ class VBDSolver(Solver):
         The sum covers the inertia and the tetrahedra only. It omits the rigid, attachment, contact and
         muscle-tendon terms, and it has no shell term, so it refuses a scene that holds shell elements rather
         than return a number that is quietly missing most of the energy."""
+        if self._rod_models:
+            if self.has_rigid_attachment or self.has_rod_contact or self.has_tissue_attachment or self.has_mtu or self._rod_bundle_links or len(self._rod_entities) != len(self._entities):
+                gs.raise_exception("Coupled rod incremental energy requires rigid, attachment and contact terms.")
+            positions = torch.empty((self._B, self._n_vertices, 3), dtype=gs.tc_float)
+            velocities = torch.empty_like(positions)
+            self._kernel_get_state(f + 1, positions, velocities)
+            energies = [
+                model.incremental_energy(positions[0, entity.v_start : entity.v_start + entity.n_vertices])
+                for entity, model in zip(self._rod_entities, self._rod_models)
+            ]
+            return torch.stack(energies).sum().reshape(1).numpy()
         if self.n_triangles > 0 or self.n_stencils > 0:
             gs.raise_exception(
                 "compute_energy has no shell term, so it would under-report a scene with triangles or bending "
@@ -3700,6 +4007,10 @@ class VBDSolver(Solver):
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
             envs_idx = sanitize_index(envs_idx, -1, self._B, 0, "envs_idx")
+            if len(state.rod_states) != len(self._rod_models):
+                gs.raise_exception("Rod snapshot entity count differs from the scene.")
+            for model, rod_state in zip(self._rod_models, state.rod_states):
+                model.set_state(rod_state)
             kernel_set_vertex_state(f, envs_idx, state.pos, state.vel, self.verts)
             kernel_set_muscle_state(envs_idx, state.muscle_actuation, self.muscle_actu)
             if self.rigid_attachment is not None:
@@ -3718,8 +4029,6 @@ class VBDSolver(Solver):
             )
             if self.contact is not None:
                 kernel_reset_contact(envs_idx, self.contact, self._sim.rigid_solver.dyn_state)
-            if self.mtu is not None:
-                kernel_reset_mtu(envs_idx, self.mtu)
                 if state.prescribed_start_pos is not None:
                     kernel_set_prescribed_state(
                         envs_idx,
@@ -3730,6 +4039,12 @@ class VBDSolver(Solver):
                         self.contact,
                     )
 
+            if self.mtu is not None:
+                if state.mtu_state is None:
+                    kernel_reset_mtu(envs_idx, self.mtu)
+                else:
+                    self.mtu.set_snapshot(state.mtu_state, envs_idx)
+
     def get_state(self, f):
         if not self.is_active:
             return None
@@ -3738,6 +4053,9 @@ class VBDSolver(Solver):
                 "An environment failed a contact step; its state is diagnostic only. Reset it before taking a snapshot."
             )
         state = VBDSolverState(self._scene)
+        state.rod_states = tuple(model.get_state() for model in self._rod_models)
+        if self.mtu is not None:
+            state.mtu_state = self.mtu.get_snapshot()
         self._kernel_get_state(f, state.pos, state.vel)
         state.muscle_actuation = qd_to_torch(self.muscle_actu, transpose=True, copy=True).contiguous()
         if self.rigid_attachment is not None:
@@ -3779,7 +4097,7 @@ class VBDSolver(Solver):
 
     def get_state_render(self, f):
         """Same contract as `FEMSolver.get_state_render`: (vverts_pos, vverts_uvs, vfaces_indices)."""
-        if not self.is_active or self._n_vverts == 0:
+        if not self.is_active:
             return None, None, None
         self._kernel_get_state_render(f)
         return self.vverts_render.pos, self.vverts_uvs, self.vfaces_indices

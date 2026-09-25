@@ -247,6 +247,14 @@ class VBDEntity(Entity):
         A `TetMesh` morph carries its own tetrahedral connectivity. It skips tetrahedralization and welding: its
         `verts`, `elems` and `faces` pass through to `instantiate` and the render mesh unchanged.
         """
+        if isinstance(self._morph, gs.options.morphs.Rod):
+            if not isinstance(self.material, gs.materials.VBD.Rod):
+                gs.raise_exception("Rod morphs require a VBD.Rod material.")
+            self._vgeoms = gs.List()
+            self.instantiate(self._morph.verts + self._morph.pos, np.empty((0, 4), dtype=gs.np_int))
+            return
+        if isinstance(self.material, gs.materials.VBD.Rod):
+            gs.raise_exception("VBD.Rod materials require a Rod morph.")
         if isinstance(self._morph, gs.options.morphs.TriMesh):
             vmesh = gs.Mesh.from_attrs(verts=self._morph.verts, faces=self._morph.faces, surface=self._surface)
             self._vgeoms = gs.List(
@@ -333,7 +341,21 @@ class VBDEntity(Entity):
 
         verts_numpy = tensor_to_array(self.init_positions, dtype=gs.np_float)
 
-        if isinstance(self.material, gs.materials.VBD.Shell):
+        if isinstance(self.material, gs.materials.VBD.Rod):
+            self._solver._kernel_add_elements(
+                self._v_start,
+                self._el_start,
+                verts_numpy,
+                self.elems,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        elif isinstance(self.material, gs.materials.VBD.Shell):
             self._add_shell_to_solver(verts_numpy)
         else:
             elems_np = self.elems.astype(gs.np_int, copy=False)
@@ -522,6 +544,11 @@ class VBDEntity(Entity):
     def get_positions(self):
         """Positions of the entity's vertices, shape (B, n_vertices, 3)."""
         return self.get_state().pos
+
+    def get_rod_state(self):
+        """Cross-section scale, segment frames and director velocity for this rod entity."""
+        index = self._solver._rod_entities.index(self)
+        return self._solver._rod_models[index].get_state()
 
     def set_friction_frame(self, tangent):
         """
@@ -818,6 +845,8 @@ class VBDEntity(Entity):
     def _get_morph_identifier(self) -> str:
         morph = self._morph
 
+        if isinstance(morph, gs.morphs.Rod):
+            return "vbd_rod"
         if isinstance(morph, gs.morphs.Box):
             return "vbd_box"
         if isinstance(morph, gs.morphs.Sphere):
