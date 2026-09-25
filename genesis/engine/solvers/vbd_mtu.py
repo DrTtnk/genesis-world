@@ -409,6 +409,21 @@ def func_refresh_mtu_link_anchors(i_l, i_b, pos, quat, mtu: qd.template()):
 
 
 @qd.func
+def func_refresh_mtu_anchors_solved(i_b, solver: qd.template(), mtu: qd.template(), dyn_state: DynState):
+    """Anchor positions at the poses VBD is solving. The rigid solver's table still holds the previous substep
+    for a free body until the commit, so a free body's anchors are placed from the attachment's pose table
+    instead: the prediction at the start of a substep, the solved pose at its end."""
+    func_refresh_mtu_anchors(i_b, mtu, dyn_state)
+    if qd.static(solver.has_rigid_attachment):
+        for i_f in range(solver.rigid_attachment.n_free):
+            i_l = solver.rigid_attachment.free_info[i_f].link
+            func_refresh_mtu_link_anchors(
+                i_l, i_b, solver.rigid_attachment.link_pose[i_l, i_b].pos,
+                solver.rigid_attachment.link_pose[i_l, i_b].quat, mtu,
+            )
+
+
+@qd.func
 def func_anchor_pos(f, i_a, i_b, solver: qd.template(), mtu: qd.template()):
     """World position of one anchor at the current iterate."""
     pos = mtu.anchor[i_a].local
@@ -606,7 +621,7 @@ def kernel_begin_mtu(f: int, solver: qd.template(), mtu: qd.template(), dyn_stat
     and the fibre state of the sweeps is frozen at the value the previous substep left."""
     for i_b in range(solver._B):
         if not solver.env_failed[i_b]:
-            func_refresh_mtu_anchors(i_b, mtu, dyn_state)
+            func_refresh_mtu_anchors_solved(i_b, solver, mtu, dyn_state)
     for i_m, i_b in qd.ndrange(mtu.n_units, solver._B):
         if not solver.env_failed[i_b] and mtu.unit[i_m].kind == UNIT_HILL:
             if not mtu.state[i_m, i_b].initialised:
@@ -634,7 +649,7 @@ def kernel_end_mtu(f: int, solver: qd.template(), mtu: qd.template(), dyn_state:
     substep ended with. These are the reported quantities; the sweeps never read them back."""
     for i_b in range(solver._B):
         if not solver.env_failed[i_b]:
-            func_refresh_mtu_anchors(i_b, mtu, dyn_state)
+            func_refresh_mtu_anchors_solved(i_b, solver, mtu, dyn_state)
     for i_m, i_b in qd.ndrange(mtu.n_units, solver._B):
         if not solver.env_failed[i_b]:
             length = func_route_length(f, i_m, i_b, solver, mtu)
