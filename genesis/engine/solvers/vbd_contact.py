@@ -862,38 +862,94 @@ def func_contact_cv_terms(f, cv, i_b, solver: qd.template(), contact: qd.templat
 
 
 @qd.func
+def func_pair_terms(f, code, i_b, solver: qd.template(), contact: qd.template()):
+    """One candidate pair, named by a slot code: its multiplier y, normal n, stiffness k, friction scale and slide,
+    its four participant contact vertices, their weights (dd/dx_j = w_j n) and which participant the slot is.
+    Point-triangle participants are the point and the triangle's corners; edge-edge ones the two ends of each
+    edge."""
+    role = code % 8
+    i_p = code // 8
+    y = gs.qd_float(0.0)
+    n = gs.qd_vec3(0.0, 0.0, 1.0)
+    k = gs.qd_float(0.0)
+    scale = gs.qd_float(0.0)
+    slide = gs.qd_vec3(0.0, 0.0, 0.0)
+    cvs = qd.Vector([0, 0, 0, 0], dt=gs.qd_int)
+    weights = gs.qd_vec4(0.0, 0.0, 0.0, 0.0)
+    own = role
+    if role < ROLE_EDGE_A:
+        y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
+        k = contact.pt_pairs[i_p, i_b].k
+        tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+        cvs = qd.Vector([contact.pt_pairs[i_p, i_b].a, tri[0], tri[1], tri[2]], dt=gs.qd_int)
+        weights = gs.qd_vec4(1.0, -w[0], -w[1], -w[2])
+    else:
+        i_p = i_p - contact.pair_cap
+        y, n, s_, t_, scale, slide = func_ee_forces(f, i_p, i_b, solver, contact)
+        k = contact.ee_pairs[i_p, i_b].k
+        ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
+        eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
+        cvs = qd.Vector([ea[0], ea[1], eb[0], eb[1]], dt=gs.qd_int)
+        weights = gs.qd_vec4(1.0 - s_, s_, -(1.0 - t_), -t_)
+        own = role - ROLE_EDGE_A
+    return y, n, k, scale, slide, cvs, weights, own
+
+
+@qd.func
 def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact: qd.template()):
     """Wrench (force, torque about `origin`) and 6x6 Gauss-Newton block of the contact pairs of every rigid contact
-    vertex of link i_l, for a free link with the world-frame rotation increment of the attachment block."""
+    vertex of link i_l, for a free link with the world-frame rotation increment of the attachment block.
+
+    The block is assembled per pair, not per vertex. When two or three participants of one pair ride on this link
+    (an edge of the bone against an edge, or a face of the bone against a point), they move together, so the
+    pair's curvature is k T^T n n^T T with T = sum_j w_j J_j over them. Summing each vertex's own k w_j^2 n n^T
+    instead drops the cross terms and underestimates the stiffness by (sum w_j)^2 / sum w_j^2, between one and
+    three: where contact dominates the block, as at a 1 ms substep on a light bone, the Newton step then
+    overshoots by that factor and the sweep oscillates rather than converges. A pair is taken once, through
+    its first participant on the link."""
     force6 = qd.Vector.zero(gs.qd_float, 6)
     hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
     # A vertex the search gave no pair contributes an exactly zero force and an exactly zero block, so leaving it
     # out changes no bit of the result. `link_active` holds the rest, in the order `link_rv` has them, which is
     # what keeps the sum below independent of anything but the mesh.
     base = contact.link_rv_offset[i_l]
+    identity = qd.Matrix.identity(gs.qd_float, 3)
     for c in range(base, base + contact.link_active_n[i_l, i_b]):
-        i_r = contact.link_active[c, i_b]
-        cv = contact.rv_cv[i_r]
-        force, hessian = func_contact_cv_terms(f, cv, i_b, solver, contact)
-        r = contact.rv_pos[i_r, i_b] - origin
-        jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
-        for row in qd.static(range(3)):
-            jacobian[row, row] = 1.0
-        jacobian[0, 4] = r[2]
-        jacobian[0, 5] = -r[1]
-        jacobian[1, 3] = -r[2]
-        jacobian[1, 5] = r[0]
-        jacobian[2, 3] = r[1]
-        jacobian[2, 4] = -r[0]
-        force6 += jacobian.transpose() @ force
-        hessian6 += jacobian.transpose() @ hessian @ jacobian
+        cv = contact.rv_cv[contact.link_active[c, i_b]]
+        for slot in range(contact.cv_slot_offset[cv, i_b], contact.cv_slot_offset[cv + 1, i_b]):
+            y, n, k, scale, slide, cvs, weights, own = func_pair_terms(
+                f, contact.cv_slot[slot, i_b], i_b, solver, contact
+            )
+            first = 4
+            for j in qd.static(range(4)):
+                if first == 4 and contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
+                    first = j
+            if y < 0.0 and own == first:
+                T = qd.Matrix.zero(gs.qd_float, 3, 6)
+                for j in qd.static(range(4)):
+                    if contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
+                        r = contact.rv_pos[contact.cv_info[cvs[j]].ref, i_b] - origin
+                        J = qd.Matrix.zero(gs.qd_float, 3, 6)
+                        for row in qd.static(range(3)):
+                            J[row, row] = 1.0
+                        J[0, 4] = r[2]
+                        J[0, 5] = -r[1]
+                        J[1, 3] = -r[2]
+                        J[1, 5] = r[0]
+                        J[2, 3] = r[1]
+                        J[2, 4] = -r[0]
+                        T += weights[j] * J
+                force6 += T.transpose() @ (-(y * n + scale * slide))
+                nn = n.outer_product(n)
+                hessian6 += T.transpose() @ (k * nn + scale * (identity - nn)) @ T
     return force6, hessian6
 
 
 @qd.func
 def func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver: qd.template(), contact: qd.template()):
     """Generalized force and Gauss-Newton curvature of the contact pairs of every rigid contact vertex that hinge
-    coordinate i_d moves: the vertex Jacobian is axis x (p - pivot)."""
+    coordinate i_d moves: a participant's Jacobian is axis x (p - pivot). Assembled per pair, for the reason
+    `func_contact_link_terms` gives, taking a pair once through its first participant that the coordinate moves."""
     force = gs.qd_float(0.0)
     curvature = gs.qd_float(0.0)
     for i_l in range(contact.dof_moves_link.shape[1]):
@@ -901,12 +957,29 @@ def func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver: qd.template(), cont
             # the same narrowed list as in func_contact_link_terms, for the same reason
             base = contact.link_rv_offset[i_l]
             for c in range(base, base + contact.link_active_n[i_l, i_b]):
-                i_r = contact.link_active[c, i_b]
-                cv = contact.rv_cv[i_r]
-                force_v, hessian_v = func_contact_cv_terms(f, cv, i_b, solver, contact)
-                jacobian = axis.cross(contact.rv_pos[i_r, i_b] - pivot)
-                force += jacobian.dot(force_v)
-                curvature += jacobian.dot(hessian_v @ jacobian)
+                cv = contact.rv_cv[contact.link_active[c, i_b]]
+                for slot in range(contact.cv_slot_offset[cv, i_b], contact.cv_slot_offset[cv + 1, i_b]):
+                    y, n, k, scale, slide, cvs, weights, own = func_pair_terms(
+                        f, contact.cv_slot[slot, i_b], i_b, solver, contact
+                    )
+                    # a tissue participant's owner is negative, so it is tested before it indexes anything
+                    moved = qd.Vector([0, 0, 0, 0], dt=gs.qd_int)
+                    for j in qd.static(range(4)):
+                        if contact.cv_info[cvs[j]].kind == 1:
+                            if contact.dof_moves_link[i_d, contact.cv_info[cvs[j]].owner]:
+                                moved[j] = 1
+                    first = 4
+                    for j in qd.static(range(4)):
+                        if first == 4 and moved[j] == 1:
+                            first = j
+                    if y < 0.0 and own == first:
+                        g = gs.qd_vec3(0.0, 0.0, 0.0)
+                        for j in qd.static(range(4)):
+                            if moved[j] == 1:
+                                g += weights[j] * axis.cross(contact.rv_pos[contact.cv_info[cvs[j]].ref, i_b] - pivot)
+                        force += g.dot(-(y * n + scale * slide))
+                        g_n = g.dot(n)
+                        curvature += k * g_n * g_n + scale * (g.dot(g) - g_n * g_n)
     return force, curvature
 
 
