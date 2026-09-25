@@ -261,6 +261,56 @@ def test_a_response_that_outruns_the_margin_triggers_a_rebuild_not_a_refusal():
     assert int(diagnostics.rebuild_count[0]) == 2, "the spent budget must force a second rebuild next substep"
 
 
+@pytest.mark.parametrize("speed", [0.0, 0.075])
+def test_a_rebuild_refills_the_budget_so_later_substeps_reuse_the_candidate_set(speed):
+    """Wang et al. 2022 Eq. 4 with a real D_max: a rebuild searches out to `margin_max`, so its candidate set
+    stays a safe superset until twice the accumulated motion has spent `margin_max - margin`. A block gliding
+    in empty space at `speed` must therefore rebuild exactly when that bound says so, and a block at rest only
+    once, at the cold start. Before the refill existed the budget stayed at the reset value of zero minus the
+    motion, below `margin` forever, and every substep rebuilt whatever `margin_max` was set to."""
+    margin, margin_max, dt, steps = 2e-4, 1e-3, 2e-3, 12
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=dt, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(
+            n_iterations=4,
+            floor_height=-1e3,
+            raise_on_env_failure=False,
+            contact_margin=margin,
+            contact_margin_max=margin_max,
+        ),
+        show_viewer=False,
+    )
+    plate = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.2, 0.2, 0.002), pos=(0.0, 0.0, 0.0), fixed=True),
+        material=gs.materials.Rigid(),
+    )
+    block = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.02, 0.02, 0.02), pos=(0.0, 0.0, 0.1), nobisect=False, maxvolume=1e-6),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.3, collision_group=1),
+    )
+    scene.vbd_solver.add_rigid_collider(plate.links[0], collision_group=0)
+    scene.vbd_solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.0, thickness=2e-4)
+    scene.build()
+    state = scene.vbd_solver.get_state(0)
+    state._vel[:, block.v_start : block.v_start + block.n_vertices] = torch.tensor(
+        (speed, 0.0, 0.0), dtype=state._vel.dtype, device=state._vel.device
+    )
+    scene.vbd_solver.set_state(0, state)
+    budget, expected = 0.0, 0
+    for _ in range(steps):
+        scene.step()
+        motion = float(scene.vbd_solver.contact_diagnostics().max_tissue_motion[0])
+        assert motion == pytest.approx(speed * dt, rel=1e-4, abs=1e-12), "the block must glide untouched"
+        if budget < margin:
+            expected, budget = expected + 1, margin_max
+        budget -= 2.0 * motion
+    rebuilds = int(scene.vbd_solver.contact_diagnostics().rebuild_count[0])
+    print(f"speed {speed} m/s: {rebuilds} rebuilds in {steps} substeps, the bound expects {expected}")
+    assert 1 <= expected < steps, "fixture sanity check: the bound must allow reuse"
+    assert rebuilds == expected
+
+
 def test_a_tunnelling_block_without_the_filter_is_still_refused():
     """With the pairs found but no filter to rescale the substep, one penalty sweep cannot stop 16 mm of travel
     inside a 0.2 mm layer, and the run must fail loudly rather than pass the block through the plate."""

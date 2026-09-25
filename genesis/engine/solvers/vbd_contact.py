@@ -1109,6 +1109,8 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
             if contact.d_budget[i_b] < contact.margin:
                 contact.rebuilding[i_b] = 1
                 contact.rebuild_count[i_b] += 1
+                # The build below searches out to margin_max, so that is the bound it hands the next substeps.
+                contact.d_budget[i_b] = contact.margin_max
     for i_r, i_b in qd.ndrange(contact.n_rv, solver._B):
         if not solver.env_failed[i_b]:
             i_l = contact.rv_link[i_r]
