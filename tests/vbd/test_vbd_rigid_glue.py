@@ -163,3 +163,63 @@ def test_a_vertex_cannot_be_both_glued_and_attached():
     column.add_rigid_glue(np.array([0, 1]), bone.links[0])
     with pytest.raises(gs.GenesisException, match="glued"):
         column.add_rigid_attachments(np.array([1]), bone.links[0])
+
+
+def _column_with_route(anchor_on_glue, glued_corners=4):
+    """The hanging column with a ligament from a world point to its glued bottom: anchored either on four glued
+    column vertices or on the bone at the same rest point."""
+    from genesis.engine.solvers.vbd_mtu import LinkAnchor, TissueAnchor, WorldAnchor
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=DT, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=10, floor_height=-1e3),
+        show_viewer=False,
+    )
+    column = scene.add_entity(
+        morph=gs.morphs.Box(size=(SIDE, SIDE, SIDE), pos=(0.0, 0.0, 0.1), nobisect=False, maxvolume=5e-9),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.4),
+    )
+    bone = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.02, 0.005), pos=(0.0, 0.0, 0.0925)),
+                            material=gs.materials.Rigid(rho=1500.0))
+    rest = tensor_to_array(column.init_positions)
+    bottom = np.flatnonzero(rest[:, 2] < rest[:, 2].min() + 1e-9)
+    elems = np.asarray(column.elems)
+    # a tetrahedron with at least three corners on the bottom face; the anchor sits on its bottom corners
+    tet = next(e for e in elems if np.isin(e, bottom).sum() >= 3)
+    weights = np.where(np.isin(tet, bottom), 1.0, 0.0)
+    weights /= weights.sum()
+    point = weights @ rest[tet]
+    glued = bottom if glued_corners == 4 else np.setdiff1d(bottom, tet[np.isin(tet, bottom)][:1])
+    column.add_rigid_glue(glued, bone.links[0])
+    end = (TissueAnchor(column, tuple(int(v) for v in tet), tuple(float(w) for w in weights)) if anchor_on_glue
+           else LinkAnchor(bone.links[0], world_pos=tuple(point)))
+    scene.vbd_solver.add_ligament([WorldAnchor((0.03, 0.0, 0.08)), end], stiffness=500.0, slack_length=0.02)
+    scene.build()
+    column.set_pinned(rest[:, 2] > rest[:, 2].max() - 1e-9)
+    return scene, bone
+
+
+@pytest.mark.required
+def test_a_route_anchored_on_glued_vertices_pulls_as_if_anchored_on_the_bone():
+    """An anchor whose weighted corners are all glued to one bone is the bone's own point: the build turns it into
+    a link anchor, so the pull reaches the bone block, which assembles every glued vertex's force."""
+    results = []
+    for anchor_on_glue in (True, False):
+        scene, bone = _column_with_route(anchor_on_glue)
+        for _ in range(100):
+            scene.step()
+        state = scene.vbd_solver.mtu_state()
+        results.append((float(state.route_length[0, 0]), float(state.tension[0, 0]), tensor_to_array(bone.get_pos())))
+    (l_glue, t_glue, p_glue), (l_link, t_link, p_link) = results
+    print(f"glued anchor: length {1e3 * l_glue:.6f} mm, tension {t_glue:.6f} N; bone anchor: {1e3 * l_link:.6f} mm, "
+          f"{t_link:.6f} N")
+    assert t_link > 0.0, "fixture sanity check: the ligament must be taut"
+    assert l_glue == pytest.approx(l_link, rel=1e-9)
+    assert t_glue == pytest.approx(t_link, rel=1e-6)
+    np.testing.assert_allclose(p_glue, p_link, atol=1e-12)
+
+
+def test_an_anchor_on_partly_glued_vertices_is_refused():
+    with pytest.raises(gs.GenesisException, match="glued"):
+        _column_with_route(anchor_on_glue=True, glued_corners=3)

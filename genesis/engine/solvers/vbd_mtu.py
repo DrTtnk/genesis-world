@@ -165,6 +165,10 @@ class VBDMTU:
                 )
             return link_poses[0][i_l], link_poses[1][i_l]
 
+        # which link carries each glued vertex (-1 for a free one): an anchor on glued vertices is a link anchor
+        glue_link = (
+            solver.rigid_attachment.glue_link.to_numpy() if solver._has_glue else np.full(solver._n_vertices, -1)
+        )
         anchor_kind, anchor_link, anchor_local, anchor_verts, anchor_weights, anchor_unit = [], [], [], [], [], []
         offsets = [0]
         for i_m, (_, anchors, _, _) in enumerate(units):
@@ -199,11 +203,32 @@ class VBDMTU:
                     anchor_verts.append(tuple(int(anchor.entity.v_start + v) for v in triangle) + (0,))
                     anchor_weights.append(tuple(anchor.weights) + (0.0,))
                 else:
-                    anchor_kind.append(KIND_TISSUE)
-                    anchor_link.append(-1)
-                    anchor_local.append((0.0, 0.0, 0.0))
-                    anchor_verts.append(tuple(anchor.entity.v_start + v for v in anchor.vertices))
-                    anchor_weights.append(anchor.weights)
+                    verts = tuple(anchor.entity.v_start + v for v in anchor.vertices)
+                    carriers = {int(glue_link[v]) for v, w in zip(verts, anchor.weights) if w != 0.0}
+                    if carriers == {-1}:
+                        anchor_kind.append(KIND_TISSUE)
+                        anchor_link.append(-1)
+                        anchor_local.append((0.0, 0.0, 0.0))
+                        anchor_verts.append(verts)
+                        anchor_weights.append(anchor.weights)
+                    elif len(carriers) == 1:
+                        # Every weighted corner rides on one link, so the anchor is that link's own point: a link
+                        # anchor at the same rest position is exactly equivalent, and its pull reaches the block.
+                        (i_l,) = carriers
+                        rest = tensor_to_array(anchor.entity.init_positions)
+                        point = np.einsum("c,cd->d", np.asarray(anchor.weights, dtype=np.float64),
+                                          rest[np.asarray(anchor.vertices)])
+                        pos, quat = pose_of(i_l)
+                        anchor_kind.append(KIND_LINK)
+                        anchor_link.append(i_l)
+                        anchor_local.append(tuple(gu.inv_transform_by_quat(point - pos, quat)))
+                        anchor_verts.append((0, 0, 0, 0))
+                        anchor_weights.append((0.0, 0.0, 0.0, 0.0))
+                    else:
+                        gs.raise_exception(
+                            "A route anchor's corners are partly glued, or glued to different links: glue all of "
+                            "them to one link, or none."
+                        )
             offsets.append(len(anchor_kind))
         self.n_anchors = len(anchor_kind)
 
