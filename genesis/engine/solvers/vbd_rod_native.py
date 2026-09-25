@@ -118,6 +118,8 @@ class VBDRodNative:
         self.rhs = qd.field(dtype=gs.qd_float, shape=(max(self.n_rods, 1), B, MAX_ROD_NODES))
         self.grad = qd.field(dtype=gs.qd_float, shape=(max(self.n_rods, 1), B, MAX_ROD_NODES))
         self.errno = qd.field(dtype=gs.qd_int, shape=B)
+        # the block a failure names: segment j for a frame, -1 - r for rod r's scales
+        self.failed_block = qd.field(dtype=gs.qd_int, shape=B)
         quat = np.concatenate([m.rest_quat.cpu().numpy() for m in models]).astype(gs.np_float)
         self.quat.from_numpy(np.repeat(quat[:, None], B, axis=1))
         scale = np.zeros((solver.n_vertices, B), dtype=gs.np_float)
@@ -170,6 +172,14 @@ class VBDRodNative:
         errno = self.errno.to_numpy()
         errno[envs] = 0
         self.errno.from_numpy(errno)
+
+    def describe_failure(self, i_b):
+        """Which rod block the latched failure of environment i_b names."""
+        block = int(self.failed_block.to_numpy()[i_b])
+        if block < 0:
+            return f"the scales of rod {-1 - block}"
+        rod = next(r for r, (_, n_segments, s0) in enumerate(self._layout) if s0 <= block < s0 + n_segments)
+        return f"frame {block - self._layout[rod][2]} of rod {rod}"
 
 
 @qd.func
@@ -358,6 +368,10 @@ def func_solve_rod_frame(f, j, i_b, solver: qd.template(), rod: qd.template()):
     if 0.5 * delta.norm() > gs.EPS * q.norm():
         energy, magnitude = func_frame_energy(f, j, i_b, q, solver, rod)
         old = 2.0 * energy
+        if not (old == old and delta.norm() == delta.norm()):
+            # non-finite already: no search can mend it, so it is not reported as one
+            qd.atomic_or(rod.errno[i_b], ErrorCode.VBD_ROD_INVALID)
+            rod.failed_block[i_b] = j
         floor = 64.0 * gs.EPS * magnitude
         slope = g.dot(delta)
         # Below the energy's rounding the search cannot tell a descent from noise, but the quadratic model is
@@ -377,6 +391,7 @@ def func_solve_rod_frame(f, j, i_b, solver: qd.template(), rod: qd.template()):
                 fraction *= 0.5
         if not is_accepted:
             qd.atomic_or(rod.errno[i_b], ErrorCode.VBD_ROD_LINE_SEARCH)
+            rod.failed_block[i_b] = j
 
 
 @qd.func
@@ -538,6 +553,9 @@ def func_solve_rod_scales(f, r, i_b, solver: qd.template(), rod: qd.template()):
     if qd.sqrt(step_norm) > gs.EPS * qd.sqrt(scale_norm):
         energy, magnitude = func_scale_energy(f, r, i_b, 0.0, solver, rod)
         old = 2.0 * energy
+        if not (old == old and step_norm == step_norm):
+            qd.atomic_or(rod.errno[i_b], ErrorCode.VBD_ROD_INVALID)
+            rod.failed_block[i_b] = -1 - r
         floor = 64.0 * gs.EPS * magnitude
         slope = gs.qd_float(0.0)
         for i in range(n):
@@ -569,6 +587,7 @@ def func_solve_rod_scales(f, r, i_b, solver: qd.template(), rod: qd.template()):
                 fraction *= 0.5
         if not is_accepted:
             qd.atomic_or(rod.errno[i_b], ErrorCode.VBD_ROD_LINE_SEARCH)
+            rod.failed_block[i_b] = -1 - r
 
 
 @qd.kernel
@@ -600,6 +619,7 @@ def kernel_rod_end(f: qd.i32, substep_global: qd.i32, solver: qd.template(), rod
             s1 = rod.scale[n0 + 1, i_b]
             if not (axial > 0.0 and s0 > 0.0 and s1 > 0.0 and q.norm() == q.norm()):
                 qd.atomic_or(rod.errno[i_b], ErrorCode.VBD_ROD_INVALID)
+                rod.failed_block[i_b] = j
     for i_b in range(solver._B):
         if rod.errno[i_b] != 0 and not solver.env_failed[i_b]:
             solver.env_failed[i_b] = 1

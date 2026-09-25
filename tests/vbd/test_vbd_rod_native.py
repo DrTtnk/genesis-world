@@ -18,23 +18,30 @@ pytestmark = pytest.mark.precision("64")
 MATERIAL = dict(rho=1060.0, stretch_x=2e4, stretch_y=3e4, stretch_z=5e4, volume=1e5, surface_bend=4e3)
 
 
+def _quat_mul(a, b):
+    return np.concatenate(([a[0] * b[0] - a[1:] @ b[1:]], a[0] * b[1:] + b[0] * a[1:] + np.cross(a[1:], b[1:])))
+
+
 def _frames_along(verts, twist):
-    """Scalar-first frames whose third axis follows each segment, turned by `twist` about it."""
+    """Scalar-first frames whose third axis follows each segment, carried from one segment to the next by the
+    smallest rotation between their tangents (parallel transport) and turned by `twist` about the new tangent."""
+    tangents = np.diff(verts, axis=0)
+    tangents /= np.linalg.norm(tangents, axis=1, keepdims=True)
+    z = np.array([0.0, 0.0, 1.0])
     frames = []
-    for j in range(len(verts) - 1):
-        d = verts[j + 1] - verts[j]
-        d = d / np.linalg.norm(d)
-        axis = np.cross([0.0, 0.0, 1.0], d)
-        s, c = np.linalg.norm(axis), d[2]
-        if s < 1e-12:
-            # parallel or antiparallel to z: no rotation, or half a turn about x
-            align = np.array([1.0, 0.0, 0.0, 0.0]) if c > 0 else np.array([0.0, 1.0, 0.0, 0.0])
+    for j, t in enumerate(tangents):
+        previous = z if j == 0 else tangents[j - 1]
+        c = previous @ t
+        if c < -1 + 1e-12:
+            # antiparallel: half a turn about any axis perpendicular to the previous tangent
+            axis = np.cross(previous, [1.0, 0.0, 0.0] if abs(previous[0]) < 0.9 else [0.0, 1.0, 0.0])
+            swing = np.concatenate(([0.0], axis / np.linalg.norm(axis)))
         else:
-            half = np.arctan2(s, c) / 2
-            align = np.concatenate(([np.cos(half)], np.sin(half) * axis / s))
-        spin = np.array([np.cos(twist[j] / 2), 0.0, 0.0, np.sin(twist[j] / 2)])
-        w1, v1, w2, v2 = align[0], align[1:], spin[0], spin[1:]
-        frames.append(np.concatenate(([w1 * w2 - v1 @ v2], w1 * v2 + w2 * v1 + np.cross(v1, v2))))
+            swing = np.concatenate(([1.0 + c], np.cross(previous, t)))
+            swing /= np.linalg.norm(swing)
+        base = swing if j == 0 else _quat_mul(swing, frames[-1])
+        spin = np.concatenate(([np.cos(twist[j] / 2)], np.sin(twist[j] / 2) * t))
+        frames.append(_quat_mul(spin, base))
     return np.array(frames)
 
 
@@ -288,3 +295,13 @@ def test_a_bone_glued_to_a_native_rod_hangs_where_the_converged_attachment_hangs
     # the rod's axial stiffness is about 3 N/m, so 3 g stretch it by some 15 mm
     assert 0.0 < attached < 0.05, "fixture sanity check: the rod must hold the bone"
     assert glued == pytest.approx(attached, rel=1e-3)
+
+
+def test_a_rod_whose_rest_frames_turn_by_more_than_120_degrees_is_refused():
+    """The curvature takes the shortest branch of the relative frame, which jumps as the turn passes 180 degrees:
+    an energy discontinuity no line search can cross. Head41's frames, each a swing from +z, reached 176 degrees
+    of turn at one joint through spurious twist; such a rest state is refused at build, not mid-run."""
+    verts = np.array([[0.0, 0.0, 0.3], [0.0, 0.0, 0.294], [0.0, 0.0, 0.288]])
+    frames = _frames_along(verts, twist=np.array([0.0, np.radians(150.0)]))
+    with pytest.raises(gs.GenesisException, match="turn by more than 120"):
+        _scene("native", 4, verts=verts, frames=frames)

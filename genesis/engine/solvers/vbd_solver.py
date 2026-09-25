@@ -559,11 +559,15 @@ class VBDSolver(Solver):
         if self.rod_native is not None:
             errno |= int(qd_to_torch(self.rod_native.errno).max())
         messages = []
-        if errno & ErrorCode.VBD_ROD_INVALID:
-            messages.append("A native rod reached a non-finite frame, a non-positive scale, or a segment reversed "
-                            "against its frame.")
-        if errno & ErrorCode.VBD_ROD_LINE_SEARCH:
-            messages.append("A native rod block's line search failed to decrease the incremental potential.")
+        if errno & (ErrorCode.VBD_ROD_INVALID | ErrorCode.VBD_ROD_LINE_SEARCH):
+            failed = int(np.argmax(qd_to_torch(self.rod_native.errno).cpu().numpy() != 0))
+            where = f" (environment {failed}: {self.rod_native.describe_failure(failed)})"
+            if errno & ErrorCode.VBD_ROD_INVALID:
+                messages.append("A native rod reached a non-finite frame, a non-positive scale, or a segment "
+                                "reversed against its frame" + where + ".")
+            if errno & ErrorCode.VBD_ROD_LINE_SEARCH:
+                messages.append("A native rod block's line search failed to decrease the incremental potential"
+                                + where + ".")
         if errno & ErrorCode.VBD_TISSUE_PERSISTENT_INVERSION:
             messages.append(
                 "A tet stayed inverted (J/J0 <= 0) for longer without a break than "
@@ -959,6 +963,16 @@ class VBDSolver(Solver):
                 rotation = quat_multiply(rotation, offset)
                 frames = torch.tensor(entity.morph.frames, dtype=gs.tc_float)
                 frames = quat_multiply(rotation.expand_as(frames), frames)
+                # The curvature takes the shortest branch of each relative frame and jumps where the turn passes
+                # 180 degrees; a rest state near that is an energy discontinuity waiting for the first sweep.
+                relative = quat_multiply(torch.cat((frames[:-1, :1], -frames[:-1, 1:]), -1), frames[1:])
+                turn = 2.0 * torch.rad2deg(torch.arccos(relative[:, 0].abs().clamp(max=1.0)))
+                if len(turn) and float(turn.max()) > 120.0:
+                    joint = int(turn.argmax()) + 1
+                    gs.raise_exception(
+                        f"Rod {entity.uid}: its rest frames turn by more than 120 degrees at node {joint} "
+                        f"({float(turn.max()):.1f}). Build the frames by parallel transport along the centreline."
+                    )
                 self._rod_models.append(
                     RodModel(
                         torch.tensor(tensor_to_array(entity.init_positions), dtype=gs.tc_float),
