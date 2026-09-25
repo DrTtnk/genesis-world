@@ -227,17 +227,17 @@ def test_native_blocks_are_the_reference_gauss_newton_systems():
     for i in range(n):
         J, r = jac("node", i)
         inertia = model.position_weight[i, 0] ** 2 / dt**2
-        g_rod = (J.T @ r).numpy() - float(inertia) * (x[i] - model.predicted_pos[i]).numpy()
-        H_rod = (J.T @ J).numpy() - float(inertia) * np.eye(3)
+        g_rod = (J.T @ r).cpu().numpy() - float(inertia.cpu()) * (x[i] - model.predicted_pos[i]).cpu().numpy()
+        H_rod = (J.T @ J).cpu().numpy() - float(inertia.cpu()) * np.eye(3)
         np.testing.assert_allclose(-node_out[i, :3], g_rod, rtol=1e-9, atol=1e-9 * np.abs(g_rod).max())
         np.testing.assert_allclose(node_out[i, 3:].reshape(3, 3), H_rod, rtol=1e-9, atol=1e-9 * np.abs(H_rod).max())
     for j in range(m):
         J, r = jac("frame", j)
-        g, H = (J.T @ r).numpy(), (J.T @ J).numpy()
+        g, H = (J.T @ r).cpu().numpy(), (J.T @ J).cpu().numpy()
         np.testing.assert_allclose(frame_out[j, :3], g, rtol=1e-9, atol=1e-9 * np.abs(g).max())
         np.testing.assert_allclose(frame_out[j, 3:].reshape(3, 3), H, rtol=1e-9, atol=1e-9 * np.abs(H).max())
     J, r = jac("scale", 0)
-    reference_step = -torch.linalg.solve(J.T @ J, J.T @ r).numpy()
+    reference_step = -torch.linalg.solve(J.T @ J, J.T @ r).cpu().numpy()
     print(f"scale step native {step}, reference {reference_step}")
     np.testing.assert_allclose(step, reference_step, rtol=1e-8, atol=1e-10)
 

@@ -42,8 +42,12 @@ class VBDRodNative:
         self.n_segments = int(sum(counts))
         seg_start = np.concatenate(([0], np.cumsum(counts))).astype(gs.np_int)
 
+        def host(value):
+            # the reference models' rest data may live on the device
+            return value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+
         def cat(values):
-            return np.concatenate([np.asarray(v, dtype=np.float64).reshape(len(v), -1) for v in values])
+            return np.concatenate([host(v).astype(np.float64).reshape(len(v), -1) for v in values])
 
         node0 = np.concatenate([entity.v_start + np.arange(n) for entity, n in zip(entities, counts)])
         first = np.concatenate([np.arange(n) == 0 for n in counts])
@@ -71,7 +75,7 @@ class VBDRodNative:
             # a rod's joint k (between segments k-1 and k) is stored at its segment k; segment 0 carries zeros
             out = []
             for model, v in zip(models, values):
-                v = np.asarray(v, dtype=np.float64).reshape(len(model.length) - 1, width)
+                v = host(v).astype(np.float64).reshape(len(model.length) - 1, width)
                 out.append(np.concatenate((np.zeros((1, width)), v)))
             return np.concatenate(out)
 
