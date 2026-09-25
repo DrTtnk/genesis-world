@@ -10,6 +10,7 @@ from genesis.engine.solvers.vbd_contact import func_contact_link_terms, func_ref
 from genesis.engine.solvers.vbd_mtu import func_mtu_link_terms, func_refresh_mtu_link_anchors
 from genesis.engine.solvers.vbd_rigid import func_attachment_blocks, func_ldlt6_solve
 from genesis.engine.solvers.vbd_rigid import func_quaternion_difference, func_quaternion_update
+from genesis.engine.solvers.vbd_rod_native import func_frame, func_mid_scale, func_tangent
 from genesis.utils.array_class import DynState, RigidInfo
 from genesis.utils.misc import tensor_to_array
 
@@ -191,6 +192,11 @@ class VBDRigidAttachment:
                 glued.append(entity.v_start + entity._glued_vertices_idx)
                 glue_links.extend(link.idx for link in entity._glued_links)
         glued = np.concatenate(glued or [np.zeros(0)]).astype(gs.np_int)
+        rod_vertices = {
+            int(v) for entity in solver._rod_entities for v in range(entity.v_start, entity.v_start + entity.n_vertices)
+        }
+        if rod_vertices.intersection(glued.tolist()) and not solver._rod_native:
+            gs.raise_exception("Rigid glue on a rod node needs rod_solver='native': the reference sweep would move it.")
         glue_links = np.array(glue_links, dtype=gs.np_int)
         self.n_glued = len(glued)
         self.has_glue = self.n_glued > 0
@@ -341,6 +347,49 @@ def func_glue_link_terms(f, i_l, i_b, origin, solver: qd.template(), attachment:
                                 * solver._func_vertex_weight_static(B0, s_).dot(a) * u_hat.outer_product(u_hat)
                             )
                         hessian6 += J_r.transpose() @ block @ J_s
+    if qd.static(solver.has_rod_native):
+        force_r, hessian_r = func_glue_rod_terms(f, i_l, i_b, origin, solver, attachment, solver.rod_native)
+        force6 += force_r
+        hessian6 += hessian_r
+    return force6, hessian6
+
+
+@qd.func
+def func_glue_rod_terms(f, i_l, i_b, origin, solver: qd.template(), attachment: qd.template(), rod: qd.template()):
+    """The stretch and volume rows of every native rod segment with an end glued to link i_l: the rod pulling on
+    the bone. Both rows are linear in the segment's two nodes (d/dx of t = +-1/L), so a segment is carried by
+    T = sum over its ends on this link of +-(w/L) J_end, with the cross term when both ride on it; taken once,
+    through its first end glued here."""
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
+    for c in range(attachment.link_glue_vert_offset[i_l], attachment.link_glue_vert_offset[i_l + 1]):
+        i_v = attachment.link_glue_vert[c]
+        for side in qd.static(range(2)):
+            j = rod.seg_prev[i_v]
+            if qd.static(side == 1):
+                j = rod.seg_next[i_v]
+            if j >= 0:
+                a = rod.seg[j].node0
+                if i_v == a or attachment.glue_link[a] != i_l:
+                    L = rod.seg[j].length
+                    t = func_tangent(f, j, i_b, solver, rod)
+                    d3 = func_frame(rod.quat[j, i_b])[:, 2]
+                    mid = func_mid_scale(j, i_b, rod)
+                    ws = rod.seg[j].w_str
+                    wv = rod.seg[j].w_vol
+                    T_s = qd.Matrix.zero(gs.qd_float, 3, 6)
+                    T_v = qd.Matrix.zero(gs.qd_float, 3, 6)
+                    for end in qd.static(range(2)):
+                        node = a + end
+                        if attachment.glue_link[node] == i_l:
+                            sign = gs.qd_float(1.0)
+                            if qd.static(end == 0):
+                                sign = -1.0
+                            J = func_rigid_jacobian(solver.verts[f + 1, node, i_b].pos - origin)
+                            T_s += (sign * ws / L) * J
+                            T_v += (sign * wv * mid * mid / L) * J
+                    force6 -= T_s.transpose() @ (ws * (t - d3)) + T_v.transpose() @ (wv * (mid * mid * t - d3))
+                    hessian6 += T_s.transpose() @ T_s + T_v.transpose() @ T_v
     return force6, hessian6
 
 

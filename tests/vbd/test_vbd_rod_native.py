@@ -240,3 +240,51 @@ def test_native_blocks_are_the_reference_gauss_newton_systems():
     reference_step = -torch.linalg.solve(J.T @ J, J.T @ r).numpy()
     print(f"scale step native {step}, reference {reference_step}")
     np.testing.assert_allclose(step, reference_step, rtol=1e-8, atol=1e-10)
+
+
+def _bone_on_rod(glue, n_iterations):
+    """A free 3 g bone hung from a vertical rod: the rod's top node pinned, its bottom node joined to the bone by
+    glue or by a rigid attachment."""
+    verts = np.array([[0.0, 0.0, 0.30], [0.0, 0.0, 0.294], [0.0, 0.0, 0.288], [0.0, 0.0, 0.282]])
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=1e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=n_iterations, floor_height=-float("inf"), rod_solver="native"),
+        show_viewer=False,
+    )
+    rod = scene.add_entity(morph=gs.morphs.Rod(verts=verts, frames=_frames_along(verts, np.zeros(3)), radius=6e-4),
+                           material=gs.materials.VBD.Rod(**MATERIAL))
+    bone = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.02, 0.005), pos=(0.0, 0.0, 0.282 - 0.0025)),
+                            material=gs.materials.Rigid(rho=1500.0))
+    if glue:
+        rod.add_rigid_glue(np.array([3]), bone.links[0])
+    else:
+        rod.add_rigid_attachments(np.array([3]), bone.links[0])
+    scene.build()
+    pinned = np.zeros(4, dtype=bool)
+    pinned[0] = True
+    rod.set_pinned(pinned)
+    return scene, bone
+
+
+def _bone_drop(glue, n_iterations, steps=300):
+    scene, bone = _bone_on_rod(glue, n_iterations)
+    z0 = float(tensor_to_array(bone.get_pos())[2])
+    heights = []
+    for _ in range(steps):
+        scene.step()
+        scene.sim.vbd_solver.check_errno()
+        heights.append(float(tensor_to_array(bone.get_pos())[2]))
+    return z0 - np.mean(heights[-50:]), np.ptp(heights[-50:])
+
+
+@pytest.mark.required
+def test_a_bone_glued_to_a_native_rod_hangs_where_the_converged_attachment_hangs_it():
+    """The rod's stretch and volume rows at a glued node are the rod pulling on the bone: they must be in the
+    bone's block, or the bone falls away from a rod that holds nothing."""
+    attached, _ = _bone_drop(glue=False, n_iterations=160)
+    glued, ripple = _bone_drop(glue=True, n_iterations=160)
+    print(f"sag of the bone: glued {1e6 * glued:.4f} um, attached {1e6 * attached:.4f} um, ripple {1e6 * ripple:.4f}")
+    # the rod's axial stiffness is about 3 N/m, so 3 g stretch it by some 15 mm
+    assert 0.0 < attached < 0.05, "fixture sanity check: the rod must hold the bone"
+    assert glued == pytest.approx(attached, rel=1e-3)
