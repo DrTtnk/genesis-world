@@ -7,6 +7,7 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.vbd_contact import func_contact_link_terms, func_refresh_link_active_vertices
+from genesis.engine.solvers.vbd_joint import func_joint_link_terms
 from genesis.engine.solvers.vbd_mtu import func_mtu_link_terms, func_refresh_mtu_link_anchors
 from genesis.engine.solvers.vbd_rigid import func_attachment_blocks, func_ldlt6_solve
 from genesis.engine.solvers.vbd_rigid import func_quaternion_difference, func_quaternion_update
@@ -531,6 +532,10 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
         force_m, hessian_m = func_mtu_link_terms(f, i_l, i_b, state.pos, solver, solver.mtu)
         force += force_m
         hessian += hessian_m
+    if qd.static(solver.has_joint):
+        force_j, hessian_j = func_joint_link_terms(i_l, i_b, attachment, solver.joints)
+        force += force_j
+        hessian += hessian_j
     if qd.static(solver.has_rod_contact):
         force += solver._rod_contacts[0].force[i_l]
         hessian += solver._rod_contacts[0].hessian[i_l]

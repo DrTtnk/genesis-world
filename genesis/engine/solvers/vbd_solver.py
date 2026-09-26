@@ -54,6 +54,7 @@ from genesis.engine.solvers.vbd_contact import (
     kernel_set_prescribed_targets,
 )
 from genesis.engine.solvers.vbd_contact import EnvStatus
+from genesis.engine.solvers.vbd_joint import VBDJoints
 from genesis.engine.solvers.vbd_mtu import (
     HillParameters,
     LinkAnchor,
@@ -267,6 +268,8 @@ class VBDSolver(Solver):
         self._has_glue = False
         self._mtu_units = []
         self._mtu_restraints = []
+        self._rigid_joints = []
+        self.joints = None
         self._rod_models = []
         self._rod_native = options.rod_solver == "native"
         self.rod_native = None
@@ -298,6 +301,33 @@ class VBDSolver(Solver):
     @property
     def has_mtu(self):
         return self.mtu is not None
+
+    @property
+    def has_joint(self):
+        return self.joints is not None
+
+    def add_rigid_joint(self, link_a, link_b, centre, axes, translational_stiffness, rotational_stiffness):
+        """Declare a joint between two rigid links: a spring along each of three orthonormal axes and an alignment
+        spring for each of them (`vbd_joint.py`). `centre` (m) and the columns of `axes` are world quantities at
+        the rest pose; `translational_stiffness` (N/m) and `rotational_stiffness` (N m) hold one value per axis,
+        and a zero leaves that translation or that axis's alignment free. Declare before `scene.build()`."""
+        if self._scene.is_built:
+            gs.raise_exception("Joints must be declared before scene.build().")
+        if link_a.idx == link_b.idx:
+            gs.raise_exception("A joint needs two different links.")
+        if link_a.is_fixed and link_b.is_fixed:
+            gs.raise_exception("A joint between two fixed links holds nothing.")
+        axes = np.asarray(axes, dtype=float)
+        if axes.shape != (3, 3) or not np.allclose(axes.T @ axes, np.eye(3), atol=1e-9) or np.linalg.det(axes) < 0:
+            gs.raise_exception("Joint axes must be the columns of a right-handed orthonormal matrix.")
+        kt = np.asarray(translational_stiffness, dtype=float)
+        kr = np.asarray(rotational_stiffness, dtype=float)
+        if kt.shape != (3,) or kr.shape != (3,) or not np.isfinite(np.concatenate([kt, kr])).all():
+            gs.raise_exception("A joint takes three finite translational and three rotational stiffnesses.")
+        if (kt < 0).any() or (kr < 0).any() or not (kt.sum() + kr.sum()) > 0:
+            gs.raise_exception("A joint's stiffnesses must be nonnegative and not all zero.")
+        self._rigid_joints.append((link_a, link_b, np.asarray(centre, dtype=float), axes, kt, kr))
+        return len(self._rigid_joints) - 1
 
     def add_rigid_collider(self, link, collision_group, regions=None):
         """Let the collision meshes of a rigid link take part in mesh contact, in the given collision group.
@@ -1223,6 +1253,17 @@ class VBDSolver(Solver):
                 kernel_reset_mtu(torch.arange(self._B, dtype=torch.int32), self.mtu)
             elif self._mtu_restraints:
                 gs.raise_exception("Rotary restraints were declared without any muscle-tendon unit.")
+            if self._rigid_joints:
+                if self._sim.requires_grad:
+                    gs.raise_exception("Joints have no adjoint yet, so they cannot be used with requires_grad.")
+                if self.rigid_attachment is None:
+                    gs.raise_exception(
+                        "A joint needs VBD to own the free bodies it moves, and no rigid attachment or glue hands "
+                        "them over: attach or glue tissue to a rigid body."
+                    )
+                if self.rigid_attachment.is_articulated:
+                    gs.raise_exception("Joints act on free bodies; an articulated rigid body has joints of its own.")
+                self.joints = VBDJoints(self, self._rigid_joints)
             if self._has_glue:
                 # The bone block assembles a glued vertex's inertia and tetrahedra only. Every other force a vertex
                 # can carry reaches it through the vertex solve, which a glued vertex never runs, so it would be lost.
