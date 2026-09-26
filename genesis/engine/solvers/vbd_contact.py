@@ -365,7 +365,8 @@ class VBDContact:
         # search than to simulate. Shorten the substep or widen the margin, which widens the cell with it.
         self.sweep_cell_cap = solver._contact_sweep_cell_cap
 
-        pair_type = qd.types.struct(a=gs.qd_int, b=gs.qd_int, lam=gs.qd_float, k=gs.qd_float)
+        # c0: the pair's violation at the start of the substep, which only 1 - alpha of is corrected within it
+        pair_type = qd.types.struct(a=gs.qd_int, b=gs.qd_int, lam=gs.qd_float, k=gs.qd_float, c0=gs.qd_float)
         self.pair_cap = solver._contact_pair_cap
         self.pt_pairs = pair_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
         self.ee_pairs = pair_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
@@ -810,6 +811,15 @@ def func_multiplier(lam, k, gap):
 
 
 @qd.func
+def func_stabilized_gap(gap, c0, contact: qd.template()):
+    """The gap a pair's multiplier acts on (Giles et al. 2025 Sec. 3.6, C* = C - alpha C(x^t)): of a violation the
+    substep started with, only 1 - alpha is corrected within it. Pushing a whole starting penetration out in one
+    substep gives the bodies the velocity depth / h out of nothing: 0.2 m/s a substep for the python head's
+    mandible tips, 0.2 mm into their layer after an impact. c0 is zero for a pair with a tissue participant."""
+    return gap - contact.alpha * qd.min(c0, 0.0)
+
+
+@qd.func
 def func_curved(lam, k, gap, h):
     """Whether a pair's curvature k n n^T enters a rigid body's block: while it pushes, and for one contact
     thickness past the point where it stops. A block's single Newton step lands a pushing pair on that point, and
@@ -827,8 +837,9 @@ def func_pt_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     pair at the current iterate. The force on the point is -y n - scale * slide and the triangle vertices take
     -w_j of it; scale is mu lam_n g, zero when the pair is inactive; `curved` is `func_curved`."""
     d, n, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
-    y = func_multiplier(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, d - h)
-    curved = func_curved(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, d - h, h)
+    gap = func_stabilized_gap(d - h, contact.pt_pairs[i_p, i_b].c0, contact)
+    y = func_multiplier(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, gap)
+    curved = func_curved(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, gap, h)
     cv_x = contact.pt_pairs[i_p, i_b].a
     tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
     mu = contact.rule_friction[contact.cv_info[cv_x].group, contact.cv_info[tri[0]].group]
@@ -850,8 +861,9 @@ def func_ee_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     pair. The force on the first edge's closest point is -y n - scale * slide, split (1 - s, s) over its endpoints;
     the second edge takes the opposite, split (1 - t, t); `curved` is `func_curved`."""
     d, n, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
-    y = func_multiplier(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, d - h)
-    curved = func_curved(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, d - h, h)
+    gap = func_stabilized_gap(d - h, contact.ee_pairs[i_p, i_b].c0, contact)
+    y = func_multiplier(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, gap)
+    curved = func_curved(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, gap, h)
     ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
     eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
     mu = contact.rule_friction[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
@@ -1459,8 +1471,19 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                             if contact.previous_pt[code // 8, i_b].b == contact.pt_pairs[i_p, i_b].b:
                                 contact.pt_pairs[i_p, i_b].lam = contact.previous_pt[code // 8, i_b].lam
                 contact.pt_pairs[i_p, i_b].lam *= contact.alpha * contact.gamma
+                contact.pt_pairs[i_p, i_b].c0 = 0.0
                 if contact.cv_info[contact.pt_pairs[i_p, i_b].a].kind != 1 or contact.cv_info[tri[0]].kind != 1:
                     contact.pt_pairs[i_p, i_b].lam = 0.0
+                else:
+                    d0, n0_unused, w0_unused = func_point_triangle_geometry(
+                        func_cv_pos_prev(f, contact.pt_pairs[i_p, i_b].a, i_b, solver, contact),
+                        func_cv_pos_prev(f, tri[0], i_b, solver, contact),
+                        func_cv_pos_prev(f, tri[1], i_b, solver, contact),
+                        func_cv_pos_prev(f, tri[2], i_b, solver, contact),
+                    )
+                    contact.pt_pairs[i_p, i_b].c0 = d0 - contact.rule_thickness[
+                        contact.cv_info[contact.pt_pairs[i_p, i_b].a].group, contact.cv_info[tri[0]].group
+                    ]
                 contact.pt_pairs[i_p, i_b].k = k0
             if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
                 ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
@@ -1479,8 +1502,20 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                             ):
                                 contact.ee_pairs[i_p, i_b].lam = contact.previous_ee[old, i_b].lam
                 contact.ee_pairs[i_p, i_b].lam *= contact.alpha * contact.gamma
+                contact.ee_pairs[i_p, i_b].c0 = 0.0
                 if contact.cv_info[ea[0]].kind != 1 or contact.cv_info[eb[0]].kind != 1:
                     contact.ee_pairs[i_p, i_b].lam = 0.0
+                else:
+                    d0 = func_pair_distance(
+                        func_cv_pos_prev(f, ea[0], i_b, solver, contact),
+                        func_cv_pos_prev(f, ea[1], i_b, solver, contact),
+                        func_cv_pos_prev(f, eb[0], i_b, solver, contact),
+                        func_cv_pos_prev(f, eb[1], i_b, solver, contact),
+                        EDGE_EDGE,
+                    )
+                    contact.ee_pairs[i_p, i_b].c0 = d0 - contact.rule_thickness[
+                        contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
+                    ]
                 contact.ee_pairs[i_p, i_b].k = k0
     # count the pairs of every contact vertex, prefix-sum the counts, then fill the flat slot list -- all as
     # stale as the pairs themselves, so none of it is worth redoing on a substep that only reuses them
@@ -1603,24 +1638,26 @@ def func_contact_dual_update(f, w, active, solver: qd.template(), contact: qd.te
         if active and i_p < qd.min(contact.n_pt[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
             d, n, weights, h = func_pt_geometry(f, i_p, i_b, solver, contact)
             k = contact.pt_pairs[i_p, i_b].k
-            contact.pt_pairs[i_p, i_b].lam = qd.min(contact.pt_pairs[i_p, i_b].lam + w * k * (d - h), 0.0)
+            gap = func_stabilized_gap(d - h, contact.pt_pairs[i_p, i_b].c0, contact)
+            contact.pt_pairs[i_p, i_b].lam = qd.min(contact.pt_pairs[i_p, i_b].lam + w * k * gap, 0.0)
             k0 = contact.rule_stiffness[
                 contact.cv_info[contact.pt_pairs[i_p, i_b].a].group,
                 contact.cv_info[contact.tri_cv[contact.pt_pairs[i_p, i_b].b][0]].group,
             ]
             contact.pt_pairs[i_p, i_b].k = qd.min(
-                k + k0 / solver._constraint_tol * qd.max(h - d, 0.0), solver._contact_k_max_ratio * k0
+                k + k0 / solver._constraint_tol * qd.max(-gap, 0.0), solver._contact_k_max_ratio * k0
             )
         if active and i_p < qd.min(contact.n_ee[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
             d, n, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
             k = contact.ee_pairs[i_p, i_b].k
-            contact.ee_pairs[i_p, i_b].lam = qd.min(contact.ee_pairs[i_p, i_b].lam + w * k * (d - h), 0.0)
+            gap = func_stabilized_gap(d - h, contact.ee_pairs[i_p, i_b].c0, contact)
+            contact.ee_pairs[i_p, i_b].lam = qd.min(contact.ee_pairs[i_p, i_b].lam + w * k * gap, 0.0)
             k0 = contact.rule_stiffness[
                 contact.cv_info[contact.edge_cv[contact.ee_pairs[i_p, i_b].a][0]].group,
                 contact.cv_info[contact.edge_cv[contact.ee_pairs[i_p, i_b].b][0]].group,
             ]
             contact.ee_pairs[i_p, i_b].k = qd.min(
-                k + k0 / solver._constraint_tol * qd.max(h - d, 0.0), solver._contact_k_max_ratio * k0
+                k + k0 / solver._constraint_tol * qd.max(-gap, 0.0), solver._contact_k_max_ratio * k0
             )
 
 

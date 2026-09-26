@@ -197,3 +197,46 @@ def test_a_snapshot_carries_the_start_share_and_the_contact_multipliers():
         scene.step()
     replayed = np.stack([tensor_to_array(e.get_pos()) for e in (lower, upper)])
     np.testing.assert_array_equal(replayed, expected)
+
+
+def _bone_inside_its_layer(depth):
+    """A free bone, no gravity and at rest, whose underside starts `depth` inside the contact layer of another
+    free bone lying still beneath it; a patch glued to a fixed anchor hands both to VBD."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=DT, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=10, floor_height=-1e3, contact_margin=2e-4,
+                                          contact_k_max_ratio=400.0),
+        show_viewer=False,
+    )
+    anchor = scene.add_entity(morph=gs.morphs.Box(size=(0.01, 0.01, 0.01), pos=(0.0, 0.1, 0.0), fixed=True),
+                              material=gs.materials.Rigid(rho=1500.0))
+    lower = scene.add_entity(morph=gs.morphs.Box(size=(0.02, 0.02, 0.003), pos=(0.0, 0.0, 0.0)),
+                             material=gs.materials.Rigid(rho=1500.0))
+    upper = scene.add_entity(morph=gs.morphs.Box(size=(0.012, 0.008, 0.002), pos=(0.0, 0.0, 0.0025 + 2e-4 - depth)),
+                             material=gs.materials.Rigid(rho=1500.0))
+    _glued_patch(scene, (0.0, 0.1, 0.0065), anchor.links[0])
+    solver = scene.sim.vbd_solver
+    solver.add_rigid_collider(lower.links[0], collision_group=1)
+    solver.add_rigid_collider(upper.links[0], collision_group=2)
+    solver.add_contact_rule(1, 2, stiffness=1e3, friction=0.1, thickness=2e-4)
+    scene.build()
+    return scene, lower, upper
+
+
+@pytest.mark.required
+def test_a_penetration_the_substep_starts_with_is_eased_out_not_shot_out():
+    """Pushing a whole starting penetration out within one substep gives the bones the velocity depth / h, energy
+    that came from nowhere: at the python head's mandible tips, 0.2 mm into the layer after an impact, that is
+    0.2 m/s of rebound a substep. A pair between two rigid bodies corrects only 1 - alpha of the violation it
+    started the substep with (Giles et al. 2025 Sec. 3.6), the rest over the substeps that follow."""
+    depth = 1e-4
+    scene, lower, upper = _bone_inside_its_layer(depth)
+    scene.step()
+    separation = float(tensor_to_array(upper.get_vel())[2] - tensor_to_array(lower.get_vel())[2])
+    assert 0.0 < separation < 0.1 * depth / DT, f"the bones separate at {separation:.4f} m/s"
+    for _ in range(100):
+        scene.step()
+    # with no gravity to close it again, the small correction velocity keeps the bones drifting apart
+    gap = float(tensor_to_array(upper.get_pos())[2] - tensor_to_array(lower.get_pos())[2]) - 0.0025
+    assert gap > 2e-4, "and over the following substeps the layer is restored"
