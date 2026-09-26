@@ -109,6 +109,12 @@ class VBDRigidAttachment:
         self.state = state_type.field(shape=(max(self.n_attachments, 1), solver._B), layout=qd.Layout.SOA)
         self.previous_error = qd.Vector.field(3, dtype=gs.qd_float, shape=(max(self.n_attachments, 1), solver._B))
         self.link_state = link_type.field(shape=(max(self.n_free, 1), solver._B), layout=qd.Layout.SOA)
+        # VBD's adaptive initialization (Chen et al. 2024 Eq. 17): the fraction of the external acceleration the
+        # next substep's start pose takes, from the acceleration this substep actually had along it. A body in
+        # free fall takes all of it, one at rest in a contact or on its ligaments none, which keeps its start
+        # out of the contact and off its ligaments' slack points. The first substep takes the whole prediction.
+        self.gravity_share = qd.field(dtype=gs.qd_float, shape=(max(self.n_free, 1), solver._B))
+        self.gravity_share.fill(1.0)
         # One pose table for every link, free or fixed, so an attachment reads its link's pose the same way in
         # both paths and a fixed link needs no special case.
         pose_type = qd.types.struct(pos=gs.qd_vec3, quat=gs.qd_vec4)
@@ -446,15 +452,21 @@ def kernel_begin_attachment(
             rotation = gu.qd_quat_to_R(quat, gs.EPS)
             predicted_pos = pos + solver._substep_dt * velocity
             predicted_quat = func_quaternion_update(quat, solver._substep_dt * (rotation @ angular))
+            # the inertia target stays the prediction; only where the sweeps start moves
+            start_pos = predicted_pos
+            for i in qd.static(range(3)):
+                start_pos[i] -= (1.0 - attachment.gravity_share[i_f, i_b]) * (
+                    solver._substep_dt * solver._substep_dt * dyn_state.dofs.acc[i_d + i, i_b]
+                )
             attachment.link_state[i_f, i_b].previous_pos = pos
             attachment.link_state[i_f, i_b].previous_quat = quat
             attachment.link_state[i_f, i_b].predicted_pos = predicted_pos
             attachment.link_state[i_f, i_b].predicted_quat = predicted_quat
-            attachment.link_state[i_f, i_b].pos = predicted_pos
+            attachment.link_state[i_f, i_b].pos = start_pos
             attachment.link_state[i_f, i_b].quat = predicted_quat
             attachment.link_state[i_f, i_b].inertia = rotation @ inertia_local @ rotation.transpose()
             attachment.link_state[i_f, i_b].mass = rigid_info.mass_mat[i_d, i_d, i_b]
-            attachment.link_pose[attachment.free_info[i_f].link, i_b].pos = predicted_pos
+            attachment.link_pose[attachment.free_info[i_f].link, i_b].pos = start_pos
             attachment.link_pose[attachment.free_info[i_f].link, i_b].quat = predicted_quat
     for i_a, i_b in qd.ndrange(attachment.n_attachments, solver._B):
         if not solver.env_failed[i_b]:
@@ -575,6 +587,15 @@ def kernel_end_attachment(
             else:
                 state = attachment.link_state[i_f, i_b]
                 velocity = (state.pos - state.previous_pos) / dt
+                external = gs.qd_vec3(0.0, 0.0, 0.0)
+                acceleration = gs.qd_vec3(0.0, 0.0, 0.0)
+                for j in qd.static(range(3)):
+                    external[j] = dyn_state.dofs.acc[i_d + j, i_b]
+                    acceleration[j] = (velocity[j] - dyn_state.dofs.vel[i_d + j, i_b]) / dt
+                share = 0.0
+                if external.dot(external) > 0.0:
+                    share = qd.math.clamp(acceleration.dot(external) / external.dot(external), 0.0, 1.0)
+                attachment.gravity_share[i_f, i_b] = share
                 angular = gu.qd_inv_transform_by_quat(
                     func_quaternion_difference(state.quat, state.previous_quat) / dt, state.quat
                 )
@@ -595,6 +616,12 @@ def kernel_set_attachment_state(
         for j in qd.static(range(3)):
             state[i_a, i_b].multiplier[j] = multiplier[i_b, i_a, j]
         state[i_a, i_b].stiffness = stiffness[i_b, i_a]
+
+
+@qd.kernel
+def kernel_set_gravity_share(envs_idx: qd.types.ndarray(), share: qd.types.ndarray(), attachment: qd.template()):
+    for i_f, i_b_ in qd.ndrange(attachment.gravity_share.shape[0], envs_idx.shape[0]):
+        attachment.gravity_share[i_f, envs_idx[i_b_]] = share[envs_idx[i_b_], i_f]
 
 
 @qd.kernel

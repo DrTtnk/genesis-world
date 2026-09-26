@@ -80,6 +80,7 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     kernel_begin_attachment,
     kernel_end_attachment,
     kernel_set_attachment_state,
+    kernel_set_gravity_share,
     kernel_set_vertex_state,
 )
 from genesis.engine.solvers.vbd_rod import RodAttachment, RodModel, RodParameters, quat_matrix, quat_multiply
@@ -2265,8 +2266,8 @@ class VBDSolver(Solver):
                 for i_a, i_b in qd.ndrange(self.tissue_attachment.n_attachments, self._B):
                     if not self.env_failed[i_b]:
                         func_update_tissue_attachment_dual(f, i_a, i_b, self, self.tissue_attachment)
-            # the pairs restart from zero next substep, so the dual update after the last sweep would only skew
-            # the reported reactions away from the forces the sweep applied
+            # no dual update after the last sweep: the reported reactions are the forces that sweep applied, and
+            # the multipliers they used are the ones the next substep starts from (kernel_begin_contact)
             if qd.static(self.has_contact):
                 func_contact_dual_update(
                     f, self._constraint_dual_relaxation, sweep < self._n_iterations - 1, self, self.contact
@@ -4134,6 +4135,7 @@ class VBDSolver(Solver):
                 kernel_set_attachment_state(
                     envs_idx, state.attachment_multiplier, state.attachment_stiffness, self.rigid_attachment.state
                 )
+                kernel_set_gravity_share(envs_idx, state.attachment_gravity_share, self.rigid_attachment)
             if self.tissue_attachment is not None:
                 kernel_set_tissue_attachment_state(
                     envs_idx,
@@ -4146,6 +4148,7 @@ class VBDSolver(Solver):
             )
             if self.contact is not None:
                 kernel_reset_contact(envs_idx, self.contact, self._sim.rigid_solver.dyn_state)
+                self.contact.restore(envs_idx, state.contact)
                 if state.prescribed_start_pos is not None:
                     kernel_set_prescribed_state(
                         envs_idx,
@@ -4185,6 +4188,9 @@ class VBDSolver(Solver):
             state.attachment_stiffness = qd_to_torch(
                 self.rigid_attachment.state.stiffness, transpose=True, copy=True
             ).contiguous()
+            state.attachment_gravity_share = qd_to_torch(
+                self.rigid_attachment.gravity_share, transpose=True, copy=True
+            ).contiguous()
         if self.tissue_attachment is not None:
             state.tissue_attachment_multiplier = qd_to_torch(
                 self.tissue_attachment.state.multiplier, transpose=True, copy=True
@@ -4193,6 +4199,7 @@ class VBDSolver(Solver):
                 self.tissue_attachment.state.stiffness, transpose=True, copy=True
             ).contiguous()
         if self.contact is not None:
+            state.contact = self.contact.snapshot()
             state.prescribed_start_pos = qd_to_torch(
                 self.contact.prescribed_start.pos, transpose=True, copy=True
             ).contiguous()

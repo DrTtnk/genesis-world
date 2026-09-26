@@ -95,6 +95,26 @@ class EnvStatus(NamedTuple):
     errno: torch.Tensor
 
 
+class ContactSnapshot(NamedTuple):
+    """What a restored environment needs to continue exactly where its snapshot was taken: the candidate set
+    with each pair's multiplier (which carries from one substep to the next), the per-vertex slot
+    lists the next rebuild matches its pairs against, and the proximity budget left. Every tensor leads with the
+    environment."""
+
+    n_pt: torch.Tensor
+    n_ee: torch.Tensor
+    pt_a: torch.Tensor
+    pt_b: torch.Tensor
+    pt_lam: torch.Tensor
+    ee_a: torch.Tensor
+    ee_b: torch.Tensor
+    ee_lam: torch.Tensor
+    slot_offset: torch.Tensor
+    slot: torch.Tensor
+    d_budget: torch.Tensor
+    rebuild_count: torch.Tensor
+
+
 class VBDContact:
     def __init__(self, solver, entities, colliders, prescribed, rules):
         self.solver = solver
@@ -357,6 +377,15 @@ class VBDContact:
         self.cv_slot_n = qd.field(dtype=gs.qd_int, shape=(self.n_cv, solver._B))
         self.cv_slot_offset = qd.field(dtype=gs.qd_int, shape=(self.n_cv + 1, solver._B))
         self.cv_slot = qd.field(dtype=gs.qd_int, shape=(8 * self.pair_cap, solver._B))
+        # The set a rebuild replaces, kept until the new one is built: a pair the search finds again takes back
+        # the multiplier it had, which the new set's own lists cannot tell it.
+        self.previous_pt = pair_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
+        self.previous_ee = pair_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
+        self.previous_slot_offset = qd.field(dtype=gs.qd_int, shape=(self.n_cv + 1, solver._B))
+        self.previous_slot = qd.field(dtype=gs.qd_int, shape=(8 * self.pair_cap, solver._B))
+        # the warm start of the attachments' augmented Lagrangian, applied to every pair (Giles et al. 2025 Eq. 19)
+        self.alpha = 0.95
+        self.gamma = 0.99
         self.errno = qd.field(dtype=gs.qd_int, shape=solver._B)
         self.max_motion = qd.field(dtype=gs.qd_float, shape=(2, solver._B))
         # how far the solved position ends from the swept path the search covered; reported for inspection, no
@@ -468,6 +497,31 @@ class VBDContact:
             deviation[:, 1],
             qd_to_torch(self.rebuild_count),
         )
+
+    def snapshot(self):
+        def copy(field):
+            return qd_to_torch(field, transpose=True, copy=True).contiguous()
+
+        def copy_per_env(field):
+            return qd_to_torch(field, copy=True).contiguous()
+
+        return ContactSnapshot(
+            copy_per_env(self.n_pt),
+            copy_per_env(self.n_ee),
+            copy(self.pt_pairs.a),
+            copy(self.pt_pairs.b),
+            copy(self.pt_pairs.lam),
+            copy(self.ee_pairs.a),
+            copy(self.ee_pairs.b),
+            copy(self.ee_pairs.lam),
+            copy(self.cv_slot_offset),
+            copy(self.cv_slot),
+            copy_per_env(self.d_budget),
+            copy_per_env(self.rebuild_count),
+        )
+
+    def restore(self, envs_idx, snapshot):
+        kernel_set_contact_state(envs_idx, *snapshot, self)
 
     def clear_toi(self):
         self.min_toi.fill(1.0)
@@ -756,12 +810,25 @@ def func_multiplier(lam, k, gap):
 
 
 @qd.func
+def func_curved(lam, k, gap, h):
+    """Whether a pair's curvature k n n^T enters a rigid body's block: while it pushes, and for one contact
+    thickness past the point where it stops. A block's single Newton step lands a pushing pair on that point, and
+    without the curvature beyond it the next sweep sees a free body, falls back through, and pushes again: every
+    other sweep carried no contact at all, and a carried multiplier ratcheted up by the violation of the sweeps in
+    between, to 97 N per pair under a 9 mN bone that sank through its plate. A tissue vertex's block keeps the
+    curvature of its pushing pairs only: the band there slowed resting tissue and thin-wall crossings enough to
+    move them out of their tested layers, and the tissue blocks showed no such cycle."""
+    return lam + k * gap < k * h
+
+
+@qd.func
 def func_pt_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     """Multiplier y, normal n, closest-point weights w, friction scale and tangential slide of a point-triangle
     pair at the current iterate. The force on the point is -y n - scale * slide and the triangle vertices take
-    -w_j of it; scale is mu lam_n g, zero when the pair is inactive."""
+    -w_j of it; scale is mu lam_n g, zero when the pair is inactive; `curved` is `func_curved`."""
     d, n, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
     y = func_multiplier(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, d - h)
+    curved = func_curved(contact.pt_pairs[i_p, i_b].lam, contact.pt_pairs[i_p, i_b].k, d - h, h)
     cv_x = contact.pt_pairs[i_p, i_b].a
     tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
     mu = contact.rule_friction[contact.cv_info[cv_x].group, contact.cv_info[tri[0]].group]
@@ -774,16 +841,17 @@ def func_pt_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     scale = gs.qd_float(0.0)
     if y < 0.0 and mu > 0.0:
         scale = -y * mu * func_friction_scale(slide.norm(), solver._friction_eps_v * solver._substep_dt)
-    return y, n, w, scale, slide
+    return y, n, w, scale, slide, curved
 
 
 @qd.func
 def func_ee_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     """Multiplier y, normal n, closest-point parameters s, t, friction scale and tangential slide of an edge-edge
     pair. The force on the first edge's closest point is -y n - scale * slide, split (1 - s, s) over its endpoints;
-    the second edge takes the opposite, split (1 - t, t)."""
+    the second edge takes the opposite, split (1 - t, t); `curved` is `func_curved`."""
     d, n, s, t, h = func_ee_geometry(f, i_p, i_b, solver, contact)
     y = func_multiplier(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, d - h)
+    curved = func_curved(contact.ee_pairs[i_p, i_b].lam, contact.ee_pairs[i_p, i_b].k, d - h, h)
     ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
     eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
     mu = contact.rule_friction[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
@@ -797,7 +865,7 @@ def func_ee_forces(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     scale = gs.qd_float(0.0)
     if y < 0.0 and mu > 0.0:
         scale = -y * mu * func_friction_scale(slide.norm(), solver._friction_eps_v * solver._substep_dt)
-    return y, n, s, t, scale, slide
+    return y, n, s, t, scale, slide, curved
 
 
 @qd.func
@@ -837,14 +905,14 @@ def func_contact_cv_terms(f, cv, i_b, solver: qd.template(), contact: qd.templat
             scale = gs.qd_float(0.0)
             slide = gs.qd_vec3(0.0, 0.0, 0.0)
             if role < ROLE_EDGE_A:
-                y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
+                y, n, w, scale, slide, curved_unused = func_pt_forces(f, i_p, i_b, solver, contact)
                 k = contact.pt_pairs[i_p, i_b].k
                 weight = 1.0
                 if role >= ROLE_TRIANGLE:
                     weight = -w[role - ROLE_TRIANGLE]
             else:
                 i_p = i_p - contact.pair_cap
-                y, n, s_, t_, scale, slide = func_ee_forces(f, i_p, i_b, solver, contact)
+                y, n, s_, t_, scale, slide, curved_unused = func_ee_forces(f, i_p, i_b, solver, contact)
                 k = contact.ee_pairs[i_p, i_b].k
                 if role == ROLE_EDGE_A:
                     weight = 1.0 - s_
@@ -877,22 +945,23 @@ def func_pair_terms(f, code, i_b, solver: qd.template(), contact: qd.template())
     cvs = qd.Vector([0, 0, 0, 0], dt=gs.qd_int)
     weights = gs.qd_vec4(0.0, 0.0, 0.0, 0.0)
     own = role
+    curved = False
     if role < ROLE_EDGE_A:
-        y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
+        y, n, w, scale, slide, curved = func_pt_forces(f, i_p, i_b, solver, contact)
         k = contact.pt_pairs[i_p, i_b].k
         tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
         cvs = qd.Vector([contact.pt_pairs[i_p, i_b].a, tri[0], tri[1], tri[2]], dt=gs.qd_int)
         weights = gs.qd_vec4(1.0, -w[0], -w[1], -w[2])
     else:
         i_p = i_p - contact.pair_cap
-        y, n, s_, t_, scale, slide = func_ee_forces(f, i_p, i_b, solver, contact)
+        y, n, s_, t_, scale, slide, curved = func_ee_forces(f, i_p, i_b, solver, contact)
         k = contact.ee_pairs[i_p, i_b].k
         ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
         eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
         cvs = qd.Vector([ea[0], ea[1], eb[0], eb[1]], dt=gs.qd_int)
         weights = gs.qd_vec4(1.0 - s_, s_, -(1.0 - t_), -t_)
         own = role - ROLE_EDGE_A
-    return y, n, k, scale, slide, cvs, weights, own
+    return y, n, k, scale, slide, cvs, weights, own, curved
 
 
 @qd.func
@@ -917,14 +986,14 @@ def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact:
     for c in range(base, base + contact.link_active_n[i_l, i_b]):
         cv = contact.rv_cv[contact.link_active[c, i_b]]
         for slot in range(contact.cv_slot_offset[cv, i_b], contact.cv_slot_offset[cv + 1, i_b]):
-            y, n, k, scale, slide, cvs, weights, own = func_pair_terms(
+            y, n, k, scale, slide, cvs, weights, own, curved = func_pair_terms(
                 f, contact.cv_slot[slot, i_b], i_b, solver, contact
             )
             first = 4
             for j in qd.static(range(4)):
                 if first == 4 and contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
                     first = j
-            if y < 0.0 and own == first:
+            if curved and own == first:
                 T = qd.Matrix.zero(gs.qd_float, 3, 6)
                 for j in qd.static(range(4)):
                     if contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
@@ -959,7 +1028,7 @@ def func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver: qd.template(), cont
             for c in range(base, base + contact.link_active_n[i_l, i_b]):
                 cv = contact.rv_cv[contact.link_active[c, i_b]]
                 for slot in range(contact.cv_slot_offset[cv, i_b], contact.cv_slot_offset[cv + 1, i_b]):
-                    y, n, k, scale, slide, cvs, weights, own = func_pair_terms(
+                    y, n, k, scale, slide, cvs, weights, own, curved = func_pair_terms(
                         f, contact.cv_slot[slot, i_b], i_b, solver, contact
                     )
                     # a tissue participant's owner is negative, so it is tested before it indexes anything
@@ -972,7 +1041,7 @@ def func_contact_dof_terms(f, i_d, i_b, axis, pivot, solver: qd.template(), cont
                     for j in qd.static(range(4)):
                         if first == 4 and moved[j] == 1:
                             first = j
-                    if y < 0.0 and own == first:
+                    if curved and own == first:
                         g = gs.qd_vec3(0.0, 0.0, 0.0)
                         for j in qd.static(range(4)):
                             if moved[j] == 1:
@@ -1184,6 +1253,19 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                 contact.rebuild_count[i_b] += 1
                 # The build below searches out to margin_max, so that is the bound it hands the next substeps.
                 contact.d_budget[i_b] = contact.margin_max
+    for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
+                contact.previous_pt[i_p, i_b] = contact.pt_pairs[i_p, i_b]
+            if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
+                contact.previous_ee[i_p, i_b] = contact.ee_pairs[i_p, i_b]
+    for cv, i_b in qd.ndrange(contact.n_cv + 1, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            contact.previous_slot_offset[cv, i_b] = contact.cv_slot_offset[cv, i_b]
+    for i, i_b in qd.ndrange(8 * contact.pair_cap, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            if i < contact.cv_slot_offset[contact.n_cv, i_b]:
+                contact.previous_slot[i, i_b] = contact.cv_slot[i, i_b]
     for i_r, i_b in qd.ndrange(contact.n_rv, solver._B):
         if not solver.env_failed[i_b]:
             i_l = contact.rv_link[i_r]
@@ -1349,27 +1431,57 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                                     qd.atomic_or(
                                                         contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS
                                                     )
-    # The dual state resets every substep, rebuild or not: lam and k are an Uzawa iterate that is only meant to
-    # converge across one substep's sweeps (kernel_reset_contact does the same for lam at the start of a whole
-    # step). A rebuild already zeroes them at insertion, but a reused pair keeps last substep's k, which ramps
-    # toward `_contact_k_max_ratio` in `func_contact_dual_update` and would otherwise carry that ramp forward
-    # substep after substep for as long as the set is reused, well past what the pair's own current violation
-    # asks for.
+    # A pair's multiplier carries from one substep to the next, scaled by alpha gamma as the attachments' is
+    # (Giles et al. 2025 Eq. 19), so the force that corrected an old violation is not replayed in full. Resetting
+    # it every substep made each substep rebuild its resting forces from zero within its own sweeps; with a start
+    # that does not pre-penetrate a resting contact (the free bodies' adaptive start), two bones stacked on a
+    # plate then jittered at 1.5 mm/s. The stiffness does not carry: it restarts at the rule's value and ramps
+    # within the substep. Carried too (AVBD's max(k_start, gamma k)), it stayed near its cap after an impact, and
+    # a cap four hundred times two light bones' m/h^2 made their blocks chatter (the python head's mandible tips,
+    # 5 to 175 N within one substep) and let tissue cross thin walls. A rebuild inserts every pair at lam = 0; a
+    # pair the previous set also had takes back that set's multiplier, found through the previous slot list of
+    # its point or of its first edge's first end. Only a pair between two rigid bodies carries: a tissue vertex
+    # starts at its inertial prediction, which already pre-penetrates a resting contact, and carried through an
+    # impact at four sweeps its pairs' multipliers let a landing tissue box cross the table and squeezed tissue
+    # unevenly between two opposed plates.
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
         if not solver.env_failed[i_b]:
             if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
-                contact.pt_pairs[i_p, i_b].lam = 0.0
                 tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
-                contact.pt_pairs[i_p, i_b].k = contact.rule_stiffness[
+                k0 = contact.rule_stiffness[
                     contact.cv_info[contact.pt_pairs[i_p, i_b].a].group, contact.cv_info[tri[0]].group
                 ]
+                if contact.rebuilding[i_b]:
+                    cv = contact.pt_pairs[i_p, i_b].a
+                    for slot in range(contact.previous_slot_offset[cv, i_b], contact.previous_slot_offset[cv + 1, i_b]):
+                        code = contact.previous_slot[slot, i_b]
+                        if code % 8 == ROLE_POINT:
+                            if contact.previous_pt[code // 8, i_b].b == contact.pt_pairs[i_p, i_b].b:
+                                contact.pt_pairs[i_p, i_b].lam = contact.previous_pt[code // 8, i_b].lam
+                contact.pt_pairs[i_p, i_b].lam *= contact.alpha * contact.gamma
+                if contact.cv_info[contact.pt_pairs[i_p, i_b].a].kind != 1 or contact.cv_info[tri[0]].kind != 1:
+                    contact.pt_pairs[i_p, i_b].lam = 0.0
+                contact.pt_pairs[i_p, i_b].k = k0
             if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap):
-                contact.ee_pairs[i_p, i_b].lam = 0.0
                 ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
                 eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
-                contact.ee_pairs[i_p, i_b].k = contact.rule_stiffness[
-                    contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
-                ]
+                k0 = contact.rule_stiffness[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
+                if contact.rebuilding[i_b]:
+                    for slot in range(
+                        contact.previous_slot_offset[ea[0], i_b], contact.previous_slot_offset[ea[0] + 1, i_b]
+                    ):
+                        code = contact.previous_slot[slot, i_b]
+                        if code % 8 == ROLE_EDGE_A:
+                            old = code // 8 - contact.pair_cap
+                            if (
+                                contact.previous_ee[old, i_b].a == contact.ee_pairs[i_p, i_b].a
+                                and contact.previous_ee[old, i_b].b == contact.ee_pairs[i_p, i_b].b
+                            ):
+                                contact.ee_pairs[i_p, i_b].lam = contact.previous_ee[old, i_b].lam
+                contact.ee_pairs[i_p, i_b].lam *= contact.alpha * contact.gamma
+                if contact.cv_info[ea[0]].kind != 1 or contact.cv_info[eb[0]].kind != 1:
+                    contact.ee_pairs[i_p, i_b].lam = 0.0
+                contact.ee_pairs[i_p, i_b].k = k0
     # count the pairs of every contact vertex, prefix-sum the counts, then fill the flat slot list -- all as
     # stale as the pairs themselves, so none of it is worth redoing on a substep that only reuses them
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
@@ -1549,7 +1661,7 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
                     depth = h
                 if d < -depth:
                     qd.atomic_or(contact.errno[i_b], ErrorCode.VBD_CONTACT_CROSSING)
-            y, n, w, scale, slide = func_pt_forces(f, i_p, i_b, solver, contact)
+            y, n, w, scale, slide, curved_unused = func_pt_forces(f, i_p, i_b, solver, contact)
             if y < 0.0:
                 force = -(y * n + scale * slide)
                 tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
@@ -1557,7 +1669,7 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
                 for j in qd.static(range(3)):
                     func_accumulate_reaction(f, tri[j], -w[j] * force, i_b, solver, contact, dyn_state)
         if i_p < qd.min(contact.n_ee[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
-            y, n, s, t, scale, slide = func_ee_forces(f, i_p, i_b, solver, contact)
+            y, n, s, t, scale, slide, curved_unused = func_ee_forces(f, i_p, i_b, solver, contact)
             if not (n[0] == n[0]):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
             ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
@@ -1646,6 +1758,43 @@ def kernel_reset_contact(envs_idx: qd.types.ndarray(), contact: qd.template(), d
         contact.prescribed_start[i_p, i_b].quat = dyn_state.links.quat[i_l, i_b]
         contact.prescribed_target[i_p, i_b].pos = dyn_state.links.pos[i_l, i_b]
         contact.prescribed_target[i_p, i_b].quat = dyn_state.links.quat[i_l, i_b]
+
+
+@qd.kernel
+def kernel_set_contact_state(
+    envs_idx: qd.types.ndarray(),
+    n_pt: qd.types.ndarray(),
+    n_ee: qd.types.ndarray(),
+    pt_a: qd.types.ndarray(),
+    pt_b: qd.types.ndarray(),
+    pt_lam: qd.types.ndarray(),
+    ee_a: qd.types.ndarray(),
+    ee_b: qd.types.ndarray(),
+    ee_lam: qd.types.ndarray(),
+    slot_offset: qd.types.ndarray(),
+    slot: qd.types.ndarray(),
+    d_budget: qd.types.ndarray(),
+    rebuild_count: qd.types.ndarray(),
+    contact: qd.template(),
+):
+    for i_b_ in range(envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        contact.n_pt[i_b] = n_pt[i_b]
+        contact.n_ee[i_b] = n_ee[i_b]
+        contact.d_budget[i_b] = d_budget[i_b]
+        contact.rebuild_count[i_b] = rebuild_count[i_b]
+    for i_p, i_b_ in qd.ndrange(contact.pair_cap, envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        contact.pt_pairs[i_p, i_b].a = pt_a[i_b, i_p]
+        contact.pt_pairs[i_p, i_b].b = pt_b[i_b, i_p]
+        contact.pt_pairs[i_p, i_b].lam = pt_lam[i_b, i_p]
+        contact.ee_pairs[i_p, i_b].a = ee_a[i_b, i_p]
+        contact.ee_pairs[i_p, i_b].b = ee_b[i_b, i_p]
+        contact.ee_pairs[i_p, i_b].lam = ee_lam[i_b, i_p]
+    for cv, i_b_ in qd.ndrange(contact.n_cv + 1, envs_idx.shape[0]):
+        contact.cv_slot_offset[cv, envs_idx[i_b_]] = slot_offset[envs_idx[i_b_], cv]
+    for i, i_b_ in qd.ndrange(8 * contact.pair_cap, envs_idx.shape[0]):
+        contact.cv_slot[i, envs_idx[i_b_]] = slot[envs_idx[i_b_], i]
 
 
 @qd.kernel
