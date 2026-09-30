@@ -378,6 +378,9 @@ def pytest_xdist_auto_num_workers(config):
     else:
         ram_memory_per_worker = 7.5
         vram_memory_per_worker = 2.5
+    # A CPU-backend session allocates no device memory, so VRAM does not bound it
+    if (config.getoption("--backend") or "cpu") == "cpu":
+        vram_memory = float("inf")
     num_workers = min(
         physical_core_count,
         max(ram_memory / ram_memory_per_worker, 1),
