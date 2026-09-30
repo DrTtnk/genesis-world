@@ -253,6 +253,24 @@ class VBDContact:
         # built once, in parallel, and read in its place.
         self.link_active = qd.field(dtype=gs.qd_int, shape=(max(self.n_rv, 1), solver._B))
         self.link_active_n = qd.field(dtype=gs.qd_int, shape=(max(rigid.n_links, 1), solver._B))
+        # built in blocks of at most 64 of a link's vertices: each block's count, each link's prefix sum over its
+        # blocks, then each block's own vertices, so that no thread walks a whole bone's surface
+        link_offsets = np.searchsorted(np.array(rv_link, dtype=np.int64)[order], np.arange(rigid.n_links + 1))
+        blocks = [(i_l, lo, min(lo + 64, link_offsets[i_l + 1]))
+                  for i_l in range(rigid.n_links) for lo in range(link_offsets[i_l], link_offsets[i_l + 1], 64)]
+        self.n_active_blocks = len(blocks)
+        block_type = qd.types.struct(link=gs.qd_int, lo=gs.qd_int, hi=gs.qd_int)
+        self.active_block = block_type.field(shape=max(self.n_active_blocks, 1))
+        self.link_block_offset = qd.field(dtype=gs.qd_int, shape=rigid.n_links + 1)
+        self.link_block_offset.from_numpy(
+            np.searchsorted(np.array([b[0] for b in blocks], dtype=np.int64), np.arange(rigid.n_links + 1))
+            .astype(gs.np_int)
+        )
+        if blocks:
+            self.active_block.link.from_numpy(np.array([b[0] for b in blocks], dtype=gs.np_int))
+            self.active_block.lo.from_numpy(np.array([b[1] for b in blocks], dtype=gs.np_int))
+            self.active_block.hi.from_numpy(np.array([b[2] for b in blocks], dtype=gs.np_int))
+        self.active_block_n = qd.field(dtype=gs.qd_int, shape=(max(self.n_active_blocks, 1), solver._B))
         # dof_moves_link[i_d, i_l]: the hinge coordinate i_d lies between link i_l and the root
         # both dimensions are floored at one: a scene whose only contact is tissue against tissue has no
         # rigid link and no rigid dof, and a zero-width field is refused by the backend
@@ -377,6 +395,11 @@ class VBDContact:
         # pair_cap). Every pair registers at most four vertices, which bounds the flat list by the pair caps.
         self.cv_slot_n = qd.field(dtype=gs.qd_int, shape=(self.n_cv, solver._B))
         self.cv_slot_offset = qd.field(dtype=gs.qd_int, shape=(self.n_cv + 1, solver._B))
+        # the prefix sum of the per-vertex slot counts runs in sqrt(n_cv) blocks: each block's total, the totals'
+        # prefix sum, then each block's own, so that no thread walks every contact vertex
+        self.scan_block = max(int(np.ceil(np.sqrt(self.n_cv))), 1)
+        self.scan_blocks = -(-self.n_cv // self.scan_block)
+        self.scan_total = qd.field(dtype=gs.qd_int, shape=(max(self.scan_blocks, 1), solver._B))
         self.cv_slot = qd.field(dtype=gs.qd_int, shape=(8 * self.pair_cap, solver._B))
         # The set a rebuild replaces, kept until the new one is built: a pair the search finds again takes back
         # the multiplier it had, which the new set's own lists cannot tell it.
@@ -1574,14 +1597,27 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                 for j in qd.static(range(2)):
                     qd.atomic_add(contact.cv_slot_n[ea[j], i_b], 1)
                     qd.atomic_add(contact.cv_slot_n[eb[j], i_b], 1)
+    for i_k, i_b in qd.ndrange(contact.scan_blocks, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            total = 0
+            for cv in range(i_k * contact.scan_block, qd.min((i_k + 1) * contact.scan_block, contact.n_cv)):
+                total += contact.cv_slot_n[cv, i_b]
+            contact.scan_total[i_k, i_b] = total
     for i_b in range(solver._B):
         if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             run = 0
-            for cv in range(contact.n_cv):
+            for i_k in range(contact.scan_blocks):
+                total = contact.scan_total[i_k, i_b]
+                contact.scan_total[i_k, i_b] = run
+                run += total
+            contact.cv_slot_offset[contact.n_cv, i_b] = run
+    for i_k, i_b in qd.ndrange(contact.scan_blocks, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            run = contact.scan_total[i_k, i_b]
+            for cv in range(i_k * contact.scan_block, qd.min((i_k + 1) * contact.scan_block, contact.n_cv)):
                 contact.cv_slot_offset[cv, i_b] = run
                 run += contact.cv_slot_n[cv, i_b]
                 contact.cv_slot_n[cv, i_b] = 0
-            contact.cv_slot_offset[contact.n_cv, i_b] = run
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
         if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap):
@@ -1616,17 +1652,32 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
     # Which of a link's rigid contact vertices carry a pair is fixed for the substep, so the rigid blocks read it
     # from here instead of rediscovering it. One thread a link keeps each list in `link_rv` order, so the wrench
     # and the 6x6 block are summed in the mesh's order rather than a thread's.
+    for i_k, i_b in qd.ndrange(contact.n_active_blocks, solver._B):
+        if not solver.env_failed[i_b]:
+            n = 0
+            for c in range(contact.active_block[i_k].lo, contact.active_block[i_k].hi):
+                cv = contact.rv_cv[contact.link_rv[c]]
+                if contact.cv_slot_offset[cv + 1, i_b] > contact.cv_slot_offset[cv, i_b]:
+                    n += 1
+            contact.active_block_n[i_k, i_b] = n
     for i_l, i_b in qd.ndrange(contact.link_active_n.shape[0], solver._B):
         if not solver.env_failed[i_b]:
-            base = contact.link_rv_offset[i_l]
             n = 0
-            for c in range(base, contact.link_rv_offset[i_l + 1]):
+            for i_k in range(contact.link_block_offset[i_l], contact.link_block_offset[i_l + 1]):
+                count = contact.active_block_n[i_k, i_b]
+                contact.active_block_n[i_k, i_b] = n
+                n += count
+            contact.link_active_n[i_l, i_b] = n
+    for i_k, i_b in qd.ndrange(contact.n_active_blocks, solver._B):
+        if not solver.env_failed[i_b]:
+            base = contact.link_rv_offset[contact.active_block[i_k].link]
+            n = contact.active_block_n[i_k, i_b]
+            for c in range(contact.active_block[i_k].lo, contact.active_block[i_k].hi):
                 i_r = contact.link_rv[c]
                 cv = contact.rv_cv[i_r]
                 if contact.cv_slot_offset[cv + 1, i_b] > contact.cv_slot_offset[cv, i_b]:
                     contact.link_active[base + n, i_b] = i_r
                     n += 1
-            contact.link_active_n[i_l, i_b] = n
 
 
 @qd.func

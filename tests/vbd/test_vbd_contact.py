@@ -1307,3 +1307,48 @@ def test_a_collider_region_keeps_a_triangle_larger_than_the_region(show_viewer):
     assert not bool(scene.vbd_solver.env_status().is_failed[0])
     assert lowest > -1e-4, "the block must rest on the plate, not fall through a surface the region dropped"
     assert lowest < 2e-3
+
+
+@pytest.mark.required
+def test_each_contact_vertex_s_slot_range_holds_exactly_its_pairs():
+    """The slot offsets are a prefix sum of each contact vertex's pair count: the range of a vertex must hold
+    one slot for every pair it takes part in, counted here from the pairs themselves."""
+    from tests.vbd.test_vbd_initial_guess import _stacked_bones
+
+    scene, _, _ = _stacked_bones()
+    for _ in range(5):
+        scene.step()
+    contact = scene.sim.vbd_solver.contact
+    n_pt, n_ee = int(contact.n_pt.to_numpy()[0]), int(contact.n_ee.to_numpy()[0])
+    assert n_pt + n_ee > 0, "no pairs to count"
+    counts = np.zeros(contact.n_cv, dtype=np.int64)
+    np.add.at(counts, contact.pt_pairs.a.to_numpy()[:n_pt, 0], 1)
+    np.add.at(counts, contact.tri_cv.to_numpy()[contact.pt_pairs.b.to_numpy()[:n_pt, 0]].ravel(), 1)
+    edge_cv = contact.edge_cv.to_numpy()
+    np.add.at(counts, edge_cv[contact.ee_pairs.a.to_numpy()[:n_ee, 0]].ravel(), 1)
+    np.add.at(counts, edge_cv[contact.ee_pairs.b.to_numpy()[:n_ee, 0]].ravel(), 1)
+    offset = contact.cv_slot_offset.to_numpy()[:, 0]
+    assert offset[0] == 0
+    np.testing.assert_array_equal(np.diff(offset), counts)
+
+
+@pytest.mark.required
+def test_each_link_s_active_list_is_its_vertices_that_carry_a_pair_in_mesh_order():
+    from tests.vbd.test_vbd_initial_guess import _stacked_bones
+
+    scene, _, _ = _stacked_bones()
+    for _ in range(5):
+        scene.step()
+    contact = scene.sim.vbd_solver.contact
+    offset = contact.cv_slot_offset.to_numpy()[:, 0]
+    carries = np.diff(offset) > 0
+    link_rv, rv_cv = contact.link_rv.to_numpy(), contact.rv_cv.to_numpy()
+    link_rv_offset = contact.link_rv_offset.to_numpy()
+    active, active_n = contact.link_active.to_numpy()[:, 0], contact.link_active_n.to_numpy()[:, 0]
+    total = 0
+    for i_l in range(len(link_rv_offset) - 1):
+        lo, hi = link_rv_offset[i_l], link_rv_offset[i_l + 1]
+        expected = [int(i_r) for i_r in link_rv[lo:hi] if carries[rv_cv[i_r]]]
+        assert active[lo:lo + active_n[i_l]].tolist() == expected
+        total += len(expected)
+    assert total > 0, "no rigid vertex carries a pair"
