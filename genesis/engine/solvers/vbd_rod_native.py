@@ -29,6 +29,9 @@ from genesis.utils.array_class import ErrorCode
 
 MAX_ROD_NODES = 64
 LINE_SEARCH_STEPS = 24
+# the start and every halving of the scale step, evaluated side by side (func_trial_fraction)
+N_TRIALS = LINE_SEARCH_STEPS + 1
+N_ENERGY_TERMS, N_MAGNITUDE_TERMS = 7, 5
 
 
 class VBDRodNative:
@@ -117,6 +120,14 @@ class VBDRodNative:
         self.band = qd.Vector.field(3, dtype=gs.qd_float, shape=(max(self.n_rods, 1), B, MAX_ROD_NODES))
         self.rhs = qd.field(dtype=gs.qd_float, shape=(max(self.n_rods, 1), B, MAX_ROD_NODES))
         self.grad = qd.field(dtype=gs.qd_float, shape=(max(self.n_rods, 1), B, MAX_ROD_NODES))
+        # the scale line search's energy at each trial: per segment term by term, then per rod (energy, magnitude)
+        self.trial_terms = qd.Vector.field(
+            N_ENERGY_TERMS, dtype=gs.qd_float, shape=(max(self.n_segments, 1), N_TRIALS, B)
+        )
+        self.trial_magnitude_terms = qd.Vector.field(
+            N_MAGNITUDE_TERMS, dtype=gs.qd_float, shape=(max(self.n_segments, 1), N_TRIALS, B)
+        )
+        self.trial_energy = qd.Vector.field(2, dtype=gs.qd_float, shape=(max(self.n_rods, 1), N_TRIALS, B))
         self.errno = qd.field(dtype=gs.qd_int, shape=B)
         # the block a failure names: segment j for a frame, -1 - r for rod r's scales
         self.failed_block = qd.field(dtype=gs.qd_int, shape=B)
@@ -397,39 +408,82 @@ def func_solve_rod_frame(f, j, i_b, solver: qd.template(), rod: qd.template()):
 @qd.func
 def func_scale_energy(f, r, i_b, fraction, solver: qd.template(), rod: qd.template()):
     """Energy of every scale-dependent row of rod r at the scales plus `fraction` of the stored step."""
-    start = rod.rod[r].node_start
     energy = gs.qd_float(0.0)
     scale = gs.qd_float(0.0)
-    h = solver._substep_dt
     for c in range(rod.rod[r].n_segments):
-        j = rod.rod[r].seg_start + c
-        s0 = rod.scale[start + c, i_b] + fraction * rod.rhs[r, i_b, c]
-        s1 = rod.scale[start + c + 1, i_b] + fraction * rod.rhs[r, i_b, c + 1]
-        mid = 0.5 * (s0 + s1)
-        R = func_frame(rod.quat[j, i_b])
-        t = func_tangent(f, j, i_b, solver, rod)
-        w = rod.seg[j].w_sec / h
-        energy += 0.5 * (w * (mid * R[:, 0] - rod.predicted[j, i_b].v0)).norm_sqr()
-        energy += 0.5 * (w * (mid * R[:, 1] - rod.predicted[j, i_b].v1)).norm_sqr()
-        energy += 0.5 * (rod.seg[j].w_rad * (mid - 1.0)) ** 2
-        w_g = rod.seg[j].w_rgr / rod.seg[j].length
-        energy += 0.5 * (w_g * (s1 - s0)) ** 2
-        wv = rod.seg[j].w_vol
-        energy += 0.5 * (wv * (mid * mid * t - R[:, 2])).norm_sqr()
-        scale += 0.5 * w * w * (2.0 * mid * mid + rod.predicted[j, i_b].v0.norm_sqr() + rod.predicted[j, i_b].v1.norm_sqr())
-        scale += 0.5 * rod.seg[j].w_rad ** 2 * (mid * mid + 1.0) + 0.5 * w_g * w_g * (s0 * s0 + s1 * s1)
-        scale += 0.5 * wv * wv * (mid**4 * t.norm_sqr() + 1.0)
-        if not rod.seg[j].first:
-            e_j, s_j = func_joint_energy(j, s0, rod.quat[j - 1, i_b], rod.quat[j, i_b], rod)
-            energy += e_j
-            scale += s_j
-            sp = rod.scale[start + c - 1, i_b] + fraction * rod.rhs[r, i_b, c - 1]
-            La = rod.seg[j - 1].length
-            Lb = rod.seg[j].length
-            w_s = rod.seg[j].w_surf / rod.seg[j].dual
-            energy += 0.5 * (w_s * ((s1 - s0) / Lb - (s0 - sp) / La)) ** 2
-            scale += 0.5 * w_s * w_s * ((s1 * s1 + s0 * s0) / (Lb * Lb) + (s0 * s0 + sp * sp) / (La * La))
+        e, m = func_scale_segment_terms(f, rod.rod[r].seg_start + c, i_b, fraction, solver, rod)
+        for t in qd.static(range(N_ENERGY_TERMS)):
+            energy += e[t]
+        for t in qd.static(range(N_MAGNITUDE_TERMS)):
+            scale += m[t]
     return energy, scale
+
+
+@qd.func
+def func_scale_segment_terms(f, j, i_b, fraction, solver: qd.template(), rod: qd.template()):
+    """Segment j's terms of `func_scale_energy`, one by one in the order it adds them: the section, radius,
+    radius-gradient and volume rows, then, past a rod's first segment, the joint's bending and surface rows (zero
+    at the first). Adding an exact zero changes no bit of the sum."""
+    r = rod.seg[j].rod
+    start = rod.rod[r].node_start
+    c = j - rod.rod[r].seg_start
+    e = qd.Vector.zero(gs.qd_float, N_ENERGY_TERMS)
+    m = qd.Vector.zero(gs.qd_float, N_MAGNITUDE_TERMS)
+    h = solver._substep_dt
+    s0 = rod.scale[start + c, i_b] + fraction * rod.rhs[r, i_b, c]
+    s1 = rod.scale[start + c + 1, i_b] + fraction * rod.rhs[r, i_b, c + 1]
+    mid = 0.5 * (s0 + s1)
+    R = func_frame(rod.quat[j, i_b])
+    t = func_tangent(f, j, i_b, solver, rod)
+    w = rod.seg[j].w_sec / h
+    e[0] = 0.5 * (w * (mid * R[:, 0] - rod.predicted[j, i_b].v0)).norm_sqr()
+    e[1] = 0.5 * (w * (mid * R[:, 1] - rod.predicted[j, i_b].v1)).norm_sqr()
+    e[2] = 0.5 * (rod.seg[j].w_rad * (mid - 1.0)) ** 2
+    w_g = rod.seg[j].w_rgr / rod.seg[j].length
+    e[3] = 0.5 * (w_g * (s1 - s0)) ** 2
+    wv = rod.seg[j].w_vol
+    e[4] = 0.5 * (wv * (mid * mid * t - R[:, 2])).norm_sqr()
+    m[0] = 0.5 * w * w * (2.0 * mid * mid + rod.predicted[j, i_b].v0.norm_sqr() + rod.predicted[j, i_b].v1.norm_sqr())
+    m[1] = 0.5 * rod.seg[j].w_rad ** 2 * (mid * mid + 1.0) + 0.5 * w_g * w_g * (s0 * s0 + s1 * s1)
+    m[2] = 0.5 * wv * wv * (mid**4 * t.norm_sqr() + 1.0)
+    if not rod.seg[j].first:
+        e_j, s_j = func_joint_energy(j, s0, rod.quat[j - 1, i_b], rod.quat[j, i_b], rod)
+        e[5] = e_j
+        m[3] = s_j
+        sp = rod.scale[start + c - 1, i_b] + fraction * rod.rhs[r, i_b, c - 1]
+        La = rod.seg[j - 1].length
+        Lb = rod.seg[j].length
+        w_s = rod.seg[j].w_surf / rod.seg[j].dual
+        e[6] = 0.5 * (w_s * ((s1 - s0) / Lb - (s0 - sp) / La)) ** 2
+        m[4] = 0.5 * w_s * w_s * ((s1 * s1 + s0 * s0) / (Lb * Lb) + (s0 * s0 + sp * sp) / (La * La))
+    return e, m
+
+
+@qd.func
+def func_sum_scale_trial(r, k, i_b, rod: qd.template()):
+    """Rod r's energy and magnitude at trial k from its segments' stored terms, summed in `func_scale_energy`'s
+    order."""
+    energy = gs.qd_float(0.0)
+    scale = gs.qd_float(0.0)
+    for c in range(rod.rod[r].n_segments):
+        e = rod.trial_terms[rod.rod[r].seg_start + c, k, i_b]
+        m = rod.trial_magnitude_terms[rod.rod[r].seg_start + c, k, i_b]
+        for t in qd.static(range(N_ENERGY_TERMS)):
+            energy += e[t]
+        for t in qd.static(range(N_MAGNITUDE_TERMS)):
+            scale += m[t]
+    rod.trial_energy[r, k, i_b] = gs.qd_vec2(energy, scale)
+
+
+@qd.func
+def func_trial_fraction(k):
+    """The step fraction of line-search trial k: 0 for the start, then 1, 1/2, 1/4, ... as the search halves it."""
+    fraction = gs.qd_float(0.0)
+    if k > 0:
+        fraction = 1.0
+        for _ in range(k - 1):
+            fraction *= 0.5
+    return fraction
 
 
 @qd.func
@@ -441,7 +495,18 @@ def func_band_add(r, i_b, i, k, value, rod: qd.template()):
 @qd.func
 def func_solve_rod_scales(f, r, i_b, solver: qd.template(), rod: qd.template()):
     """The coupled scale block of rod r: assemble its banded Gauss-Newton system, solve it exactly, and take the
-    reference's positive, descending step."""
+    reference's positive, descending step. One thread does all of it; the sweep splits the same work over the
+    rods and their line-search trials (`VBDSolver._kernel_sweeps`)."""
+    func_rod_scales_newton(f, r, i_b, solver, rod)
+    for k in range(N_TRIALS):
+        energy, magnitude = func_scale_energy(f, r, i_b, func_trial_fraction(k), solver, rod)
+        rod.trial_energy[r, k, i_b] = gs.qd_vec2(energy, magnitude)
+    func_rod_scales_accept(r, i_b, rod)
+
+
+@qd.func
+def func_rod_scales_newton(f, r, i_b, solver: qd.template(), rod: qd.template()):
+    """Assemble rod r's banded scale system and solve it: the step goes to `rhs`, the gradient to `grad`."""
     start = rod.rod[r].node_start
     n = rod.rod[r].n_segments + 1
     h = solver._substep_dt
@@ -545,13 +610,23 @@ def func_solve_rod_scales(f, r, i_b, solver: qd.template(), rod: qd.template()):
         if i + 2 < n:
             x -= rod.band[r, i_b, i + 2][2] * rod.rhs[r, i_b, i + 2]
         rod.rhs[r, i_b, i] = x
+
+
+@qd.func
+def func_rod_scales_accept(r, i_b, rod: qd.template()):
+    """Take the reference's positive, descending step along `rhs`, reading trial k's energy and magnitude from
+    `trial_energy[r, k]` (k = 0 at the start, k >= 1 at `func_trial_fraction(k)`): the first trial the halving
+    search accepts is the same whichever order the energies were computed in."""
+    start = rod.rod[r].node_start
+    n = rod.rod[r].n_segments + 1
     step_norm = gs.qd_float(0.0)
     scale_norm = gs.qd_float(0.0)
     for i in range(n):
         step_norm += rod.rhs[r, i_b, i] ** 2
         scale_norm += rod.scale[start + i, i_b] ** 2
     if qd.sqrt(step_norm) > gs.EPS * qd.sqrt(scale_norm):
-        energy, magnitude = func_scale_energy(f, r, i_b, 0.0, solver, rod)
+        energy = rod.trial_energy[r, 0, i_b][0]
+        magnitude = rod.trial_energy[r, 0, i_b][1]
         old = 2.0 * energy
         if not (old == old and step_norm == step_norm):
             qd.atomic_or(rod.errno[i_b], ErrorCode.VBD_ROD_INVALID)
@@ -572,14 +647,14 @@ def func_solve_rod_scales(f, r, i_b, solver: qd.template(), rod: qd.template()):
                     rod.scale[start + i, i_b] += rod.rhs[r, i_b, i]
                 is_accepted = True
         fraction = gs.qd_float(1.0)
-        for _ in range(LINE_SEARCH_STEPS):
+        for k in range(LINE_SEARCH_STEPS):
             if not is_accepted:
                 positive = True
                 for i in range(n):
                     if rod.scale[start + i, i_b] + fraction * rod.rhs[r, i_b, i] <= 0.0:
                         positive = False
                 if positive:
-                    e_new, unused_magnitude = func_scale_energy(f, r, i_b, fraction, solver, rod)
+                    e_new = rod.trial_energy[r, k + 1, i_b][0]
                     if 2.0 * e_new <= old + 1e-4 * fraction * slope + floor:
                         for i in range(n):
                             rod.scale[start + i, i_b] += fraction * rod.rhs[r, i_b, i]

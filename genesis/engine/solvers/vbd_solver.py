@@ -95,10 +95,15 @@ from genesis.engine.solvers.vbd_rigid_colouring import (
 from genesis.engine.solvers.vbd_rod import RodAttachment, RodModel, RodParameters, quat_matrix, quat_multiply
 from genesis.engine.solvers.vbd_rod_contact import RodContact
 from genesis.engine.solvers.vbd_rod_native import (
+    N_TRIALS,
     VBDRodNative,
     func_rod_node_terms,
     func_solve_rod_frame,
-    func_solve_rod_scales,
+    func_rod_scales_accept,
+    func_rod_scales_newton,
+    func_scale_segment_terms,
+    func_sum_scale_trial,
+    func_trial_fraction,
     kernel_rod_begin,
     kernel_rod_end,
 )
@@ -2318,9 +2323,23 @@ class VBDSolver(Solver):
                 ):
                     if not self.env_failed[i_b]:
                         func_solve_rod_frame(f, self.rod_native.frame_perm[k], i_b, self, self.rod_native)
+            # each rod's coupled scales (func_solve_rod_scales), split so that no thread walks a whole line
+            # search: the Newton step a rod, the energy of every trial fraction a segment, their sums a rod and
+            # trial, then the halving search's choice a rod
             for r, i_b in qd.ndrange(self.rod_native.n_rods, self._B):
                 if not self.env_failed[i_b]:
-                    func_solve_rod_scales(f, r, i_b, self, self.rod_native)
+                    func_rod_scales_newton(f, r, i_b, self, self.rod_native)
+            for j, k, i_b in qd.ndrange(self.rod_native.n_segments, N_TRIALS, self._B):
+                if not self.env_failed[i_b]:
+                    e, m = func_scale_segment_terms(f, j, i_b, func_trial_fraction(k), self, self.rod_native)
+                    self.rod_native.trial_terms[j, k, i_b] = e
+                    self.rod_native.trial_magnitude_terms[j, k, i_b] = m
+            for r, k, i_b in qd.ndrange(self.rod_native.n_rods, N_TRIALS, self._B):
+                if not self.env_failed[i_b]:
+                    func_sum_scale_trial(r, k, i_b, self.rod_native)
+            for r, i_b in qd.ndrange(self.rod_native.n_rods, self._B):
+                if not self.env_failed[i_b]:
+                    func_rod_scales_accept(r, i_b, self.rod_native)
 
     @qd.kernel
     def _kernel_rigid_colour(self, f: qd.i32, c: qd.i32):

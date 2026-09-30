@@ -305,3 +305,66 @@ def test_a_rod_whose_rest_frames_turn_by_more_than_120_degrees_is_refused():
     frames = _frames_along(verts, twist=np.array([0.0, np.radians(150.0)]))
     with pytest.raises(gs.GenesisException, match="turn by more than 120"):
         _scene("native", 4, verts=verts, frames=frames)
+
+
+@pytest.mark.required
+def test_the_sweep_s_split_scale_passes_take_the_serial_block_s_step():
+    """The sweep splits the scale block over rods and line-search trials; from one state it must move the scales
+    as `func_solve_rod_scales` does, to rounding (a term summed where it is computed can have its last multiply
+    fused into the add; read back from the trial buffer it cannot)."""
+    import quadrants as qd
+
+    from genesis.engine.solvers.vbd_rod_native import (
+        N_TRIALS,
+        func_rod_scales_accept,
+        func_rod_scales_newton,
+        func_scale_segment_terms,
+        func_solve_rod_scales,
+        func_sum_scale_trial,
+        func_trial_fraction,
+        kernel_rod_begin,
+    )
+
+    scene, _ = _scene("native", 4)
+    solver = scene.sim.vbd_solver
+    native = solver.rod_native
+    for _ in range(3):
+        scene.step()
+    # scales off their rest value, so that the block has a real step to take
+    state = solver.get_state(0)
+    scale, quat, director_velocity = state.rod_states[0]
+    rng = np.random.default_rng(11)
+    scale = scale * torch.tensor(1.0 + 0.2 * (rng.random(scale.shape) - 0.5), dtype=scale.dtype, device=scale.device)
+    state.rod_states = ((scale, quat, director_velocity),)
+    solver.set_state(0, state)
+    solver._kernel_predict(0)
+    kernel_rod_begin(solver, native)
+
+    @qd.kernel
+    def serial(solver: qd.template(), rod: qd.template()):
+        for r in range(rod.n_rods):
+            func_solve_rod_scales(0, r, 0, solver, rod)
+
+    @qd.kernel
+    def split(solver: qd.template(), rod: qd.template()):
+        for r in range(rod.n_rods):
+            func_rod_scales_newton(0, r, 0, solver, rod)
+        for j, k in qd.ndrange(rod.n_segments, N_TRIALS):
+            e, m = func_scale_segment_terms(0, j, 0, func_trial_fraction(k), solver, rod)
+            rod.trial_terms[j, k, 0] = e
+            rod.trial_magnitude_terms[j, k, 0] = m
+        for r, k in qd.ndrange(rod.n_rods, N_TRIALS):
+            func_sum_scale_trial(r, k, 0, rod)
+        for r in range(rod.n_rods):
+            func_rod_scales_accept(r, 0, rod)
+
+    before = native.scale.to_numpy()[:, 0].copy()
+    serial(solver, native)
+    after_serial = native.scale.to_numpy()[:, 0].copy()
+    solver.set_state(0, state)
+    np.testing.assert_array_equal(native.scale.to_numpy()[:, 0], before)
+    split(solver, native)
+    after_split = native.scale.to_numpy()[:, 0]
+    assert int(native.errno.to_numpy()[0]) == 0
+    assert np.abs(after_serial - before).max() > 1e-9, "the block took no step: nothing to compare"
+    np.testing.assert_allclose(after_split, after_serial, rtol=0.0, atol=1e-13)
