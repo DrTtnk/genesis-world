@@ -47,7 +47,7 @@ def test_the_reverse_sweep_matches_finite_differences_of_the_executed_rollout(sh
         solver._kernel_set_state(0, torch.as_tensor(x[None]).contiguous(), torch.as_tensor(v[None]).contiguous())
         solver._kernel_predict(0)
         for _sweep in range(solver._n_iterations):
-            solver._kernel_sweeps(0, _sweep)
+            solver._sweep(0, _sweep)
         solver._kernel_update_velocity(0)
         return float((w * solver.verts.pos.to_numpy()[1, :, 0]).sum())
 
@@ -111,7 +111,7 @@ def test_the_reverse_sweep_carries_contact_friction_damping_and_fibres(show_view
         solver._kernel_set_state(0, torch.as_tensor(x[None]).contiguous(), torch.as_tensor(v[None]).contiguous())
         solver._kernel_predict(0)
         for _sweep in range(solver._n_iterations):
-            solver._kernel_sweeps(0, _sweep)
+            solver._sweep(0, _sweep)
         solver._kernel_update_velocity(0)
         return float((w * solver.verts.pos.to_numpy()[1, :, 0]).sum())
 
@@ -173,7 +173,7 @@ def test_the_reverse_sweep_carries_the_augmented_lagrangian(show_viewer, n_itera
         solver._kernel_set_state(0, torch.as_tensor(x[None]).contiguous(), torch.as_tensor(v0[None]).contiguous())
         solver._kernel_predict(0)
         for _sweep in range(solver._n_iterations):
-            solver._kernel_sweeps(0, _sweep)
+            solver._sweep(0, _sweep)
         solver._kernel_update_velocity(0)
         return float((w * solver.verts.pos.to_numpy()[1, :, 0]).sum())
 

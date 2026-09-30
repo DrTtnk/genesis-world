@@ -602,21 +602,28 @@ def func_mtu_link_terms(f, i_l, i_b, origin, solver: qd.template(), mtu: qd.temp
     force6 = qd.Vector.zero(gs.qd_float, 6)
     hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
     for slot in range(mtu.link_anchor_offset[i_l], mtu.link_anchor_offset[i_l + 1]):
-        i_a = mtu.link_anchor[slot]
-        force, hessian = func_anchor_terms(f, i_a, i_b, solver, mtu)
-        r = func_anchor_pos(f, i_a, i_b, solver, mtu) - origin
-        jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
-        for row in qd.static(range(3)):
-            jacobian[row, row] = 1.0
-        jacobian[0, 4] = r[2]
-        jacobian[0, 5] = -r[1]
-        jacobian[1, 3] = -r[2]
-        jacobian[1, 5] = r[0]
-        jacobian[2, 3] = r[1]
-        jacobian[2, 4] = -r[0]
-        force6 += jacobian.transpose() @ force
-        hessian6 += jacobian.transpose() @ hessian @ jacobian
+        slot_force, slot_hessian = func_mtu_anchor_link_terms(f, slot, i_b, origin, solver, mtu)
+        force6 += slot_force
+        hessian6 += slot_hessian
     return force6, hessian6
+
+
+@qd.func
+def func_mtu_anchor_link_terms(f, slot, i_b, origin, solver: qd.template(), mtu: qd.template()):
+    """One link anchor's share of `func_mtu_link_terms`, for the anchor at `link_anchor[slot]`."""
+    i_a = mtu.link_anchor[slot]
+    force, hessian = func_anchor_terms(f, i_a, i_b, solver, mtu)
+    r = func_anchor_pos(f, i_a, i_b, solver, mtu) - origin
+    jacobian = qd.Matrix.zero(gs.qd_float, 3, 6)
+    for row in qd.static(range(3)):
+        jacobian[row, row] = 1.0
+    jacobian[0, 4] = r[2]
+    jacobian[0, 5] = -r[1]
+    jacobian[1, 3] = -r[2]
+    jacobian[1, 5] = r[0]
+    jacobian[2, 3] = r[1]
+    jacobian[2, 4] = -r[0]
+    return jacobian.transpose() @ force, jacobian.transpose() @ hessian @ jacobian
 
 
 @qd.func

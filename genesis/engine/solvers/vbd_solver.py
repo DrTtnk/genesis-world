@@ -84,6 +84,13 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     kernel_set_gravity_share,
     kernel_set_vertex_state,
 )
+from genesis.engine.solvers.vbd_rigid_colouring import (
+    VBDRigidColouring,
+    func_rigid_entry_terms,
+    func_solve_attachment_link_entries,
+    kernel_clear_rigid_colour_errno,
+    kernel_colour_free_bodies,
+)
 from genesis.engine.solvers.vbd_rod import RodAttachment, RodModel, RodParameters, quat_matrix, quat_multiply
 from genesis.engine.solvers.vbd_rod_contact import RodContact
 from genesis.engine.solvers.vbd_rod_native import (
@@ -240,6 +247,8 @@ class VBDSolver(Solver):
         self._prescribed_colliders = []
         self._contact_pair_cap = options.contact_pair_cap
         self._contact_cell_cap = options.contact_cell_cap
+        self._rigid_colour_cap = options.rigid_colour_cap
+        self._rigid_entry_cap = options.rigid_entry_cap
         self._contact_sweep_cell_cap = options.contact_sweep_cell_cap
         self._contact_margin = options.contact_margin
         self._contact_margin_max = options.contact_margin_max
@@ -270,6 +279,7 @@ class VBDSolver(Solver):
         self._mtu_restraints = []
         self._rigid_joints = []
         self.joints = None
+        self.rigid_colouring = None
         self._rod_models = []
         self._rod_native = options.rod_solver == "native"
         self.rod_native = None
@@ -305,6 +315,10 @@ class VBDSolver(Solver):
     @property
     def has_joint(self):
         return self.joints is not None
+
+    @property
+    def has_rigid_colouring(self):
+        return self.rigid_colouring is not None
 
     def add_rigid_joint(self, link_a, link_b, centre, axes, translational_stiffness, rotational_stiffness):
         """Declare a joint between two rigid links: a spring along each of three orthonormal axes and an alignment
@@ -585,6 +599,8 @@ class VBDSolver(Solver):
         """Raise with every contact and tissue failure recorded since the last check, physical failures first: a
         batch that crossed a surface and overflowed a buffer in the same window reports both."""
         errno = int(qd_to_torch(self.tissue_errno).max())
+        if self.rigid_colouring is not None:
+            errno |= int(qd_to_torch(self.rigid_colouring.errno).max())
         if self.contact is not None:
             errno |= int(qd_to_torch(self.contact.errno).max())
         if self.rod_native is not None:
@@ -599,6 +615,12 @@ class VBDSolver(Solver):
             if errno & ErrorCode.VBD_ROD_LINE_SEARCH:
                 messages.append("A native rod block's line search failed to decrease the incremental potential"
                                 + where + ".")
+        if errno & ErrorCode.OVERFLOW_VBD_RIGID_ENTRIES:
+            messages.append("The free bodies' contact slots and link anchors in one substep exceed "
+                            "VBDOptions.rigid_entry_cap.")
+        if errno & ErrorCode.OVERFLOW_VBD_RIGID_COLOURS:
+            messages.append("The free bodies coupled in one substep need more colours than "
+                            "VBDOptions.rigid_colour_cap allows.")
         if errno & ErrorCode.VBD_TISSUE_PERSISTENT_INVERSION:
             messages.append(
                 "A tet stayed inverted (J/J0 <= 0) for longer without a break than "
@@ -1264,6 +1286,9 @@ class VBDSolver(Solver):
                 if self.rigid_attachment.is_articulated:
                     gs.raise_exception("Joints act on free bodies; an articulated rigid body has joints of its own.")
                 self.joints = VBDJoints(self, self._rigid_joints)
+            if self.rigid_attachment is not None and not self.rigid_attachment.is_articulated:
+                if self.rigid_attachment.n_free:
+                    self.rigid_colouring = VBDRigidColouring(self, self._rigid_colour_cap, self._rigid_entry_cap)
             if self._has_glue:
                 # The bone block assembles a glued vertex's inertia and tetrahedra only. Every other force a vertex
                 # can carry reaches it through the vertex solve, which a glued vertex never runs, so it would be lost.
@@ -2264,10 +2289,18 @@ class VBDSolver(Solver):
             self._constraint_k_max_ratio * self._k_start,
         )
 
+    def _sweep(self, f, sweep):
+        """One whole sweep: vertices and rods, the free bodies colour by colour, then the multipliers."""
+        self._kernel_sweeps(f, sweep)
+        if self.rigid_colouring is not None:
+            for c in range(self.rigid_colouring.cap):
+                self._kernel_rigid_colour(f, c)
+        self._kernel_sweep_duals(f, sweep)
+
     @qd.kernel
     def _kernel_sweeps(self, f: qd.i32, sweep: qd.i32):
-        """One sweep. The sweep index is a runtime argument and Python drives the loop, so the body is
-        transformed once instead of `n_iterations` times.
+        """The vertex and native rod half of one sweep. The sweep index is a runtime argument and Python drives the
+        loop, so the body is transformed once instead of `n_iterations` times.
 
         It cannot be a loop inside the kernel: the colour passes below are top-level `ndrange` loops, which is
         what makes them parallel with an implicit barrier between them, and wrapping them in an outer loop would
@@ -2275,44 +2308,63 @@ class VBDSolver(Solver):
         kernel launches. The launches cost a few microseconds each against a step of about a millisecond, while
         the inlining costs about 4.6 seconds of Quadrants front-end work per sweep on every process start.
         """
-        if True:
-            self._func_sweep(f, sweep)
-            if qd.static(self.has_rod_native):
-                # frames in two colours, then each rod's coupled scales, after the vertices of the same sweep
-                for c in qd.static(range(2)):
-                    for k, i_b in qd.ndrange(
-                        (self.rod_native.frame_offsets[c], self.rod_native.frame_offsets[c + 1]), self._B
-                    ):
-                        if not self.env_failed[i_b]:
-                            func_solve_rod_frame(f, self.rod_native.frame_perm[k], i_b, self, self.rod_native)
-                for r, i_b in qd.ndrange(self.rod_native.n_rods, self._B):
+        self._func_sweep(f, sweep)
+        if qd.static(self.has_rod_native):
+            # frames in two colours, then each rod's coupled scales, after the vertices of the same sweep
+            for c in qd.static(range(2)):
+                for k, i_b in qd.ndrange(
+                    (self.rod_native.frame_offsets[c], self.rod_native.frame_offsets[c + 1]), self._B
+                ):
                     if not self.env_failed[i_b]:
-                        func_solve_rod_scales(f, r, i_b, self, self.rod_native)
-            if qd.static(self.has_rigid_attachment):
-                # one block per free body, in order: the bodies couple only through the soft elements, so this
-                # is Gauss-Seidel over blocks and a later body already sees the earlier one's new pose
-                for i_b in range(self._B):
-                    if not self.env_failed[i_b]:
-                        for i_f in range(self.rigid_attachment.n_free):
-                            func_solve_attachment_link(f, i_f, i_b, self, self.rigid_attachment)
-                for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
-                    if not self.env_failed[i_b]:
-                        func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
-                if qd.static(self.has_contact):
-                    # A sweep moves only the vertices a pair reads; the rest of each free body's surface is
-                    # settled here, after the last sweep, because the next substep's swept search starts from it.
-                    for i_r, i_b in qd.ndrange(self.contact.n_rv, self._B):
-                        func_settle_free_vertex(sweep == self._n_iterations - 1, i_r, i_b, self, self.contact)
-            if qd.static(self.has_tissue_attachment):
-                for i_a, i_b in qd.ndrange(self.tissue_attachment.n_attachments, self._B):
-                    if not self.env_failed[i_b]:
-                        func_update_tissue_attachment_dual(f, i_a, i_b, self, self.tissue_attachment)
-            # no dual update after the last sweep: the reported reactions are the forces that sweep applied, and
-            # the multipliers they used are the ones the next substep starts from (kernel_begin_contact)
-            if qd.static(self.has_contact):
-                func_contact_dual_update(
-                    f, self._constraint_dual_relaxation, sweep < self._n_iterations - 1, self, self.contact
+                        func_solve_rod_frame(f, self.rod_native.frame_perm[k], i_b, self, self.rod_native)
+            for r, i_b in qd.ndrange(self.rod_native.n_rods, self._B):
+                if not self.env_failed[i_b]:
+                    func_solve_rod_scales(f, r, i_b, self, self.rod_native)
+
+    @qd.kernel
+    def _kernel_rigid_colour(self, f: qd.i32, c: qd.i32):
+        """One block per free body of colour c, side by side (vbd_rigid_colouring.py). Bodies of one colour share
+        no element, so colour after colour this is Gauss-Seidel over blocks in colour order, and a body sees the
+        new pose of every coupled body of an earlier colour. The colour is a runtime argument for the same reason
+        as the sweep index: a static loop over the colours would inline the block solve once a colour.
+
+        The colour's entries (contact slots and link anchors) are computed first, one thread an entry, then each
+        body sums its own in order and solves."""
+        for t in range(self.rigid_colouring.colour_entry_max[c] * self._B):
+            i_b = t % self._B
+            e = self.rigid_colouring.colour_entry_offset[c, i_b] + t // self._B
+            if not self.env_failed[i_b] and e < self.rigid_colouring.colour_entry_offset[c + 1, i_b]:
+                func_rigid_entry_terms(f, e, i_b, self, self.rigid_attachment, self.rigid_colouring)
+        for k, i_b in qd.ndrange(self.rigid_attachment.n_free, self._B):
+            begin = self.rigid_colouring.colour_offset[c, i_b]
+            if not self.env_failed[i_b] and begin + k < self.rigid_colouring.colour_offset[c + 1, i_b]:
+                func_solve_attachment_link_entries(
+                    f, self.rigid_colouring.colour_body[begin + k, i_b], i_b, self, self.rigid_attachment,
+                    self.rigid_colouring,
                 )
+
+    @qd.kernel
+    def _kernel_sweep_duals(self, f: qd.i32, sweep: qd.i32):
+        """The multiplier half of one sweep, after the vertices, rods and free bodies have moved."""
+        if qd.static(self.has_rigid_attachment):
+            for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
+                if not self.env_failed[i_b]:
+                    func_update_attachment_dual(f, i_a, i_b, self, self.rigid_attachment)
+            if qd.static(self.has_contact):
+                # A sweep moves only the vertices a pair reads; the rest of each free body's surface is
+                # settled here, after the last sweep, because the next substep's swept search starts from it.
+                for i_r, i_b in qd.ndrange(self.contact.n_rv, self._B):
+                    func_settle_free_vertex(sweep == self._n_iterations - 1, i_r, i_b, self, self.contact)
+        if qd.static(self.has_tissue_attachment):
+            for i_a, i_b in qd.ndrange(self.tissue_attachment.n_attachments, self._B):
+                if not self.env_failed[i_b]:
+                    func_update_tissue_attachment_dual(f, i_a, i_b, self, self.tissue_attachment)
+        # no dual update after the last sweep: the reported reactions are the forces that sweep applied, and
+        # the multipliers they used are the ones the next substep starts from (kernel_begin_contact)
+        if qd.static(self.has_contact):
+            func_contact_dual_update(
+                f, self._constraint_dual_relaxation, sweep < self._n_iterations - 1, self, self.contact
+            )
 
     @qd.func
     def _func_sweep(self, f, sweep):
@@ -2735,7 +2787,7 @@ class VBDSolver(Solver):
                     )
             else:
                 for sweep in range(self._n_iterations):
-                    self._kernel_sweeps(f, sweep)
+                    self._sweep(f, sweep)
             return
         # The force scale of this substep: the imbalance left at the predicted position, floored by the body's own
         # weight so that a body already at rest still has a finite scale. An absolute newton tolerance is meaningless
@@ -4021,6 +4073,11 @@ class VBDSolver(Solver):
                     )
             if self.rod_native is not None:
                 kernel_rod_begin(self, self.rod_native)
+            if self.rigid_colouring is not None:
+                # after the contact search: this substep's pairs are the contact couplings
+                kernel_colour_free_bodies(
+                    self._sim.cur_substep_global, self, self.rigid_attachment, self.rigid_colouring
+                )
             self.solve(f)
             if self.rod_native is not None:
                 kernel_rod_end(f, self._sim.cur_substep_global, self, self.rod_native)
@@ -4180,6 +4237,8 @@ class VBDSolver(Solver):
                     envs_idx, state.attachment_multiplier, state.attachment_stiffness, self.rigid_attachment.state
                 )
                 kernel_set_gravity_share(envs_idx, state.attachment_gravity_share, self.rigid_attachment)
+                if self.rigid_colouring is not None:
+                    kernel_clear_rigid_colour_errno(envs_idx, self.rigid_colouring)
             if self.tissue_attachment is not None:
                 kernel_set_tissue_attachment_state(
                     envs_idx,

@@ -17,6 +17,15 @@ snapshots restore these activations for the selected environments.
 Run `python -m pytest tests/coupling/test_vbd_rigid.py tests/vbd/test_vbd_muscle_entities.py tests/vbd/test_rigid_attachment_reference.py --backend gpu -n 0`.
 Performance and swallowing acceptance are separate checks.
 
+Local VBD rigid colouring: the free bodies' 6x6 blocks are solved one colour at
+a time, with one thread for each body. Bodies that share a joint, a muscle-tendon
+unit, a glued tetrahedron or rod segment, or a contact pair take different
+colours. The colouring is done again each substep, after the contact search. In
+each colour, a first pass computes the contact slots and muscle link anchors
+with one thread for each entry. `VBDOptions.rigid_colour_cap` (default 8) and
+`rigid_entry_cap` (default 16384) limit the work; a substep that needs more
+fails loudly. Run `python -m pytest tests/vbd/test_vbd_rigid_colouring.py`.
+
 Local physical attachment work: PBD entities now provide
 `attach_particles_to_link(link_idx, particles_idx_local, compliance=0.0)`.
 This uses a two-way implicit spring solve with the full articulated mass matrix.

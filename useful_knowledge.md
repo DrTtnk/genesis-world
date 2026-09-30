@@ -17,6 +17,23 @@ Lessons from wrong assumptions, recorded as they were found.
 - **A new worktree or a changed kernel source misses the offline cache.** The first run then includes the LLVM
   compile of every changed kernel. Compare test times only between runs with the same cache state.
 
+## Rigid colouring (2026-09-30)
+
+- **Do not unroll a loop over colours with `qd.static` when the body is a whole block solve.** I did this first
+  for the free-body colours (cap 8). Four small tests then took 517 s. Launch one kernel for each colour from
+  Python, the same fix as for the sweeps.
+- **Quadrants refuses an alias of a solver object inside kernel scope.** `contact = solver.contact` and
+  `colouring = self.rigid_colouring` fail with "Invalid constant scalar data type". Pass the object as a
+  `qd.template()` argument, or write the full attribute path. `qd.static(x is not None)` fails too ("Operator
+  "is not" ... not supported"): give the object a `has_...` property, as `has_joint` does.
+- **Kernels cannot capture a Genesis solver or its fields by closure.** The fields are ndarrays ("Ndarray ...
+  used in kernel scope but not registered"). Pass them as template arguments.
+- **A sum in the same order is not always bitwise the same.** The entry pass stores each contact term and sums
+  it later, and the serial block sums it where it computes it. The blocks differ by one unit in the last place,
+  most probably because fast math fuses the last multiply into the add only in the serial path. Compare such
+  paths with an absolute tolerance scaled to the largest element (1e-14), and keep a whole-trajectory test
+  where both runs use the same code.
+
 ## VBD contact search / margin (2026-09-21, GPU perf task on vbd_contact.py)
 
 - **Never scale a search reach by a multiple of a user-chosen `margin`.** `margin` can already be sized

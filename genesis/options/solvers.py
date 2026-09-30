@@ -977,6 +977,17 @@ class VBDOptions(Options):
         Largest number of candidate mesh-contact pairs per environment and substep (point-triangle and edge-edge
         counted separately). Memory grows with it; a substep that finds more pairs fails with an error instead of
         dropping contacts. Defaults to 65536.
+    rigid_colour_cap : int, optional
+        Largest number of colours the free bodies may need in one substep. Bodies that share a joint, a
+        muscle-tendon unit, a glued tetrahedron or rod segment, or a contact pair take different colours, and one
+        colour is solved at a time with one thread a body. A substep whose bodies need more fails with an error.
+        Every colour up to the cap is a pass of each sweep, so a cap far above the need costs compile time and a
+        few microseconds a sweep. At most 31. Defaults to 8.
+    rigid_entry_cap : int, optional
+        Largest number of per-body entries (contact slots of the free bodies' vertices, and muscle-tendon link
+        anchors) in one substep. Each colour first computes its bodies' entries one thread an entry, so that a body
+        with hundreds of contacts is not one thread's work. A substep with more entries fails with an error.
+        Memory is 42 floats an entry. Defaults to 16384.
     contact_cell_cap : int, optional
         Largest number of contact vertices a hash bucket may hold. Overflow fails the substep rather than
         dropping a vertex silently. It has to be read together with `contact_cell_size`, because a cell sized
@@ -1096,6 +1107,8 @@ class VBDOptions(Options):
     max_sweeps: PositiveInt = 400
     max_dual_steps: PositiveInt = 200
     contact_pair_cap: PositiveInt = 65536
+    rigid_colour_cap: PositiveInt = 8
+    rigid_entry_cap: PositiveInt = 16384
     contact_cell_cap: PositiveInt = 256
     contact_sweep_cell_cap: PositiveInt = 512
     contact_margin: Optional[float] = None

@@ -491,9 +491,8 @@ def kernel_begin_attachment(
 
 
 @qd.func
-def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
-    """One free body's 6x6 block. Bodies couple only through the soft elements and contact, never through the
-    mass matrix, so solving them one after another is Gauss-Seidel over blocks, which is what AVBD asks for."""
+def func_attachment_link_base(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
+    """The first terms of one free body's block: its inertia, its vertex attachments and its glued tissue."""
     i_l = attachment.free_info[i_f].link
     state = attachment.link_state[i_f, i_b]
     force = qd.Vector.zero(gs.qd_float, 6)
@@ -524,14 +523,13 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
         force_g, hessian_g = func_glue_link_terms(f, i_l, i_b, state.pos, solver, attachment)
         force += force_g
         hessian += hessian_g
-    if qd.static(solver.has_contact):
-        force_c, hessian_c = func_contact_link_terms(f, i_l, i_b, state.pos, solver, solver.contact)
-        force += force_c
-        hessian += hessian_c
-    if qd.static(solver.has_mtu):
-        force_m, hessian_m = func_mtu_link_terms(f, i_l, i_b, state.pos, solver, solver.mtu)
-        force += force_m
-        hessian += hessian_m
+    return force, hessian
+
+
+@qd.func
+def func_attachment_link_tail(i_f, i_b, force, hessian, solver: qd.template(), attachment: qd.template()):
+    """The last terms of the block, after contact and muscle-tendon units: joints and rod contact."""
+    i_l = attachment.free_info[i_f].link
     if qd.static(solver.has_joint):
         force_j, hessian_j = func_joint_link_terms(i_l, i_b, attachment, solver.joints)
         force += force_j
@@ -539,6 +537,14 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
     if qd.static(solver.has_rod_contact):
         force += solver._rod_contacts[0].force[i_l]
         hessian += solver._rod_contacts[0].hessian[i_l]
+    return force, hessian
+
+
+@qd.func
+def func_apply_attachment_link(f, i_f, i_b, force, hessian, solver: qd.template(), attachment: qd.template()):
+    """Solve the block, move the body and refresh every cache that follows its pose."""
+    i_l = attachment.free_info[i_f].link
+    state = attachment.link_state[i_f, i_b]
     increment = func_ldlt6_solve(hessian, force)
     attachment.link_state[i_f, i_b].pos += increment[:3]
     attachment.link_state[i_f, i_b].quat = func_quaternion_update(state.quat, increment[3:6])
@@ -556,6 +562,32 @@ def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: q
         func_refresh_mtu_link_anchors(
             i_l, i_b, attachment.link_state[i_f, i_b].pos, attachment.link_state[i_f, i_b].quat, solver.mtu
         )
+
+
+@qd.func
+def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
+    """One free body's 6x6 block. Bodies couple only through the soft elements and contact, never through the
+    mass matrix, so solving them one after another is Gauss-Seidel over blocks, which is what AVBD asks for."""
+    force, hessian = func_attachment_link_system(f, i_f, i_b, solver, attachment)
+    func_apply_attachment_link(f, i_f, i_b, force, hessian, solver, attachment)
+
+
+@qd.func
+def func_attachment_link_system(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
+    """Negative gradient and 6x6 block of one free body at the current poses, with no state written."""
+    i_l = attachment.free_info[i_f].link
+    force, hessian = func_attachment_link_base(f, i_f, i_b, solver, attachment)
+    if qd.static(solver.has_contact):
+        force_c, hessian_c = func_contact_link_terms(
+            f, i_l, i_b, attachment.link_state[i_f, i_b].pos, solver, solver.contact
+        )
+        force += force_c
+        hessian += hessian_c
+    if qd.static(solver.has_mtu):
+        force_m, hessian_m = func_mtu_link_terms(f, i_l, i_b, attachment.link_state[i_f, i_b].pos, solver, solver.mtu)
+        force += force_m
+        hessian += hessian_m
+    return func_attachment_link_tail(i_f, i_b, force, hessian, solver, attachment)
 
 
 @qd.func

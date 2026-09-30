@@ -994,35 +994,48 @@ def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact:
     # out changes no bit of the result. `link_active` holds the rest, in the order `link_rv` has them, which is
     # what keeps the sum below independent of anything but the mesh.
     base = contact.link_rv_offset[i_l]
-    identity = qd.Matrix.identity(gs.qd_float, 3)
     for c in range(base, base + contact.link_active_n[i_l, i_b]):
         cv = contact.rv_cv[contact.link_active[c, i_b]]
         for slot in range(contact.cv_slot_offset[cv, i_b], contact.cv_slot_offset[cv + 1, i_b]):
-            y, n, k, scale, slide, cvs, weights, own, curved = func_pair_terms(
-                f, contact.cv_slot[slot, i_b], i_b, solver, contact
-            )
-            first = 4
-            for j in qd.static(range(4)):
-                if first == 4 and contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
-                    first = j
-            if curved and own == first:
-                T = qd.Matrix.zero(gs.qd_float, 3, 6)
-                for j in qd.static(range(4)):
-                    if contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
-                        r = contact.rv_pos[contact.cv_info[cvs[j]].ref, i_b] - origin
-                        J = qd.Matrix.zero(gs.qd_float, 3, 6)
-                        for row in qd.static(range(3)):
-                            J[row, row] = 1.0
-                        J[0, 4] = r[2]
-                        J[0, 5] = -r[1]
-                        J[1, 3] = -r[2]
-                        J[1, 5] = r[0]
-                        J[2, 3] = r[1]
-                        J[2, 4] = -r[0]
-                        T += weights[j] * J
-                force6 += T.transpose() @ (-(y * n + scale * slide))
-                nn = n.outer_product(n)
-                hessian6 += T.transpose() @ (k * nn + scale * (identity - nn)) @ T
+            slot_force, slot_hessian = func_contact_slot_link_terms(f, i_l, i_b, origin, slot, solver, contact)
+            force6 += slot_force
+            hessian6 += slot_hessian
+    return force6, hessian6
+
+
+@qd.func
+def func_contact_slot_link_terms(f, i_l, i_b, origin, slot, solver: qd.template(), contact: qd.template()):
+    """One candidate slot's share of `func_contact_link_terms`: the pair's wrench and block if this slot is the
+    pair's first participant on link i_l and the pair is curved, else exactly zero. Adding an exact zero changes
+    no bit of a sum, so summing these over the link's slots in order is `func_contact_link_terms` itself."""
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
+    identity = qd.Matrix.identity(gs.qd_float, 3)
+    y, n, k, scale, slide, cvs, weights, own, curved = func_pair_terms(
+        f, contact.cv_slot[slot, i_b], i_b, solver, contact
+    )
+    first = 4
+    for j in qd.static(range(4)):
+        if first == 4 and contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
+            first = j
+    if curved and own == first:
+        T = qd.Matrix.zero(gs.qd_float, 3, 6)
+        for j in qd.static(range(4)):
+            if contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
+                r = contact.rv_pos[contact.cv_info[cvs[j]].ref, i_b] - origin
+                J = qd.Matrix.zero(gs.qd_float, 3, 6)
+                for row in qd.static(range(3)):
+                    J[row, row] = 1.0
+                J[0, 4] = r[2]
+                J[0, 5] = -r[1]
+                J[1, 3] = -r[2]
+                J[1, 5] = r[0]
+                J[2, 3] = r[1]
+                J[2, 4] = -r[0]
+                T += weights[j] * J
+        force6 = T.transpose() @ (-(y * n + scale * slide))
+        nn = n.outer_product(n)
+        hessian6 = T.transpose() @ (k * nn + scale * (identity - nn)) @ T
     return force6, hessian6
 
 
