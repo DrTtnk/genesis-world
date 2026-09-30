@@ -20,35 +20,39 @@ from genesis.utils.array_class import DynInfo, DynState, RigidInfo
 
 
 @qd.kernel
-def kernel_sweeps_articulation(
+def kernel_sweep_articulation(
     f: int,
+    sweep: int,
     solver: qd.template(),
     dyn_state: DynState,
     dyn_info: DynInfo,
     rigid_info: RigidInfo,
     rigid_config: qd.template(),
 ):
-    for sweep in qd.static(range(solver._n_iterations)):
-        solver._func_sweep(f, sweep)
-        for i_b in range(solver._B):
+    """One sweep, driven from Python like `_kernel_sweeps` in vbd_solver.py: a static loop over the sweeps would
+    inline `n_iterations` copies of the whole sweep, about 7 s of Quadrants front-end work each."""
+    solver._func_sweep(f, sweep)
+    for i_b in range(solver._B):
+        if not solver.env_failed[i_b]:
+            func_solve_articulation_batch(
+                f, i_b, solver, solver.rigid_attachment, dyn_state, dyn_info, rigid_info, rigid_config
+            )
+            for i_l in range(solver.rigid_attachment.rigid.n_links):
+                solver.rigid_attachment.link_pose[i_l, i_b].pos = dyn_state.links.pos[i_l, i_b]
+                solver.rigid_attachment.link_pose[i_l, i_b].quat = dyn_state.links.quat[i_l, i_b]
+    for i_a, i_b in qd.ndrange(solver.rigid_attachment.n_attachments, solver._B):
+        if not solver.env_failed[i_b]:
+            func_update_attachment_dual(f, i_a, i_b, solver, solver.rigid_attachment)
+    if qd.static(solver.has_tissue_attachment):
+        for i_a, i_b in qd.ndrange(solver.tissue_attachment.n_attachments, solver._B):
             if not solver.env_failed[i_b]:
-                func_solve_articulation_batch(
-                    f, i_b, solver, solver.rigid_attachment, dyn_state, dyn_info, rigid_info, rigid_config
-                )
-                for i_l in range(solver.rigid_attachment.rigid.n_links):
-                    solver.rigid_attachment.link_pose[i_l, i_b].pos = dyn_state.links.pos[i_l, i_b]
-                    solver.rigid_attachment.link_pose[i_l, i_b].quat = dyn_state.links.quat[i_l, i_b]
-        for i_a, i_b in qd.ndrange(solver.rigid_attachment.n_attachments, solver._B):
-            if not solver.env_failed[i_b]:
-                func_update_attachment_dual(f, i_a, i_b, solver, solver.rigid_attachment)
-        if qd.static(solver.has_tissue_attachment):
-            for i_a, i_b in qd.ndrange(solver.tissue_attachment.n_attachments, solver._B):
-                if not solver.env_failed[i_b]:
-                    func_update_tissue_attachment_dual(f, i_a, i_b, solver, solver.tissue_attachment)
-        # see _kernel_sweeps in vbd_solver.py: no dual update after the last sweep. Here the sweep index is a
-        # static one, so the guard can stay outside the loop without serialising it.
-        if qd.static(solver.has_contact and sweep < solver._n_iterations - 1):
-            func_contact_dual_update(f, solver._constraint_dual_relaxation, True, solver, solver.contact)
+                func_update_tissue_attachment_dual(f, i_a, i_b, solver, solver.tissue_attachment)
+    # see _kernel_sweeps in vbd_solver.py: no dual update after the last sweep, passed as a value so that the
+    # dual update's loop stays top level, and so parallel
+    if qd.static(solver.has_contact):
+        func_contact_dual_update(
+            f, solver._constraint_dual_relaxation, sweep < solver._n_iterations - 1, solver, solver.contact
+        )
 
 
 @qd.kernel

@@ -2,6 +2,21 @@
 
 Lessons from wrong assumptions, recorded as they were found.
 
+## Test suite time (2026-09-30)
+
+- **The slow VBD tests were compile-bound, not physics-bound.** I assumed that the 541 s adjoint test was slow
+  because of its finite-difference rollouts. Its rig has 8 vertices. Measured alone, its physics was a small part.
+  Three kernels unrolled `for sweep in qd.static(range(n_iterations))`: `kernel_sweeps_articulation`,
+  `_kernel_primal_sweeps` and `_kernel_adjoint_sweeps`. Each inlined copy of the sweep body costs about 7 s of
+  Quadrants front end, and LLVM then compiles the large result. The fix is the same as in `_kernel_sweeps`:
+  one sweep per kernel, with the sweep index as a runtime argument and a Python loop. Results stay bitwise
+  equal. The adjoint test went from 394 s to 38 s alone. Do not unroll a sweep loop with `qd.static`.
+- **Measure the front end per kernel before you optimise a slow test.** cProfile makes the Quadrants front end
+  look about 3 times slower than it is. Time `quadrants.lang.kernel.Kernel.materialize` for each kernel on its
+  first call instead. In the hinge MTU test one kernel took 28.7 s of the 30.3 s front end.
+- **A new worktree or a changed kernel source misses the offline cache.** The first run then includes the LLVM
+  compile of every changed kernel. Compare test times only between runs with the same cache state.
+
 ## VBD contact search / margin (2026-09-21, GPU perf task on vbd_contact.py)
 
 - **Never scale a search reach by a multiple of a user-chosen `margin`.** `margin` can already be sized

@@ -39,7 +39,7 @@ from genesis.engine.solvers.vbd_accd import (
 from genesis.engine.solvers.vbd_articulation import (
     kernel_begin_articulation,
     kernel_end_articulation,
-    kernel_sweeps_articulation,
+    kernel_sweep_articulation,
 )
 from genesis.engine.solvers.vbd_contact import (
     VBDContact,
@@ -2392,13 +2392,13 @@ class VBDSolver(Solver):
             self._func_record_angle(f, i_c, i_b)
 
     @qd.kernel
-    def _kernel_primal_sweeps(self, f: qd.i32):
-        """`n_iterations` sweeps with the multipliers held fixed: the inner solve of the exact Uzawa iteration used
-        under requires_grad. The constraint record is taken by `solve()` when it returns."""
-        for sweep in qd.static(range(self._n_iterations)):
-            for c in qd.static(range(self._n_colors)):
-                for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    self._func_solve_vertex(f, self.color_perm[k], i_b, 0.0, 0.0, False, sweep)
+    def _kernel_primal_sweep(self, f: qd.i32, sweep: qd.i32):
+        """One sweep with the multipliers held fixed: the inner solve of the exact Uzawa iteration used under
+        requires_grad. The constraint record is taken by `solve()` when it returns. Python drives the sweeps, as for
+        `_kernel_sweeps`: a static loop would inline `n_iterations` copies of the colour passes."""
+        for c in qd.static(range(self._n_colors)):
+            for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
+                self._func_solve_vertex(f, self.color_perm[k], i_b, 0.0, 0.0, False, sweep)
 
     @qd.kernel
     def _kernel_dual_update(self, f: qd.i32):
@@ -2607,7 +2607,8 @@ class VBDSolver(Solver):
             self._kernel_residual(f)
             if self.residual[None] < target:
                 return
-            self._kernel_primal_sweeps(f)
+            for sweep in range(self._n_iterations):
+                self._kernel_primal_sweep(f, sweep)
         self._kernel_residual(f)
         gs.raise_exception(
             f"VBD substep did not converge: residual {self.residual[None]:.3e} >= {target:.3e} "
@@ -2728,9 +2729,10 @@ class VBDSolver(Solver):
         if not self._sim.requires_grad or not self._grad_converge:
             if self.rigid_attachment is not None and self.rigid_attachment.is_articulated:
                 rigid = self.rigid_attachment.rigid
-                kernel_sweeps_articulation(
-                    f, self, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config
-                )
+                for sweep in range(self._n_iterations):
+                    kernel_sweep_articulation(
+                        f, sweep, self, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config
+                    )
             else:
                 for sweep in range(self._n_iterations):
                     self._kernel_sweeps(f, sweep)
@@ -3732,35 +3734,35 @@ class VBDSolver(Solver):
             self.z[i_v, i_b] = qd.Vector.zero(qd.f64, 3)
 
     @qd.kernel
-    def _kernel_adjoint_sweeps(self, f: qd.i32):
-        """Colored Gauss-Seidel on J^T z + G^T zeta = gbar: z_i = (J_ii^T)^-1 (gbar_i - sum_j J_ij z_j - (G^T zeta)_i),
-        then the dual update zeta += w k (G z) per active constraint."""
-        for _ in qd.static(range(self._n_iterations)):
-            for c in qd.static(range(self._n_colors)):
-                for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
-                    i_v = self.color_perm[k]
-                    rhs = (
-                        self.gbar[i_v, i_b]
-                        - self._func_offdiag_apply(f, i_v, i_b, self.z)
-                        - self._func_zeta_force(f, i_v, i_b)
+    def _kernel_adjoint_sweep(self, f: qd.i32):
+        """One colored Gauss-Seidel sweep on J^T z + G^T zeta = gbar: z_i = (J_ii^T)^-1 (gbar_i - sum_j J_ij z_j -
+        (G^T zeta)_i), then the dual update zeta += w k (G z) per active constraint. Python drives the sweeps, as for
+        `_kernel_sweeps`: a static loop would inline `n_iterations` copies of the body."""
+        for c in qd.static(range(self._n_colors)):
+            for k, i_b in qd.ndrange((self._color_offsets[c], self._color_offsets[c + 1]), self._B):
+                i_v = self.color_perm[k]
+                rhs = (
+                    self.gbar[i_v, i_b]
+                    - self._func_offdiag_apply(f, i_v, i_b, self.z)
+                    - self._func_zeta_force(f, i_v, i_b)
+                )
+                self.z[i_v, i_b] = self._func_diag_block(f, i_v, i_b).transpose().inverse() @ rhs
+        if qd.static(self._n_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
+                if self.cons_hist[f + 1, i_c, i_b].k_eff != 0.0:
+                    self.cons_zeta[i_c, i_b] += (
+                        self._constraint_dual_relaxation
+                        * self.cons_hist[f + 1, i_c, i_b].k_eff
+                        * self._func_constraint_dot_z(f, i_c, i_b)
                     )
-                    self.z[i_v, i_b] = self._func_diag_block(f, i_v, i_b).transpose().inverse() @ rhs
-            if qd.static(self._n_constraints > 0):
-                for i_c, i_b in qd.ndrange(self._n_constraints, self._B):
-                    if self.cons_hist[f + 1, i_c, i_b].k_eff != 0.0:
-                        self.cons_zeta[i_c, i_b] += (
-                            self._constraint_dual_relaxation
-                            * self.cons_hist[f + 1, i_c, i_b].k_eff
-                            * self._func_constraint_dot_z(f, i_c, i_b)
-                        )
-            if qd.static(self._n_angle_constraints > 0):
-                for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
-                    if self.acons_hist[f + 1, i_c, i_b].k_eff != 0.0:
-                        self.acons_zeta[i_c, i_b] += (
-                            self._constraint_dual_relaxation
-                            * self.acons_hist[f + 1, i_c, i_b].k_eff
-                            * self._func_angle_dot_z(f, i_c, i_b)
-                        )
+        if qd.static(self._n_angle_constraints > 0):
+            for i_c, i_b in qd.ndrange(self._n_angle_constraints, self._B):
+                if self.acons_hist[f + 1, i_c, i_b].k_eff != 0.0:
+                    self.acons_zeta[i_c, i_b] += (
+                        self._constraint_dual_relaxation
+                        * self.acons_hist[f + 1, i_c, i_b].k_eff
+                        * self._func_angle_dot_z(f, i_c, i_b)
+                    )
 
     @qd.kernel
     def _kernel_adjoint_residual(self, f: qd.i32):
@@ -3861,7 +3863,8 @@ class VBDSolver(Solver):
         if self.residual[None] == 0.0:  # nothing flows back into this substep
             return
         for _ in range(self._max_sweeps // self._n_iterations):
-            self._kernel_adjoint_sweeps(f)
+            for _ in range(self._n_iterations):
+                self._kernel_adjoint_sweep(f)
             self._kernel_adjoint_residual(f)
             if self.adj_residual[None] <= self._residual_tol * self.residual[None]:  # residual holds max |gbar|
                 break
