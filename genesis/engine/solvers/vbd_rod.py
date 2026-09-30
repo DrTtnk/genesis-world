@@ -103,7 +103,14 @@ class RodModel:
         if not bool((self.length > 0).all()):
             raise ValueError("Rod segments must have positive rest length.")
         self.rest_director = quat_matrix(quaternions)[..., 2]
-        if not torch.allclose(edge / self.length[:, None], self.rest_director, atol=1e-6, rtol=1e-6):
+        # A segment's direction carries the rounding of its end positions over its length, about eps |x| / L; in
+        # float32 a half-millimetre segment 0.1 m from the origin is already 1e-5 off. Allow what the precision
+        # can represent, and never less than the fixed bound this check had (allclose, atol = rtol = 1e-6).
+        eps = torch.finfo(positions.dtype).eps
+        reach = torch.maximum(positions[1:].abs().amax(-1), positions[:-1].abs().amax(-1))
+        fixed = 1e-6 + 1e-6 * self.rest_director.abs()
+        tol = torch.maximum(fixed, (8.0 * eps * reach / self.length)[:, None])
+        if not bool(((edge / self.length[:, None] - self.rest_director).abs() <= tol).all()):
             raise ValueError("Rest frame third axis must align with its centreline segment.")
         self.dual_length = (self.length[1:] + self.length[:-1]) / 2
         self.area = torch.pi * radius**2

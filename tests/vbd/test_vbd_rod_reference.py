@@ -177,6 +177,33 @@ def test_invalid_geometry_and_snapshot_fail():
         rod.set_state(state)
 
 
+def _straight_rod(dtype, offset, segment, tilt):
+    """Eight segments along an oblique direction at `offset` from the origin (so rounding falls across the
+    segments, not only along them), frames built in float64 then cast, each frame's third axis turned by `tilt`
+    radians about an axis normal to the rod."""
+    w = np.array([1.0, 0.7, -0.4]) / np.linalg.norm([1.0, 0.7, -0.4])
+    x = offset + segment * np.arange(9)[:, None] * w
+    u = np.cross([0.0, 1.0, 0.0], w)
+    u /= np.linalg.norm(u)
+    frame = Rotation.from_rotvec(tilt * u) * Rotation.from_matrix(np.column_stack((u, np.cross(w, u), w)))
+    q = np.tile(frame.as_quat(scalar_first=True), (8, 1))
+    return RodModel(torch.tensor(x, dtype=dtype), torch.tensor(q, dtype=dtype), 1e-4,
+                    RodParameters(1000.0, 1e3, 1e3, 1e4, 1e6, 0.0))
+
+
+def test_the_rest_frame_check_holds_each_precision_to_what_it_can_represent():
+    """Half-millimetre segments 0.1 m from the origin, as in the snake head. In float32 their directions carry
+    about 1e-5 of rounding, so the check allows what the precision can represent (8 eps |x| / L); in float64
+    that bound is far below 1e-6, and 1e-6 stays the tolerance."""
+    offset = np.array([0.1, -0.08, 0.12])
+    _straight_rod(torch.float32, offset, 5e-4, 0.0)
+    with pytest.raises(ValueError, match="align with its centreline"):
+        _straight_rod(torch.float32, offset, 5e-4, 1e-3)
+    _straight_rod(torch.float64, offset, 5e-4, 0.0)
+    with pytest.raises(ValueError, match="align with its centreline"):
+        _straight_rod(torch.float64, offset, 5e-4, 1e-5)
+
+
 def test_random_rotated_rest_states_do_not_request_unresolvable_descent():
     rng = np.random.default_rng(392)
     for _ in range(8):
