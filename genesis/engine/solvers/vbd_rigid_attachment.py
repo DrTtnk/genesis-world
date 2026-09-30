@@ -305,59 +305,76 @@ def func_glue_link_terms(f, i_l, i_b, origin, solver: qd.template(), attachment:
     the underestimate `func_contact_link_terms` documents."""
     force6 = qd.Vector.zero(gs.qd_float, 6)
     hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
-    inv_h2 = 1.0 / (solver._substep_dt * solver._substep_dt)
     for c in range(attachment.link_glue_vert_offset[i_l], attachment.link_glue_vert_offset[i_l + 1]):
-        i_v = attachment.link_glue_vert[c]
-        m_h2 = solver.verts_info[i_v].mass * inv_h2
-        x = solver.verts[f + 1, i_v, i_b].pos
-        J = func_rigid_jacobian(x - origin)
-        force6 += J.transpose() @ (-m_h2 * (x - solver._func_inertia_target(f, i_v, i_b)))
-        hessian6 += m_h2 * J.transpose() @ J
-    identity = qd.Matrix.identity(gs.qd_float, 3)
+        vertex_force, vertex_hessian = func_glue_vertex_terms(f, c, i_b, origin, solver, attachment)
+        force6 += vertex_force
+        hessian6 += vertex_hessian
     for c in range(attachment.link_glue_elem_offset[i_l], attachment.link_glue_elem_offset[i_l + 1]):
-        i_e = attachment.link_glue_elem[c]
-        mask = attachment.link_glue_mask[c]
-        v = solver.elems_info[i_e].v
-        F, B = solver._func_deformation(f + 1, i_e, i_b)
-        mu = solver.elems_info[i_e].mu
-        lam = solver.elems_info[i_e].lam
-        cof = solver._func_cofactor(F)
-        P = mu * F + lam * (F.determinant() - (1.0 + mu / lam)) * cof
-        V = solver.elems_info[i_e].vol_rest
-        k_fiber = solver.elems_info[i_e].k_fiber
-        B0 = solver.elems_info[i_e].B_rest
-        a = solver.elems_info[i_e].fiber
-        p0 = solver.verts[f + 1, v[0], i_b].pos
-        Ds = qd.Matrix.cols(
-            [solver.verts[f + 1, v[1], i_b].pos - p0, solver.verts[f + 1, v[2], i_b].pos - p0,
-             solver.verts[f + 1, v[3], i_b].pos - p0]
-        )
-        u = (Ds @ B0) @ a
-        u_hat = u.normalized()
-        for r in qd.static(range(4)):
-            if (mask >> r) & 1:
-                w_r = solver._func_vertex_weight_static(B, r)
-                J_r = func_rigid_jacobian(solver.verts[f + 1, v[r], i_b].pos - origin)
-                f_r = -V * (P @ w_r)
-                if k_fiber > 0.0:
-                    f_fib, _, _ = solver._func_fiber_terms(f + 1, i_e, i_b, solver._func_vertex_weight_static(B0, r))
-                    f_r += f_fib
-                force6 += J_r.transpose() @ f_r
-                for s_ in qd.static(range(4)):
-                    if (mask >> s_) & 1:
-                        w_s = solver._func_vertex_weight_static(B, s_)
-                        J_s = func_rigid_jacobian(solver.verts[f + 1, v[s_], i_b].pos - origin)
-                        block = V * mu * w_r.dot(w_s) * identity + V * lam * (cof @ w_r).outer_product(cof @ w_s)
-                        if k_fiber > 0.0:
-                            block += (
-                                V * k_fiber * solver._func_vertex_weight_static(B0, r).dot(a)
-                                * solver._func_vertex_weight_static(B0, s_).dot(a) * u_hat.outer_product(u_hat)
-                            )
-                        hessian6 += J_r.transpose() @ block @ J_s
+        elem_force, elem_hessian = func_glue_elem_terms(f, c, i_b, origin, solver, attachment)
+        force6 += elem_force
+        hessian6 += elem_hessian
     if qd.static(solver.has_rod_native):
         force_r, hessian_r = func_glue_rod_terms(f, i_l, i_b, origin, solver, attachment, solver.rod_native)
         force6 += force_r
         hessian6 += hessian_r
+    return force6, hessian6
+
+
+@qd.func
+def func_glue_vertex_terms(f, c, i_b, origin, solver: qd.template(), attachment: qd.template()):
+    """The inertia and gravity of the glued vertex at `link_glue_vert[c]`, carried to its link's block."""
+    i_v = attachment.link_glue_vert[c]
+    m_h2 = solver.verts_info[i_v].mass * (1.0 / (solver._substep_dt * solver._substep_dt))
+    x = solver.verts[f + 1, i_v, i_b].pos
+    J = func_rigid_jacobian(x - origin)
+    return J.transpose() @ (-m_h2 * (x - solver._func_inertia_target(f, i_v, i_b))), m_h2 * J.transpose() @ J
+
+
+@qd.func
+def func_glue_elem_terms(f, c, i_b, origin, solver: qd.template(), attachment: qd.template()):
+    """The tetrahedron at `link_glue_elem[c]`, through the corners its link carries (`link_glue_mask[c]`)."""
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
+    identity = qd.Matrix.identity(gs.qd_float, 3)
+    i_e = attachment.link_glue_elem[c]
+    mask = attachment.link_glue_mask[c]
+    v = solver.elems_info[i_e].v
+    F, B = solver._func_deformation(f + 1, i_e, i_b)
+    mu = solver.elems_info[i_e].mu
+    lam = solver.elems_info[i_e].lam
+    cof = solver._func_cofactor(F)
+    P = mu * F + lam * (F.determinant() - (1.0 + mu / lam)) * cof
+    V = solver.elems_info[i_e].vol_rest
+    k_fiber = solver.elems_info[i_e].k_fiber
+    B0 = solver.elems_info[i_e].B_rest
+    a = solver.elems_info[i_e].fiber
+    p0 = solver.verts[f + 1, v[0], i_b].pos
+    Ds = qd.Matrix.cols(
+        [solver.verts[f + 1, v[1], i_b].pos - p0, solver.verts[f + 1, v[2], i_b].pos - p0,
+         solver.verts[f + 1, v[3], i_b].pos - p0]
+    )
+    u = (Ds @ B0) @ a
+    u_hat = u.normalized()
+    for r in qd.static(range(4)):
+        if (mask >> r) & 1:
+            w_r = solver._func_vertex_weight_static(B, r)
+            J_r = func_rigid_jacobian(solver.verts[f + 1, v[r], i_b].pos - origin)
+            f_r = -V * (P @ w_r)
+            if k_fiber > 0.0:
+                f_fib, _, _ = solver._func_fiber_terms(f + 1, i_e, i_b, solver._func_vertex_weight_static(B0, r))
+                f_r += f_fib
+            force6 += J_r.transpose() @ f_r
+            for s_ in qd.static(range(4)):
+                if (mask >> s_) & 1:
+                    w_s = solver._func_vertex_weight_static(B, s_)
+                    J_s = func_rigid_jacobian(solver.verts[f + 1, v[s_], i_b].pos - origin)
+                    block = V * mu * w_r.dot(w_s) * identity + V * lam * (cof @ w_r).outer_product(cof @ w_s)
+                    if k_fiber > 0.0:
+                        block += (
+                            V * k_fiber * solver._func_vertex_weight_static(B0, r).dot(a)
+                            * solver._func_vertex_weight_static(B0, s_).dot(a) * u_hat.outer_product(u_hat)
+                        )
+                    hessian6 += J_r.transpose() @ block @ J_s
     return force6, hessian6
 
 
@@ -370,33 +387,45 @@ def func_glue_rod_terms(f, i_l, i_b, origin, solver: qd.template(), attachment: 
     force6 = qd.Vector.zero(gs.qd_float, 6)
     hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
     for c in range(attachment.link_glue_vert_offset[i_l], attachment.link_glue_vert_offset[i_l + 1]):
-        i_v = attachment.link_glue_vert[c]
-        for side in qd.static(range(2)):
-            j = rod.seg_prev[i_v]
-            if qd.static(side == 1):
-                j = rod.seg_next[i_v]
-            if j >= 0:
-                a = rod.seg[j].node0
-                if i_v == a or attachment.glue_link[a] != i_l:
-                    L = rod.seg[j].length
-                    t = func_tangent(f, j, i_b, solver, rod)
-                    d3 = func_frame(rod.quat[j, i_b])[:, 2]
-                    mid = func_mid_scale(j, i_b, rod)
-                    ws = rod.seg[j].w_str
-                    wv = rod.seg[j].w_vol
-                    T_s = qd.Matrix.zero(gs.qd_float, 3, 6)
-                    T_v = qd.Matrix.zero(gs.qd_float, 3, 6)
-                    for end in qd.static(range(2)):
-                        node = a + end
-                        if attachment.glue_link[node] == i_l:
-                            sign = gs.qd_float(1.0)
-                            if qd.static(end == 0):
-                                sign = -1.0
-                            J = func_rigid_jacobian(solver.verts[f + 1, node, i_b].pos - origin)
-                            T_s += (sign * ws / L) * J
-                            T_v += (sign * wv * mid * mid / L) * J
-                    force6 -= T_s.transpose() @ (ws * (t - d3)) + T_v.transpose() @ (wv * (mid * mid * t - d3))
-                    hessian6 += T_s.transpose() @ T_s + T_v.transpose() @ T_v
+        vertex_force, vertex_hessian = func_glue_rod_vertex_terms(f, i_l, c, i_b, origin, solver, attachment, rod)
+        force6 += vertex_force
+        hessian6 += vertex_hessian
+    return force6, hessian6
+
+
+@qd.func
+def func_glue_rod_vertex_terms(f, i_l, c, i_b, origin, solver: qd.template(), attachment: qd.template(),
+                               rod: qd.template()):
+    """The rod segments on both sides of the glued vertex at `link_glue_vert[c]` that this vertex carries."""
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
+    i_v = attachment.link_glue_vert[c]
+    for side in qd.static(range(2)):
+        j = rod.seg_prev[i_v]
+        if qd.static(side == 1):
+            j = rod.seg_next[i_v]
+        if j >= 0:
+            a = rod.seg[j].node0
+            if i_v == a or attachment.glue_link[a] != i_l:
+                L = rod.seg[j].length
+                t = func_tangent(f, j, i_b, solver, rod)
+                d3 = func_frame(rod.quat[j, i_b])[:, 2]
+                mid = func_mid_scale(j, i_b, rod)
+                ws = rod.seg[j].w_str
+                wv = rod.seg[j].w_vol
+                T_s = qd.Matrix.zero(gs.qd_float, 3, 6)
+                T_v = qd.Matrix.zero(gs.qd_float, 3, 6)
+                for end in qd.static(range(2)):
+                    node = a + end
+                    if attachment.glue_link[node] == i_l:
+                        sign = gs.qd_float(1.0)
+                        if qd.static(end == 0):
+                            sign = -1.0
+                        J = func_rigid_jacobian(solver.verts[f + 1, node, i_b].pos - origin)
+                        T_s += (sign * ws / L) * J
+                        T_v += (sign * wv * mid * mid / L) * J
+                force6 -= T_s.transpose() @ (ws * (t - d3)) + T_v.transpose() @ (wv * (mid * mid * t - d3))
+                hessian6 += T_s.transpose() @ T_s + T_v.transpose() @ T_v
     return force6, hessian6
 
 
@@ -493,6 +522,19 @@ def kernel_begin_attachment(
 @qd.func
 def func_attachment_link_base(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
     """The first terms of one free body's block: its inertia, its vertex attachments and its glued tissue."""
+    force, hessian = func_attachment_link_own(f, i_f, i_b, solver, attachment)
+    if qd.static(attachment.has_glue):
+        force_g, hessian_g = func_glue_link_terms(
+            f, attachment.free_info[i_f].link, i_b, attachment.link_state[i_f, i_b].pos, solver, attachment
+        )
+        force += force_g
+        hessian += hessian_g
+    return force, hessian
+
+
+@qd.func
+def func_attachment_link_own(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
+    """A free body's inertia and its vertex attachments."""
     i_l = attachment.free_info[i_f].link
     state = attachment.link_state[i_f, i_b]
     force = qd.Vector.zero(gs.qd_float, 6)
@@ -519,10 +561,6 @@ def func_attachment_link_base(f, i_f, i_b, solver: qd.template(), attachment: qd
         )
         force += rigid_force
         hessian += rigid_hessian
-    if qd.static(attachment.has_glue):
-        force_g, hessian_g = func_glue_link_terms(f, i_l, i_b, state.pos, solver, attachment)
-        force += force_g
-        hessian += hessian_g
     return force, hessian
 
 
@@ -543,6 +581,13 @@ def func_attachment_link_tail(i_f, i_b, force, hessian, solver: qd.template(), a
 @qd.func
 def func_apply_attachment_link(f, i_f, i_b, force, hessian, solver: qd.template(), attachment: qd.template()):
     """Solve the block, move the body and refresh every cache that follows its pose."""
+    func_move_attachment_link(i_f, i_b, force, hessian, attachment)
+    func_refresh_attachment_link(f, i_f, i_b, solver, attachment)
+
+
+@qd.func
+def func_move_attachment_link(i_f, i_b, force, hessian, attachment: qd.template()):
+    """Solve the block and move the body; the caches that follow its pose are left to the caller."""
     i_l = attachment.free_info[i_f].link
     state = attachment.link_state[i_f, i_b]
     increment = func_ldlt6_solve(hessian, force)
@@ -550,6 +595,12 @@ def func_apply_attachment_link(f, i_f, i_b, force, hessian, solver: qd.template(
     attachment.link_state[i_f, i_b].quat = func_quaternion_update(state.quat, increment[3:6])
     attachment.link_pose[i_l, i_b].pos = attachment.link_state[i_f, i_b].pos
     attachment.link_pose[i_l, i_b].quat = attachment.link_state[i_f, i_b].quat
+
+
+@qd.func
+def func_refresh_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
+    """Glued vertices, active rigid contact vertices and muscle anchors of the body, at its pose."""
+    i_l = attachment.free_info[i_f].link
     if qd.static(attachment.has_glue):
         func_refresh_glue(
             f, i_l, i_b, attachment.link_state[i_f, i_b].pos, attachment.link_state[i_f, i_b].quat, solver, attachment

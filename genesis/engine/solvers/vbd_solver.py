@@ -86,6 +86,7 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
 )
 from genesis.engine.solvers.vbd_rigid_colouring import (
     VBDRigidColouring,
+    func_refresh_item,
     func_rigid_entry_terms,
     func_solve_attachment_link_entries,
     kernel_clear_rigid_colour_errno,
@@ -2328,8 +2329,8 @@ class VBDSolver(Solver):
         new pose of every coupled body of an earlier colour. The colour is a runtime argument for the same reason
         as the sweep index: a static loop over the colours would inline the block solve once a colour.
 
-        The colour's entries (contact slots and link anchors) are computed first, one thread an entry, then each
-        body sums its own in order and solves."""
+        Three passes, one thread an item: the colour's entries (glue, contact slots, link anchors, joints), then
+        each body's block summed from its own and solved, then the caches at the new poses."""
         for t in range(self.rigid_colouring.colour_entry_max[c] * self._B):
             i_b = t % self._B
             e = self.rigid_colouring.colour_entry_offset[c, i_b] + t // self._B
@@ -2342,6 +2343,11 @@ class VBDSolver(Solver):
                     f, self.rigid_colouring.colour_body[begin + k, i_b], i_b, self, self.rigid_attachment,
                     self.rigid_colouring,
                 )
+        for t in range(self.rigid_colouring.colour_refresh_max[c] * self._B):
+            i_b = t % self._B
+            r = self.rigid_colouring.colour_refresh_offset[c, i_b] + t // self._B
+            if not self.env_failed[i_b] and r < self.rigid_colouring.colour_refresh_offset[c + 1, i_b]:
+                func_refresh_item(f, r, i_b, self, self.rigid_attachment, self.rigid_colouring)
 
     @qd.kernel
     def _kernel_sweep_duals(self, f: qd.i32, sweep: qd.i32):

@@ -79,41 +79,52 @@ def func_joint_link_terms(i_l, i_b, attachment: qd.template(), joints: qd.templa
     `attachment.link_pose`, which holds each free body's latest solved pose and each fixed link's own."""
     force6 = qd.Vector.zero(gs.qd_float, 6)
     hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
-    identity = qd.Matrix.identity(gs.qd_float, 3)
     for c in range(joints.link_joint_offset[i_l], joints.link_joint_offset[i_l + 1]):
-        info = joints.info[joints.link_joint[c]]
-        pa = attachment.link_pose[info.link_a, i_b].pos
-        pb = attachment.link_pose[info.link_b, i_b].pos
-        Ra = gu.qd_quat_to_R(attachment.link_pose[info.link_a, i_b].quat, gs.EPS)
-        Rb = gu.qd_quat_to_R(attachment.link_pose[info.link_b, i_b].quat, gs.EPS)
-        ra = Ra @ info.centre_a
-        rb = Rb @ info.centre_b
-        d = pb + rb - pa - ra
-        for i in qd.static(range(3)):
-            e = Ra @ gs.qd_vec3(info.axes_a[0, i], info.axes_a[1, i], info.axes_a[2, i])
-            f = Rb @ gs.qd_vec3(info.axes_b[0, i], info.axes_b[1, i], info.axes_b[2, i])
-            J = qd.Vector.zero(gs.qd_float, 6)
-            Jw = qd.Matrix.zero(gs.qd_float, 3, 3)
-            if i_l == info.link_a:
-                torque_arm = e.cross(d + ra)
-                Jw = e.outer_product(f) - e.dot(f) * identity
-                for j in qd.static(range(3)):
-                    J[j] = -e[j]
-                    J[j + 3] = torque_arm[j]
-            else:
-                torque_arm = rb.cross(e)
-                Jw = e.dot(f) * identity - f.outer_product(e)
-                for j in qd.static(range(3)):
-                    J[j] = e[j]
-                    J[j + 3] = torque_arm[j]
-            u = e.dot(d)
-            force6 -= info.kt[i] * u * J
-            hessian6 += info.kt[i] * J.outer_product(J)
-            w = e.cross(f)
-            torque = Jw.transpose() @ w
-            block = Jw.transpose() @ Jw
+        joint_force, joint_hessian = func_joint_terms(i_l, c, i_b, attachment, joints)
+        force6 += joint_force
+        hessian6 += joint_hessian
+    return force6, hessian6
+
+
+@qd.func
+def func_joint_terms(i_l, c, i_b, attachment: qd.template(), joints: qd.template()):
+    """The joint at `link_joint[c]`, seen from link i_l."""
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
+    identity = qd.Matrix.identity(gs.qd_float, 3)
+    info = joints.info[joints.link_joint[c]]
+    pa = attachment.link_pose[info.link_a, i_b].pos
+    pb = attachment.link_pose[info.link_b, i_b].pos
+    Ra = gu.qd_quat_to_R(attachment.link_pose[info.link_a, i_b].quat, gs.EPS)
+    Rb = gu.qd_quat_to_R(attachment.link_pose[info.link_b, i_b].quat, gs.EPS)
+    ra = Ra @ info.centre_a
+    rb = Rb @ info.centre_b
+    d = pb + rb - pa - ra
+    for i in qd.static(range(3)):
+        e = Ra @ gs.qd_vec3(info.axes_a[0, i], info.axes_a[1, i], info.axes_a[2, i])
+        f = Rb @ gs.qd_vec3(info.axes_b[0, i], info.axes_b[1, i], info.axes_b[2, i])
+        J = qd.Vector.zero(gs.qd_float, 6)
+        Jw = qd.Matrix.zero(gs.qd_float, 3, 3)
+        if i_l == info.link_a:
+            torque_arm = e.cross(d + ra)
+            Jw = e.outer_product(f) - e.dot(f) * identity
             for j in qd.static(range(3)):
-                force6[j + 3] -= info.kr[i] * torque[j]
-                for k in qd.static(range(3)):
-                    hessian6[j + 3, k + 3] += info.kr[i] * block[j, k]
+                J[j] = -e[j]
+                J[j + 3] = torque_arm[j]
+        else:
+            torque_arm = rb.cross(e)
+            Jw = e.dot(f) * identity - f.outer_product(e)
+            for j in qd.static(range(3)):
+                J[j] = e[j]
+                J[j + 3] = torque_arm[j]
+        u = e.dot(d)
+        force6 -= info.kt[i] * u * J
+        hessian6 += info.kt[i] * J.outer_product(J)
+        w = e.cross(f)
+        torque = Jw.transpose() @ w
+        block = Jw.transpose() @ Jw
+        for j in qd.static(range(3)):
+            force6[j + 3] -= info.kr[i] * torque[j]
+            for k in qd.static(range(3)):
+                hessian6[j + 3, k + 3] += info.kr[i] * block[j, k]
     return force6, hessian6
