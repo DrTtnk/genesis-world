@@ -132,7 +132,8 @@ def run(substeps, contact_ccd, pair_cap, frames, n_along, n_around, margin, stif
     contact = scene.vbd_solver.contact
     contact.clear_toi()
     semi_axes = np.array(SEMI_AXES)
-    grid_mb = contact.hash_buckets * contact.hash_cap * scene.vbd_solver._B * 4 * 4 / 2**20
+    # entries: an index and a four-int key; buckets: a count and a start
+    grid_mb = (contact.hash_entries * 5 + contact.hash_buckets * 2) * scene.vbd_solver._B * 4 / 2**20
 
     peak_pt = peak_ee = timed_frames = 0
     worst_depth = 0.0

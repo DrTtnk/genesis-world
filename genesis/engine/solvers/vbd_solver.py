@@ -267,7 +267,7 @@ class VBDSolver(Solver):
         self._rigid_colliders = []
         self._prescribed_colliders = []
         self._contact_pair_cap = options.contact_pair_cap
-        self._contact_cell_cap = options.contact_cell_cap
+        self._contact_hash_entries = options.contact_hash_entries
         self._rigid_colour_cap = options.rigid_colour_cap
         self._rigid_entry_cap = options.rigid_entry_cap
         self._contact_sweep_cell_cap = options.contact_sweep_cell_cap
@@ -670,8 +670,8 @@ class VBDSolver(Solver):
         # safe bound and rebuilt (or will, next substep). See VBDContact.d_budget and ContactDiagnostics.
         if errno & ErrorCode.INVALID_VBD_CONTACT_NAN:
             messages.append("A contact pair has a non-finite distance.")
-        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_CELL:
-            messages.append("More contact vertices in one hash cell than VBDOptions.contact_cell_cap allows.")
+        if errno & ErrorCode.OVERFLOW_VBD_CONTACT_HASH:
+            messages.append("More contact hash entries than VBDOptions.contact_hash_entries allows.")
         if errno & ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS:
             messages.append("More candidate contact pairs than VBDOptions.contact_pair_cap allows.")
         if errno & ErrorCode.OVERFLOW_VBD_CONTACT_SWEEP:

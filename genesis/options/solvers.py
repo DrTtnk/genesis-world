@@ -988,11 +988,14 @@ class VBDOptions(Options):
         anchors) in one substep. Each colour first computes its bodies' entries one thread an entry, so that a body
         with hundreds of contacts is not one thread's work. A substep with more entries fails with an error.
         Memory is 42 floats an entry. Defaults to 16384.
-    contact_cell_cap : int, optional
-        Largest number of entries a hash bucket may hold in either phase: swept vertices for point-triangle
-        search, then swept edge boxes for edge-edge search. Overflow fails the substep rather than dropping a
-        candidate silently. Read this with `contact_cell_size`: larger cells hold more entries. Defaults to
-        256, which is 31 MB of hash slots on a 15 thousand vertex scene.
+    contact_hash_entries : int, optional
+        Largest number of entries the candidate search's hash may hold in either phase: each swept vertex once
+        for every cell of its swept box (point-triangle search), then each edge once for every cell of its swept
+        box (edge-edge search). A build stores the entries contiguously by bucket, so one bucket holds whatever
+        its cells hold; only this total is bounded, and exceeding it fails the substep rather than dropping a
+        candidate silently. Memory is 20 bytes an entry. Left unset it is eight times the larger of the contact
+        vertex count and the edge entries of the rest pose: 1.4 million entries, 28 MB, on the python head's 15
+        thousand contact vertices.
     contact_sweep_cell_cap : int, optional
         Largest number of hash-grid cells one contact vertex may sweep in a substep. Vertex motion is the
         product of the three cell spans; overflow fails the substep instead of leaving its path unsearched.
@@ -1016,8 +1019,8 @@ class VBDOptions(Options):
         into 350 cells, the largest into 36288, and a substep made 20 million cell visits to keep 560 pairs.
         Left unset it is the median contact edge length, floored at twice the reach so that growing a box by
         the reach can never add more than one cell a side. Raise it and each box touches fewer cells while each
-        cell holds more vertices or edges; the product has a minimum near the mesh's own scale, and far above it
-        `contact_cell_cap` can overflow.
+        cell holds more vertices or edges; the product has a minimum near the mesh's own scale. Far below it, the
+        boxes cover so many cells that `contact_hash_entries` can overflow.
     contact_crossing_depth : float, optional
         How far behind a face (m) a contact point may be before the substep is refused as a crossing the penalty
         failed to hold. The signed point-triangle force already pushes a point that slipped behind back out, so
@@ -1117,7 +1120,7 @@ class VBDOptions(Options):
     contact_pair_cap: PositiveInt = 65536
     rigid_colour_cap: PositiveInt = 8
     rigid_entry_cap: PositiveInt = 16384
-    contact_cell_cap: PositiveInt = 256
+    contact_hash_entries: Optional[PositiveInt] = None
     contact_sweep_cell_cap: PositiveInt = 512
     contact_margin: Optional[float] = None
     contact_margin_max: Optional[float] = None

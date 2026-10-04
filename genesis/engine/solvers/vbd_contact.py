@@ -357,10 +357,31 @@ class VBDContact:
         )
         if not self.cell > 0.0:
             gs.raise_exception(f"VBDOptions.contact_cell_size must be above zero, got {self.cell}.")
-        self.hash_buckets = 2 * self.n_cv
-        self.hash_cap = solver._contact_cell_cap
+        # The hash holds one entry per cell of each swept box: the vertices' for the point-triangle search, then the
+        # edges' for the edge-edge search. A build stores them contiguously by bucket -- count each bucket's
+        # entries, prefix-sum the counts into each bucket's start, fill -- so a bucket holds whatever its cells
+        # hold, and only the total is bounded. Fixed-capacity buckets were sized for the vertices (two buckets a
+        # contact vertex, 256 slots each): the python head's bones put 243 thousand edge entries into 30 thousand
+        # buckets, a query read 14 entries of other cells for every one of its own, and a bucket overflowed as
+        # the jaws came to rest. An entry's key is its cell and its collision group, so a query rejects an entry
+        # of a group it has no rule with from the key alone: on the same head, half of all reads had been edges of
+        # the searching edge's own bone, each rejected by `func_may_collide` only after looking up the edge, its
+        # ends and its box. Keying the buckets by group instead was tried and was slower: a group there has rules
+        # with most others, so every cell became fifteen queries.
+        lo = np.floor(np.minimum(rest[edges[:, 0]], rest[edges[:, 1]]) / self.cell)
+        hi = np.floor(np.maximum(rest[edges[:, 0]], rest[edges[:, 1]]) / self.cell)
+        rest_entries = max(self.n_cv, int(np.prod(hi - lo + 1, axis=1).sum()))
+        self.hash_buckets = 2 * rest_entries
+        self.hash_entries = (
+            8 * rest_entries if solver._contact_hash_entries is None else solver._contact_hash_entries
+        )
+        # each bucket's entry count, reused as its fill cursor; each bucket's first entry, and the total last
         self.cell_n = qd.field(dtype=gs.qd_int, shape=(self.hash_buckets, solver._B))
-        self.cell_v = qd.field(dtype=gs.qd_int, shape=(self.hash_buckets, self.hash_cap, solver._B))
+        self.cell_start = qd.field(dtype=gs.qd_int, shape=(self.hash_buckets + 1, solver._B))
+        self.cell_v = qd.field(dtype=gs.qd_int, shape=(self.hash_entries, solver._B))
+        self.hash_scan_block = max(int(np.ceil(np.sqrt(self.hash_buckets))), 1)
+        self.hash_scan_blocks = -(-self.hash_buckets // self.hash_scan_block)
+        self.hash_scan_total = qd.field(dtype=gs.qd_int, shape=(self.hash_scan_blocks, solver._B))
         # the inclusive cell range a contact vertex sweeps over the substep, and its predicted end position: the
         # grid holds the vertex in every cell of that range, and the pair tests read both ends of the sweep
         self.cv_lo = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
@@ -369,10 +390,9 @@ class VBDContact:
         # only these two edge ranges need separate storage to deduplicate a pair's shared cells exactly.
         self.edge_lo = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_edges, solver._B))
         self.edge_hi = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_edges, solver._B))
-        # the cell each bucket slot was inserted under: two cells of one vertex's own sweep can hash to the
-        # same bucket, and this is what a query tells them apart without scanning the bucket (see
-        # `func_is_own_cell`)
-        self.cell_c = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.hash_buckets, self.hash_cap, solver._B))
+        # the cell and group each entry was inserted under: two keys can hash to one bucket, including two cells of
+        # one vertex's own sweep, and this is what a query tells them apart by (see `func_is_own_entry`)
+        self.cell_key = qd.Vector.field(4, dtype=gs.qd_int, shape=(self.hash_entries, solver._B))
         self.cv_pred = qd.Vector.field(3, dtype=gs.qd_float, shape=(self.n_cv, solver._B))
         # A sweep that spans more cells than this is refused rather than searched: the rasterization is the
         # product of the three spans, so a body that travels hundreds of cells in one substep would cost more to
@@ -1338,16 +1358,61 @@ def func_is_canonical_edge_cell(i_e, i_b, cell, lo, contact: qd.template()):
 
 
 @qd.func
-def func_is_own_cell(h, slot, i_b, cell, contact: qd.template()):
-    """Whether this vertex- or edge-bucket slot was inserted under the cell currently being searched.
+def func_is_own_entry(slot, i_b, cell, group, contact: qd.template()):
+    """Whether this hash entry was inserted under the cell currently being searched, by a group that `group`
+    has a rule with. Both are read from the entry's own key, before anything the entry names is looked up.
 
-    Two cells of one swept primitive can hash to the same bucket, which puts it there twice, and both
-    entries then pass the canonical-cell test, since that test reads the searched cell and not the entry. But
-    the two entries were inserted under different cells -- that is the only way they could collide rather than
-    be the same insert -- so at most one of them can carry the cell being searched. Accepting only that one is
-    what used to take `func_is_first_entry`'s O(slot) scan of the bucket; this is O(1).
+    Two cells can hash to the same bucket, including two cells of one swept primitive, which puts it there
+    twice; both of its entries then pass the canonical-cell test, since that test reads the searched cell and
+    not the entry. But the two entries were inserted under different cells -- that is the only way they could
+    collide rather than be the same insert -- so at most one of them carries the cell being searched. Accepting
+    only that one is what used to take `func_is_first_entry`'s O(slot) scan of the bucket; this is O(1).
     """
-    return (contact.cell_c[h, slot, i_b] == cell).all()
+    key = contact.cell_key[slot, i_b]
+    return key[0] == cell[0] and key[1] == cell[1] and key[2] == cell[2] and contact.rule_stiffness[group, key[3]] > 0.0
+
+
+@qd.func
+def func_hash_scan(solver: qd.template(), contact: qd.template()):
+    """Each bucket's first entry from the counts in `cell_n`, which are reset to serve as the fill cursors.
+
+    The exclusive prefix sum runs in sqrt(buckets) blocks: each block's total, the totals' prefix sum, then each
+    block's own, so that no thread walks every bucket. A total above the capacity fails the substep, and the
+    fills and queries clamp to the capacity, so an overflowing build drops entries only after it has been
+    reported."""
+    for i_k, i_b in qd.ndrange(contact.hash_scan_blocks, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            total = 0
+            for h in range(i_k * contact.hash_scan_block, qd.min((i_k + 1) * contact.hash_scan_block, contact.hash_buckets)):
+                total += contact.cell_n[h, i_b]
+            contact.hash_scan_total[i_k, i_b] = total
+    for i_b in range(solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            run = 0
+            for i_k in range(contact.hash_scan_blocks):
+                total = contact.hash_scan_total[i_k, i_b]
+                contact.hash_scan_total[i_k, i_b] = run
+                run += total
+            contact.cell_start[contact.hash_buckets, i_b] = run
+            if run > contact.hash_entries:
+                qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_HASH)
+    for i_k, i_b in qd.ndrange(contact.hash_scan_blocks, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            run = contact.hash_scan_total[i_k, i_b]
+            for h in range(i_k * contact.hash_scan_block, qd.min((i_k + 1) * contact.hash_scan_block, contact.hash_buckets)):
+                contact.cell_start[h, i_b] = run
+                run += contact.cell_n[h, i_b]
+                contact.cell_n[h, i_b] = 0
+
+
+@qd.func
+def func_hash_insert(cell, group, value, i_b, contact: qd.template()):
+    """Fill one entry of a counted build (see `func_hash_scan`)."""
+    h = func_cell_hash(cell, contact.hash_buckets)
+    slot = contact.cell_start[h, i_b] + qd.atomic_add(contact.cell_n[h, i_b], 1)
+    if slot < contact.hash_entries:
+        contact.cell_v[slot, i_b] = value
+        contact.cell_key[slot, i_b] = qd.Vector([cell[0], cell[1], cell[2], group], dt=gs.qd_int)
 
 
 @qd.func
@@ -1421,6 +1486,7 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                     quat = solver.rigid_attachment.link_pose[i_l, i_b].quat
             contact.rv_pos_prev[i_r, i_b] = contact.rv_pos[i_r, i_b]
             contact.rv_pos[i_r, i_b] = gu.qd_transform_by_trans_quat(contact.rv_local[i_r], pos, quat)
+    # The vertex hash for the point-triangle search: count each bucket's entries, prefix-sum, fill.
     for h, i_b in qd.ndrange(contact.hash_buckets, solver._B):
         if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             contact.cell_n[h, i_b] = 0
@@ -1445,13 +1511,18 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                         for cj in range(lo[1], hi[1] + 1):
                             for ck in range(lo[2], hi[2] + 1):
                                 cell = qd.Vector([ci, cj, ck], dt=gs.qd_int)
-                                h = func_cell_hash(cell, contact.hash_buckets)
-                                slot = qd.atomic_add(contact.cell_n[h, i_b], 1)
-                                if slot < contact.hash_cap:
-                                    contact.cell_v[h, slot, i_b] = cv
-                                    contact.cell_c[h, slot, i_b] = cell
-                                else:
-                                    qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
+                                qd.atomic_add(contact.cell_n[func_cell_hash(cell, contact.hash_buckets), i_b], 1)
+    func_hash_scan(solver, contact)
+    for cv, i_b in qd.ndrange(contact.n_cv, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            lo = contact.cv_lo[cv, i_b]
+            hi = contact.cv_hi[cv, i_b]
+            if (hi[0] - lo[0] + 1) * (hi[1] - lo[1] + 1) * (hi[2] - lo[2] + 1) <= contact.sweep_cell_cap:
+                group = contact.cv_info[cv].group
+                for ci in range(lo[0], hi[0] + 1):
+                    for cj in range(lo[1], hi[1] + 1):
+                        for ck in range(lo[2], hi[2] + 1):
+                            func_hash_insert(qd.Vector([ci, cj, ck], dt=gs.qd_int), group, cv, i_b, contact)
     for i_b in range(solver._B):
         if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             contact.n_pt[i_b] = 0
@@ -1474,15 +1545,18 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
             high = qd.max(qd.max(qd.max(a, b), c), qd.max(qd.max(a0, b0), c0))
             lo = func_cell(low - reach, contact.cell)
             hi = func_cell(high + reach, contact.cell)
+            group = contact.cv_info[tri[0]].group
             for ci in range(lo[0], hi[0] + 1):
                 for cj in range(lo[1], hi[1] + 1):
                     for ck in range(lo[2], hi[2] + 1):
                         cell = qd.Vector([ci, cj, ck], dt=gs.qd_int)
                         h = func_cell_hash(cell, contact.hash_buckets)
-                        for slot in range(qd.min(contact.cell_n[h, i_b], contact.hash_cap)):
-                            cv = contact.cell_v[h, slot, i_b]
-                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_own_cell(
-                                h, slot, i_b, cell, contact
+                        for slot in range(
+                            contact.cell_start[h, i_b], qd.min(contact.cell_start[h + 1, i_b], contact.hash_entries)
+                        ):
+                            cv = contact.cell_v[slot, i_b]
+                            is_new = func_is_own_entry(slot, i_b, cell, group, contact) and func_is_canonical_cell(
+                                cv, i_b, cell, lo, contact
                             )
                             if is_new and func_may_collide(cv, tri[0], contact):
                                 is_adjacent = False
@@ -1511,9 +1585,10 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                             ]
                                         else:
                                             qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS)
-    # PT has finished reading the vertex hash. Reuse its buckets for complete swept edge AABBs: two long
-    # perpendicular edges can meet at their interiors while all four endpoints lie outside one another's
-    # search boxes. Hashing only vertices therefore misses exactly the EE pair that can stop a crossing.
+    # PT has finished reading the vertex hash. Rebuild it for complete swept edge AABBs: two long perpendicular
+    # edges can meet at their interiors while all four endpoints lie outside one another's search boxes. Hashing
+    # only vertices therefore misses exactly the EE pair that can stop a crossing. An edge is keyed by the group
+    # of its first end, which is the group `func_may_collide` judges it by.
     for h, i_b in qd.ndrange(contact.hash_buckets, solver._B):
         if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             contact.cell_n[h, i_b] = 0
@@ -1534,13 +1609,17 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                 for cj in range(lo[1], hi[1] + 1):
                     for ck in range(lo[2], hi[2] + 1):
                         cell = qd.Vector([ci, cj, ck], dt=gs.qd_int)
-                        h = func_cell_hash(cell, contact.hash_buckets)
-                        slot = qd.atomic_add(contact.cell_n[h, i_b], 1)
-                        if slot < contact.hash_cap:
-                            contact.cell_v[h, slot, i_b] = i_e
-                            contact.cell_c[h, slot, i_b] = cell
-                        else:
-                            qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
+                        qd.atomic_add(contact.cell_n[func_cell_hash(cell, contact.hash_buckets), i_b], 1)
+    func_hash_scan(solver, contact)
+    for i_e, i_b in qd.ndrange(contact.n_edges, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            lo = contact.edge_lo[i_e, i_b]
+            hi = contact.edge_hi[i_e, i_b]
+            group = contact.cv_info[contact.edge_cv[i_e][0]].group
+            for ci in range(lo[0], hi[0] + 1):
+                for cj in range(lo[1], hi[1] + 1):
+                    for ck in range(lo[2], hi[2] + 1):
+                        func_hash_insert(qd.Vector([ci, cj, ck], dt=gs.qd_int), group, i_e, i_b, contact)
     for i_e, i_b in qd.ndrange(contact.n_edges, solver._B):
         if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             ea = contact.edge_cv[i_e]
@@ -1551,48 +1630,51 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
             reach = contact.max_thickness + contact.margin_max
             lo = func_cell(qd.min(qd.min(a, b), qd.min(a0, b0)) - reach, contact.cell)
             hi = func_cell(qd.max(qd.max(a, b), qd.max(a0, b0)) + reach, contact.cell)
+            group = contact.cv_info[ea[0]].group
             for ci in range(lo[0], hi[0] + 1):
                 for cj in range(lo[1], hi[1] + 1):
                     for ck in range(lo[2], hi[2] + 1):
                         cell = qd.Vector([ci, cj, ck], dt=gs.qd_int)
                         h = func_cell_hash(cell, contact.hash_buckets)
-                        for slot in range(qd.min(contact.cell_n[h, i_b], contact.hash_cap)):
-                            j_e = contact.cell_v[h, slot, i_b]
-                            is_new = func_is_canonical_edge_cell(j_e, i_b, cell, lo, contact) and func_is_own_cell(
-                                h, slot, i_b, cell, contact
-                            )
-                            if j_e > i_e and is_new:
-                                eb = contact.edge_cv[j_e]
-                                if func_may_collide(ea[0], eb[0], contact):
-                                    is_adjacent = False
-                                    for j in qd.static(range(2)):
-                                        for l in qd.static(range(2)):
-                                            if func_shares_tetrahedron(ea[j], eb[l], solver, contact):
-                                                is_adjacent = True
-                                    if not is_adjacent:
-                                        c = func_cv_pos(f, eb[0], i_b, solver, contact)
-                                        d = func_cv_pos(f, eb[1], i_b, solver, contact)
-                                        c0 = func_cv_pos_prev(f, eb[0], i_b, solver, contact)
-                                        d0 = func_cv_pos_prev(f, eb[1], i_b, solver, contact)
-                                        dist = func_swept_lower_bound(
-                                            func_pair_distance(a0, b0, c0, d0, EDGE_EDGE),
-                                            func_pair_distance(a, b, c, d, EDGE_EDGE),
-                                            func_sweep_bound(a - a0, b - b0, c - c0, d - d0, EDGE_EDGE),
-                                        )
-                                        h_rule = contact.rule_thickness[
-                                            contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
-                                        ]
-                                        if dist < h_rule + contact.margin_max:
-                                            i_p = qd.atomic_add(contact.n_ee[i_b], 1)
-                                            if i_p < contact.pair_cap:
-                                                contact.ee_pairs[i_p, i_b].a = i_e
-                                                contact.ee_pairs[i_p, i_b].b = j_e
-                                                contact.ee_pairs[i_p, i_b].lam = 0.0
-                                                contact.ee_pairs[i_p, i_b].k = contact.rule_stiffness[
-                                                    contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
-                                                ]
-                                            else:
-                                                qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS)
+                        for slot in range(
+                            contact.cell_start[h, i_b], qd.min(contact.cell_start[h + 1, i_b], contact.hash_entries)
+                        ):
+                            j_e = contact.cell_v[slot, i_b]
+                            if j_e > i_e and func_is_own_entry(slot, i_b, cell, group, contact):
+                                if func_is_canonical_edge_cell(j_e, i_b, cell, lo, contact):
+                                    eb = contact.edge_cv[j_e]
+                                    if func_may_collide(ea[0], eb[0], contact):
+                                        is_adjacent = False
+                                        for j in qd.static(range(2)):
+                                            for l in qd.static(range(2)):
+                                                if func_shares_tetrahedron(ea[j], eb[l], solver, contact):
+                                                    is_adjacent = True
+                                        if not is_adjacent:
+                                            c = func_cv_pos(f, eb[0], i_b, solver, contact)
+                                            d = func_cv_pos(f, eb[1], i_b, solver, contact)
+                                            c0 = func_cv_pos_prev(f, eb[0], i_b, solver, contact)
+                                            d0 = func_cv_pos_prev(f, eb[1], i_b, solver, contact)
+                                            dist = func_swept_lower_bound(
+                                                func_pair_distance(a0, b0, c0, d0, EDGE_EDGE),
+                                                func_pair_distance(a, b, c, d, EDGE_EDGE),
+                                                func_sweep_bound(a - a0, b - b0, c - c0, d - d0, EDGE_EDGE),
+                                            )
+                                            h_rule = contact.rule_thickness[
+                                                contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
+                                            ]
+                                            if dist < h_rule + contact.margin_max:
+                                                i_p = qd.atomic_add(contact.n_ee[i_b], 1)
+                                                if i_p < contact.pair_cap:
+                                                    contact.ee_pairs[i_p, i_b].a = i_e
+                                                    contact.ee_pairs[i_p, i_b].b = j_e
+                                                    contact.ee_pairs[i_p, i_b].lam = 0.0
+                                                    contact.ee_pairs[i_p, i_b].k = contact.rule_stiffness[
+                                                        contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
+                                                    ]
+                                                else:
+                                                    qd.atomic_or(
+                                                        contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS
+                                                    )
     # A pair's multiplier carries from one substep to the next, scaled by alpha gamma as the attachments' is
     # (Giles et al. 2025 Eq. 19), so the force that corrected an old violation is not replayed in full. Resetting
     # it every substep made each substep rebuild its resting forces from zero within its own sweeps; with a start

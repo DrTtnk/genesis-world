@@ -7,9 +7,11 @@ import quadrants as qd
 import genesis as gs
 from genesis.engine.solvers.vbd_contact import (
     EDGE_EDGE,
+    POINT_TRIANGLE,
     func_cv_pos_prev,
     func_may_collide,
     func_pair_distance,
+    func_shares_tetrahedron,
     func_sweep_bound,
     func_swept_lower_bound,
 )
@@ -44,8 +46,7 @@ def kernel_exhaustive_edge_candidates(solver: qd.template(), contact: qd.templat
                     expected[i_e, j_e, i_b] = 1
 
 
-def _crossed_bars(n_envs, show_viewer, *, cell_size=None, cell_cap=256, sweep_cap=512,
-                  raise_on_env_failure=True):
+def _crossed_bars(n_envs, show_viewer, *, cell_size=None, sweep_cap=512, raise_on_env_failure=True):
     thickness = 2e-4
     gap = 1.5e-4
     width = 0.006
@@ -58,7 +59,6 @@ def _crossed_bars(n_envs, show_viewer, *, cell_size=None, cell_cap=256, sweep_ca
             floor_height=-float("inf"),
             contact_margin=thickness,
             contact_cell_size=cell_size,
-            contact_cell_cap=cell_cap,
             contact_sweep_cell_cap=sweep_cap,
             raise_on_env_failure=raise_on_env_failure,
         ),
@@ -101,13 +101,9 @@ def test_crossed_long_edges_are_candidates_before_surface_crossing(n_envs, show_
         assert len(set(edge_pairs)) == n_ee, "shared cells and hash aliases must not duplicate EE pairs"
 
 
-@pytest.mark.parametrize("cell_size,cell_cap,sweep_cap", [(0.012, 256, 512), (0.003, 256, 512), (0.001, 8192, 8192)])
-def test_edge_hash_pairset_matches_exhaustive_narrowphase_at_different_cell_sizes(
-    cell_size, cell_cap, sweep_cap, show_viewer
-):
-    scene, _, upper = _crossed_bars(
-        2, show_viewer, cell_size=cell_size, cell_cap=cell_cap, sweep_cap=sweep_cap
-    )
+@pytest.mark.parametrize("cell_size,sweep_cap", [(0.012, 512), (0.003, 512), (0.001, 8192)])
+def test_edge_hash_pairset_matches_exhaustive_narrowphase_at_different_cell_sizes(cell_size, sweep_cap, show_viewer):
+    scene, _, upper = _crossed_bars(2, show_viewer, cell_size=cell_size, sweep_cap=sweep_cap)
     upper.set_dofs_velocity((0.0, 0.0, -0.02, 0.0, 0.0, 0.0))
     scene.step()
     solver = scene.vbd_solver
@@ -123,14 +119,10 @@ def test_edge_hash_pairset_matches_exhaustive_narrowphase_at_different_cell_size
         assert brute
         assert len(actual) == len(set(actual)), "one pair must survive each shared-cell/hash alias only once"
         assert set(actual) == brute
-    if cell_size == 0.001:
-        # A long 60 mm edge spans more than the entire hash table, forcing repeated hash buckets.
-        cells = tensor_to_array(qd_to_torch(contact.edge_hi)) - tensor_to_array(qd_to_torch(contact.edge_lo))
-        assert np.max(cells[..., 0:2]) > contact.hash_buckets
 
 
 def test_static_long_edge_is_not_limited_by_vertex_motion_cap(show_viewer):
-    scene, _, _ = _crossed_bars(0, show_viewer, cell_size=0.0008, cell_cap=8192, sweep_cap=1)
+    scene, _, _ = _crossed_bars(0, show_viewer, cell_size=0.0008, sweep_cap=1)
     scene.step()
     contact = scene.vbd_solver.contact
     lo = tensor_to_array(qd_to_torch(contact.edge_lo))
@@ -150,3 +142,89 @@ def test_moving_vertex_sweep_still_fails_loudly(show_viewer):
     status = scene.vbd_solver.env_status()
     assert bool(status.is_failed[0])
     assert int(status.errno[0]) & int(ErrorCode.OVERFLOW_VBD_CONTACT_SWEEP)
+
+
+@qd.kernel
+def kernel_exhaustive_point_candidates(solver: qd.template(), contact: qd.template(), expected: qd.template()):
+    """Use the production swept narrowphase on every eligible point-triangle pair, without the spatial hash."""
+    for cv, i_t, i_b in qd.ndrange(contact.n_cv, contact.n_triangles, solver._B):
+        expected[cv, i_t, i_b] = 0
+        tri = contact.tri_cv[i_t]
+        if func_may_collide(cv, tri[0], contact):
+            is_adjacent = False
+            for j in qd.static(range(3)):
+                if func_shares_tetrahedron(cv, tri[j], solver, contact):
+                    is_adjacent = True
+            if not is_adjacent:
+                x0 = func_cv_pos_prev(0, cv, i_b, solver, contact)
+                a0 = func_cv_pos_prev(0, tri[0], i_b, solver, contact)
+                b0 = func_cv_pos_prev(0, tri[1], i_b, solver, contact)
+                c0 = func_cv_pos_prev(0, tri[2], i_b, solver, contact)
+                x = contact.cv_pred[cv, i_b]
+                a = contact.cv_pred[tri[0], i_b]
+                b = contact.cv_pred[tri[1], i_b]
+                c = contact.cv_pred[tri[2], i_b]
+                distance = func_swept_lower_bound(
+                    func_pair_distance(x0, a0, b0, c0, POINT_TRIANGLE),
+                    func_pair_distance(x, a, b, c, POINT_TRIANGLE),
+                    func_sweep_bound(x - x0, a - a0, b - b0, c - c0, POINT_TRIANGLE),
+                )
+                thickness = contact.rule_thickness[contact.cv_info[cv].group, contact.cv_info[tri[0]].group]
+                if distance < thickness + contact.margin_max:
+                    expected[cv, i_t, i_b] = 1
+
+
+def test_the_hash_pairsets_match_exhaustive_narrowphase_across_ruled_unruled_and_self_ruled_groups(show_viewer):
+    """The hash keys each entry by its cell and its collision group, and a query rejects an entry of a group its
+    own group has no rule with from that key alone. Four boxes, each 0.15 mm from the next inside a 0.2 mm layer: a plate
+    (group 0); a free box on it (group 1, ruled with 0); a second box on it beside the first (group 0 again, a
+    rule of group 0 with itself, so it must meet the plate and not itself); and a third box on it in group 2,
+    which has no rule with anything. Every pair the exhaustive narrowphase admits must be found once, and no
+    other."""
+    thickness, gap, size = 2e-4, 1.5e-4, 0.01
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=1e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=2, floor_height=-float("inf"), contact_margin=thickness),
+        show_viewer=show_viewer,
+    )
+    plate = scene.add_entity(morph=gs.morphs.Box(size=(0.04, 0.04, size), pos=(0.0, 0.0, 0.0), fixed=True),
+                             material=gs.materials.Rigid())
+    z = size + gap
+    free = scene.add_entity(morph=gs.morphs.Box(size=(size,) * 3, pos=(-(size + gap) / 2, 0.0, z)),
+                            material=gs.materials.Rigid())
+    same_group = scene.add_entity(morph=gs.morphs.Box(size=(size,) * 3, pos=((size + gap) / 2, 0.0, z), fixed=True),
+                                  material=gs.materials.Rigid())
+    unruled = scene.add_entity(morph=gs.morphs.Box(size=(size,) * 3, pos=(0.0, size + gap, z), fixed=True),
+                               material=gs.materials.Rigid())
+    solver = scene.vbd_solver
+    solver.add_rigid_link(free.links[0])
+    for entity, group in ((plate, 0), (free, 1), (same_group, 0), (unruled, 2)):
+        solver.add_rigid_collider(entity.links[0], collision_group=group)
+    solver.add_contact_rule(0, 1, stiffness=1e5, friction=0.0, thickness=thickness)
+    solver.add_contact_rule(0, 0, stiffness=1e5, friction=0.0, thickness=thickness)
+    scene.build()
+    scene.step()
+    contact = solver.contact
+    assert not bool(solver.env_status().is_failed[0])
+    point = qd.field(dtype=gs.qd_int, shape=(contact.n_cv, contact.n_triangles, solver._B))
+    edge = qd.field(dtype=gs.qd_int, shape=(contact.n_edges, contact.n_edges, solver._B))
+    kernel_exhaustive_point_candidates(solver, contact, point)
+    kernel_exhaustive_edge_candidates(solver, contact, edge)
+    snapshot = contact.snapshot()
+    owner = tensor_to_array(qd_to_torch(contact.cv_info.owner))
+    for kind, reference, n, a, b, ends in (
+        ("point-triangle", point, snapshot.n_pt, snapshot.pt_a, snapshot.pt_b, lambda a, b: (a, contact.tri_cv[b][0])),
+        ("edge-edge", edge, snapshot.n_ee, snapshot.ee_a, snapshot.ee_b,
+         lambda a, b: (contact.edge_cv[a][0], contact.edge_cv[b][0])),
+    ):
+        count = int(n[0])
+        found = list(zip(a[0, :count].tolist(), b[0, :count].tolist()))
+        brute = {tuple(int(i) for i in pair) for pair in np.argwhere(tensor_to_array(qd_to_torch(reference))[..., 0] == 1)}
+        assert len(found) == len(set(found)), f"{kind}: a pair was collected twice"
+        assert set(found) == brute, f"{kind}: hash and exhaustive search disagree"
+        bodies = {tuple(sorted((int(owner[x]), int(owner[y])))) for x, y in (ends(*pair) for pair in found)}
+        expected = {tuple(sorted((plate.links[0].idx, free.links[0].idx))),
+                    tuple(sorted((plate.links[0].idx, same_group.links[0].idx))),
+                    tuple(sorted((free.links[0].idx, same_group.links[0].idx)))}
+        assert bodies == expected, f"{kind}: pairs between {bodies}, expected exactly {expected}"

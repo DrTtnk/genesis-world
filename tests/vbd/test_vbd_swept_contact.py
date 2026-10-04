@@ -25,10 +25,9 @@ from genesis.utils.array_class import ErrorCode
 from genesis.engine.solvers.vbd_contact import (
     EDGE_EDGE,
     POINT_TRIANGLE,
-    func_cell_hash,
     func_edge_edge_geometry,
     func_is_canonical_cell,
-    func_is_own_cell,
+    func_is_own_entry,
     func_point_triangle_geometry,
     func_pair_distance,
     func_sweep_bound,
@@ -495,7 +494,7 @@ def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():
     assert int(frozen["n_point_pairs"][0]) + int(frozen["n_edge_pairs"][0]) > 0, "the evidence must not be empty"
 
 
-def _two_block_scene(velocity, cell=None, cell_cap=256):
+def _two_block_scene(velocity, cell=None, hash_entries=None):
     """Two tissue blocks a hair apart, both carried at the same velocity: the pair geometry is identical at every
     speed, only the swept cell ranges grow."""
     scene = gs.Scene(
@@ -503,7 +502,7 @@ def _two_block_scene(velocity, cell=None, cell_cap=256):
         rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
         vbd_options=gs.options.VBDOptions(
             n_iterations=1, floor_height=-1e3, contact_margin=1e-3, contact_cell_size=cell,
-            contact_cell_cap=cell_cap, raise_on_env_failure=False
+            contact_hash_entries=hash_entries, raise_on_env_failure=False
         ),
         show_viewer=False,
     )
@@ -541,53 +540,46 @@ def test_a_vertex_swept_across_many_cells_is_collected_once():
 def test_a_vertex_whose_swept_box_hashes_two_cells_into_one_bucket_is_still_collected_once():
     """`func_cell_hash` is a generic spatial hash, not injective per vertex: two cells of one vertex's own
     swept range can land in the same bucket, and both entries pass `func_is_canonical_cell` identically,
-    since that test reads the searched cell and the vertex's own bounds, never which slot the entry sits
-    in. A one-bucket table (`hash_buckets=1`) forces every cell to collide, so a vertex that spans two
-    cells of its own sweep is guaranteed to appear twice in the bucket. `contact.cell_c` -- the cell an
-    entry was inserted under -- and `func_is_own_cell`, which checks it against the cell currently being
-    searched, are what keep that vertex collected exactly once, in O(1) rather than the O(slot) scan
-    `func_is_first_entry` used to do."""
+    since that test reads the searched cell and the vertex's own bounds, never which entry it is. A one-bucket
+    table (`hash_buckets=1`) forces every cell to collide, so a vertex that spans two cells of its own sweep is
+    guaranteed to appear twice in the bucket. `contact.cell_key` -- the cell and group an entry was inserted
+    under -- and `func_is_own_entry`, which checks it against the cell currently being searched, are what keep
+    that vertex collected exactly once, in O(1) rather than the O(slot) scan `func_is_first_entry` used to do."""
     contact = types.SimpleNamespace(
-        cell_c=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 2, 1)),
+        cell_key=qd.Vector.field(4, dtype=gs.qd_int, shape=(2, 1)),
+        rule_stiffness=qd.field(dtype=gs.qd_float, shape=(1, 1)),
         cv_lo=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 1)),
         cv_hi=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 1)),
     )
-    cell_v = qd.field(dtype=gs.qd_int, shape=(1, 2, 1))
+    cell_v = qd.field(dtype=gs.qd_int, shape=(2, 1))
     hits = qd.field(dtype=gs.qd_int, shape=(2,))
 
     @qd.kernel
     def kernel():
-        # one vertex (cv 0) whose own sweep spans exactly two cells, K and C
+        # one vertex (cv 0, group 0) whose own sweep spans exactly two cells, K and C, both in the one bucket:
+        # entries 0 and 1 are that bucket's whole range
         cell_k = qd.Vector([0, 0, 0], dt=gs.qd_int)
         cell_c = qd.Vector([1, 0, 0], dt=gs.qd_int)
         contact.cv_lo[0, 0] = cell_k
         contact.cv_hi[0, 0] = cell_c
-        # insert cv 0 at both of its cells, exactly as kernel_begin_contact's cv loop does
-        h_k = func_cell_hash(cell_k, 1)
-        cell_v[h_k, 0, 0] = 0
-        contact.cell_c[h_k, 0, 0] = cell_k
-        h_c = func_cell_hash(cell_c, 1)
-        cell_v[h_c, 1, 0] = 0
-        contact.cell_c[h_c, 1, 0] = cell_c
+        contact.rule_stiffness[0, 0] = 1.0
+        cell_v[0, 0] = 0
+        contact.cell_key[0, 0] = qd.Vector([0, 0, 0, 0], dt=gs.qd_int)
+        cell_v[1, 0] = 0
+        contact.cell_key[1, 0] = qd.Vector([1, 0, 0, 0], dt=gs.qd_int)
         # search cell K (the canonical cell of the pair, since the search box's own lower corner is K
         # too): the bucket holds both of cv 0's entries, and only the one stored under K may match
         hits[0] = 0
         for slot in range(2):
-            cv = cell_v[h_k, slot, 0]
-            is_new = func_is_canonical_cell(cv, 0, cell_k, cell_k, contact) and func_is_own_cell(
-                h_k, slot, 0, cell_k, contact
-            )
-            if is_new:
+            cv = cell_v[slot, 0]
+            if func_is_own_entry(slot, 0, cell_k, 0, contact) and func_is_canonical_cell(cv, 0, cell_k, cell_k, contact):
                 hits[0] += 1
         # search cell C: never canonical against a search box whose lower corner is K, so it must
         # contribute nothing, collision or not
         hits[1] = 0
         for slot in range(2):
-            cv = cell_v[h_c, slot, 0]
-            is_new = func_is_canonical_cell(cv, 0, cell_c, cell_k, contact) and func_is_own_cell(
-                h_c, slot, 0, cell_c, contact
-            )
-            if is_new:
+            cv = cell_v[slot, 0]
+            if func_is_own_entry(slot, 0, cell_c, 0, contact) and func_is_canonical_cell(cv, 0, cell_c, cell_k, contact):
                 hits[1] += 1
 
     kernel()
@@ -618,8 +610,7 @@ def test_the_candidate_set_does_not_depend_on_the_grid_cell_size():
     and one of them in 36288."""
     sets = {}
     for cell in (None, 5e-4, 4e-3, 2e-2):
-        # The 0.5 mm grid puts 433 edge entries in one bucket; give every grid the same explicit room.
-        pt, ee = _candidate_set(_two_block_scene(0.0, cell=cell, cell_cap=512))
+        pt, ee = _candidate_set(_two_block_scene(0.0, cell=cell))
         sets[cell] = (pt, ee)
     reference = sets[None]
     assert reference[0] and reference[1], "the fixture must find pairs of both kinds"
@@ -628,13 +619,22 @@ def test_the_candidate_set_does_not_depend_on_the_grid_cell_size():
         assert found[1] == reference[1], f"edge-edge set changed at cell {cell}"
 
 
-def test_a_grid_bucket_overflow_fails_loudly_instead_of_returning_an_incomplete_pairset():
-    scene = _two_block_scene(0.0, cell=5e-4, cell_cap=256)
-    contact = scene.vbd_solver.contact
+def test_a_dense_grid_cell_is_searched_completely_with_the_default_options():
+    """A hash bucket used to hold at most `contact_cell_cap` entries, so a grid finer than the mesh, which puts
+    433 edge entries in one bucket here, failed the substep, and so did the bones of the python head once its jaws
+    came to rest against each other. A build now stores its entries contiguously by bucket (count, prefix sum,
+    fill), so a bucket holds whatever its cell holds, and only the total is bounded."""
+    reference = _candidate_set(_two_block_scene(0.0))
+    dense = _candidate_set(_two_block_scene(0.0, cell=5e-4))
+    assert reference[0] and reference[1], "the fixture must find pairs of both kinds"
+    assert dense == reference
+
+
+def test_a_hash_entry_overflow_fails_loudly_instead_of_returning_an_incomplete_pairset():
+    scene = _two_block_scene(0.0, hash_entries=64)
     status = scene.vbd_solver.env_status()
-    assert int(qd_to_torch(contact.cell_n).max()) > contact.hash_cap
     assert bool(status.is_failed[0])
-    assert int(status.errno[0]) & int(ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
+    assert int(status.errno[0]) & int(ErrorCode.OVERFLOW_VBD_CONTACT_HASH)
 
 
 def test_the_grid_cell_follows_the_mesh_and_not_the_contact_layer():
