@@ -58,12 +58,14 @@ NEWTON_ITERATIONS = 6
 @dataclass(frozen=True)
 class HillParameters:
     """Maximum isometric force (N), optimal fibre length (m), tendon slack length (m) and maximum contraction
-    speed (m/s) of one muscle-tendon unit."""
+    speed (m/s) of one muscle-tendon unit. Tendon strain at maximum isometric force
+    sets its linear series compliance; the legacy default is 0.04 (dimensionless)."""
 
     f_max: float
     l_opt: float
     l_slack: float
     v_max: float
+    tendon_strain_at_fmax: float = EPS_REF
 
 
 @dataclass(frozen=True)
@@ -270,7 +272,7 @@ class VBDMTU:
                 l_opt.append(parameters.l_opt)
                 l_slack.append(parameters.l_slack)
                 v_max.append(parameters.v_max)
-                k_tendon.append(parameters.f_max / (EPS_REF * parameters.l_slack))
+                k_tendon.append(parameters.f_max / (parameters.tendon_strain_at_fmax * parameters.l_slack))
             else:
                 stiffness, slack = parameters
                 f_max.append(0.0)
@@ -518,7 +520,7 @@ def func_solve_fibre(length, fibre_previous, activation, i_m, dt, mtu: qd.templa
     fibre = qd.min(fibre_previous, taut)
     for _ in range(NEWTON_ITERATIONS):
         residual = (
-            mtu.unit[i_m].f_max * qd.max(length - fibre - mtu.unit[i_m].l_slack, 0.0) / (EPS_REF * mtu.unit[i_m].l_slack)
+            k_tendon * qd.max(length - fibre - mtu.unit[i_m].l_slack, 0.0)
             - func_fibre_force(fibre, fibre_previous, activation, i_m, dt, mtu)
         )
         slope = -(k_tendon + func_fibre_slope(fibre, fibre_previous, activation, i_m, dt, mtu))
@@ -544,7 +546,7 @@ def func_unit_tension(f, i_m, i_b, length, solver: qd.template(), mtu: qd.templa
         fibre = func_solve_fibre(length, fibre_previous, activation, i_m, dt, mtu)
         extension = length - fibre - mtu.unit[i_m].l_slack
         if extension > 0.0:
-            tension = mtu.unit[i_m].f_max * extension / (EPS_REF * mtu.unit[i_m].l_slack)
+            tension = mtu.unit[i_m].k_tendon * extension
             k_tendon = mtu.unit[i_m].k_tendon
             slope = func_fibre_slope(fibre, fibre_previous, activation, i_m, dt, mtu)
             # two springs in series; the positive part is the projection the block needs when the fibre lags

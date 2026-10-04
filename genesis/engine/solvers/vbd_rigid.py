@@ -124,31 +124,30 @@ def func_ldlt6_solve(matrix: qd.types.matrix(6, 6), right_hand_side: qd.types.ve
     lower = qd.Matrix.identity(gs.qd_float, 6)
     diagonal = qd.Vector.zero(gs.qd_float, 6)
 
-    # Runtime loops keep this fixed-size solve compact in generated code.
-    for column in range(6):
+    # Static indices make each triangular access compile-time addressable.
+    for column in qd.static(range(6)):
         pivot = matrix[column, column]
-        for previous in range(column):
+        for previous in qd.static(range(column)):
             pivot -= lower[column, previous] * lower[column, previous] * diagonal[previous]
         diagonal[column] = pivot
 
-        for row in range(column + 1, 6):
+        for row in qd.static(range(column + 1, 6)):
             value = matrix[row, column]
-            for previous in range(column):
+            for previous in qd.static(range(column)):
                 value -= lower[row, previous] * lower[column, previous] * diagonal[previous]
             lower[row, column] = value / pivot
 
     forward = qd.Vector.zero(gs.qd_float, 6)
-    for row in range(6):
+    for row in qd.static(range(6)):
         value = right_hand_side[row]
-        for column in range(row):
+        for column in qd.static(range(row)):
             value -= lower[row, column] * forward[column]
         forward[row] = value
 
     solution = qd.Vector.zero(gs.qd_float, 6)
-    for row_offset in range(6):
-        row = 5 - row_offset
+    for row in qd.static(range(5, -1, -1)):
         value = forward[row] / diagonal[row]
-        for column in range(row + 1, 6):
+        for column in qd.static(range(row + 1, 6)):
             value -= lower[column, row] * solution[column]
         solution[row] = value
 

@@ -3,9 +3,12 @@
 # Genesis World
 
 Local VBD coupling spike: `tissue.add_rigid_attachments(vertices_idx, link)`
-declares two-way attachments before build. It supports one free rigid link
-at its centre of mass, or a fixed-base revolute chain with coordinate limits
-and implicit diagonal joint damping. Each tissue vertex has one link owner.
+declares two-way attachments before build. `scene.vbd_solver.add_rigid_link(link)`
+gives VBD explicit integration ownership of every free rigid link in a scene,
+including rigid-only scenes with no tissue carrier. This declaration requires
+free links with origins at their centres of mass. Tissue attachments also support
+a fixed-base revolute chain with coordinate limits and implicit diagonal joint
+damping. Each tissue vertex has one link owner.
 Both paths require Euler integration, LegacyCoupler, equal timesteps, no
 joint frictionloss, and rigid collisions disabled. The free-link path also
 requires zero armature and damping.
@@ -15,6 +18,7 @@ Differentiable coupling and rigid contacts remain outside this spike.
 Muscle entities own separate activation ranges, including their input gradients;
 snapshots restore these activations for the selected environments.
 Run `python -m pytest tests/coupling/test_vbd_rigid.py tests/vbd/test_vbd_muscle_entities.py tests/vbd/test_rigid_attachment_reference.py --backend gpu -n 0`.
+The focused CPU ownership gate is `python -m pytest tests/vbd/test_vbd_rigid_ownership.py tests/coupling/test_vbd_rigid.py tests/vbd/test_vbd_joint.py --backend cpu -n 0 -q` (19 passed on 2026-09-27). This is not a full-suite result.
 Performance and swallowing acceptance are separate checks.
 
 Local VBD rigid colouring: the free bodies' 6x6 blocks are solved one colour at
@@ -25,6 +29,28 @@ each colour, a first pass computes the contact slots and muscle link anchors
 with one thread for each entry. `VBDOptions.rigid_colour_cap` (default 8) and
 `rigid_entry_cap` (default 16384) limit the work; a substep that needs more
 fails loudly. Run `python -m pytest tests/vbd/test_vbd_rigid_colouring.py`.
+
+Local forward VBD diagnostics: `VBDOptions(record_rigid_residual=True)` records
+force/torque residuals and unapplied rigid block corrections after each solve.
+Read `scene.vbd_solver.rigid_solve_diagnostics()` after a completed step. Units
+are N/Nm and m/rad, with a solved-substep stamp. Reset invalidates the sample.
+This is opt-in work for free rigid blocks (native rods when present), not a
+coupled convergence certificate or an adaptive stop. Timing with recording on
+is not normal physics throughput. Standalone rigid-only VBD state now resets
+through the active-solver contract, including its zero-vertex snapshots. Both
+vertex snapshot arrays must match the full scene shape before restoration.
+
+The six-by-six LDLT solve now uses fixed loop indices. One warmed skull-fixed
+head comparison showed 13.7% less rigid-kernel time and 10.5% less physics wall
+time, with saved bone-coordinate differences below 2 nm over 320 ms. The shared
+GPU still took 4.58 s for 0.12 s of physics. That measurement was taken with the
+serial body schedule; the bodies are now solved by colour (see "Local VBD rigid
+colouring" above). `vbd_rigid_cooperative.py` is an unwired CUDA contact-assembly prototype, with
+same-pose and serial-order parity tests; it is not a promoted execution path.
+Run `python -m pytest tests/vbd/test_vbd_rigid_residual.py --backend cpu -n 0`
+and `python -m pytest tests/vbd/test_vbd_rigid_cooperative.py --backend gpu -n 0`.
+The full VBD/coupling gate is `python -m pytest tests/vbd
+tests/coupling/test_vbd_rigid.py --backend cpu -n 4`.
 
 Local physical attachment work: PBD entities now provide
 `attach_particles_to_link(link_idx, particles_idx_local, compliance=0.0)`.
@@ -370,3 +396,28 @@ cases are checked in `test_vbd_rod_reference.py`. Run its tests with:
 ```sh
 python -m pytest tests/vbd/test_vbd_rod.py tests/vbd/test_vbd_rod_reference.py tests/vbd/test_vbd_rod_attachment.py tests/vbd/test_vbd_rod_contact.py tests/vbd/test_vbd_rod_contact_scene.py tests/vbd/test_vbd_rod_integration.py tests/vbd/test_vbd_rod_bundle.py --backend cpu -n 0
 ```
+
+### Rigid contact regression (local VBD development)
+
+Rigid contact now checks the first rigid participant on a link before it
+computes pair geometry and friction. The pair assembly keeps the same force and
+curvature. To check point-triangle and edge-edge ownership against the original
+assembler, and the resting light-bone response, run:
+
+```sh
+PYTHONPATH=$PWD python -m pytest -n 0 --backend cpu tests/vbd/test_vbd_contact_owner.py tests/vbd/test_vbd_contact_large_step.py::test_a_light_bone_settles_on_a_plate_at_a_millisecond_substep
+```
+
+The candidate search now reuses its grid in two phases: swept vertices for point-triangle pairs, then swept whole-edge boxes for edge-edge pairs. Long crossed edges can meet at their interiors with no endpoint in the opposing search box. The real-engine coverage test checks the EE set against exhaustive swept narrowphase at several cell sizes, duplicate suppression, and the vertex-motion capacity boundary:
+
+```sh
+PYTHONPATH=$PWD python -m pytest -n 0 --backend cpu tests/vbd/test_vbd_contact_interior_edges.py
+```
+
+`VBDOptions(contact_linearization="substep")` is an opt-in local frozen-witness contact experiment; the default remains `"iterate"`. It is neither CCD nor a global noncrossing guarantee. The rigid plate test exercises the opt-in law, its PT/EE pairs, weight reaction, and reset replay:
+
+```sh
+PYTHONPATH=$PWD python -m pytest -n 0 --backend cpu tests/vbd/test_vbd_frozen_contact.py
+```
+
+The six older contact cases that initially failed when static edge extent was incorrectly subjected to the vertex-motion cap passed after that guard was removed. Grid size is a performance choice only while the configured bucket capacity is sufficient; overflow fails the environment and invalidates a candidate-set comparison. The affected swept-contact and interior-edge CPU files passed 26/26 after their tests were updated to check that condition and the motion-budget rebuild contract. A full VBD plus rigid-coupling CPU attempt ran 310 of 317 collected cases (307 passed, one existing expected failure, and two test-fixture failures); the repaired 26-case run and a separate six-case completion run passed. No single clean full-suite rerun has completed yet.

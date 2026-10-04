@@ -223,11 +223,12 @@ class VBDContact:
         self.cv_info.ref.from_numpy(np.array(cv_ref, dtype=gs.np_int))
         self.cv_info.group.from_numpy(np.array(cv_group, dtype=gs.np_int))
         self.cv_info.owner.from_numpy(np.array(cv_owner, dtype=gs.np_int))
-        self.vertex_cv = qd.field(dtype=gs.qd_int, shape=solver.n_vertices)
+        self.vertex_cv = qd.field(dtype=gs.qd_int, shape=max(solver.n_vertices, 1))
         lookup = np.full(solver.n_vertices, -1, dtype=gs.np_int)
         tissue = np.array(cv_kind) == 0
         lookup[np.array(cv_ref)[tissue]] = np.flatnonzero(tissue)
-        self.vertex_cv.from_numpy(lookup)
+        if solver.n_vertices:
+            self.vertex_cv.from_numpy(lookup)
         self.rv_link = qd.field(dtype=gs.qd_int, shape=max(self.n_rv, 1))
         self.rv_local = qd.Vector.field(3, dtype=gs.qd_float, shape=max(self.n_rv, 1))
         self.rv_cv = qd.field(dtype=gs.qd_int, shape=max(self.n_rv, 1))
@@ -291,15 +292,6 @@ class VBDContact:
         self.tri_cv.from_numpy(triangles.astype(gs.np_int))
         self.edge_cv = qd.field(dtype=gs.qd_ivec2, shape=self.n_edges)
         self.edge_cv.from_numpy(edges.astype(gs.np_int))
-        # edges incident to a contact vertex, as a CSR, for the edge-edge candidate search
-        order = np.argsort(edges.reshape(-1), kind="stable")
-        self.cv_edge_offset = qd.field(dtype=gs.qd_int, shape=self.n_cv + 1)
-        self.cv_edge_offset.from_numpy(
-            np.searchsorted(edges.reshape(-1)[order], np.arange(self.n_cv + 1)).astype(gs.np_int)
-        )
-        self.cv_edge = qd.field(dtype=gs.qd_int, shape=2 * self.n_edges)
-        self.cv_edge.from_numpy((order // 2).astype(gs.np_int))
-
         self.rule_stiffness = qd.field(dtype=gs.qd_float, shape=(n_groups, n_groups))
         self.rule_friction = qd.field(dtype=gs.qd_float, shape=(n_groups, n_groups))
         self.rule_thickness = qd.field(dtype=gs.qd_float, shape=(n_groups, n_groups))
@@ -373,6 +365,10 @@ class VBDContact:
         # grid holds the vertex in every cell of that range, and the pair tests read both ends of the sweep
         self.cv_lo = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
         self.cv_hi = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_cv, solver._B))
+        # PT uses swept vertex boxes. After PT collection, the same hash slots hold swept edge boxes for EE;
+        # only these two edge ranges need separate storage to deduplicate a pair's shared cells exactly.
+        self.edge_lo = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_edges, solver._B))
+        self.edge_hi = qd.Vector.field(3, dtype=gs.qd_int, shape=(self.n_edges, solver._B))
         # the cell each bucket slot was inserted under: two cells of one vertex's own sweep can hash to the
         # same bucket, and this is what a query tells them apart without scanning the bucket (see
         # `func_is_own_cell`)
@@ -388,6 +384,12 @@ class VBDContact:
         self.pair_cap = solver._contact_pair_cap
         self.pt_pairs = pair_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
         self.ee_pairs = pair_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
+        # A frozen witness is rebuilt from the previous configuration at every substep, including when the
+        # candidate pair set is reused. The default per-iterate law allocates no witness storage.
+        if solver._contact_linearization == "substep":
+            witness_type = qd.types.struct(normal=gs.qd_vec3, weights=gs.qd_vec4)
+            self.pt_witness = witness_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
+            self.ee_witness = witness_type.field(shape=(self.pair_cap, solver._B), layout=qd.Layout.SOA)
         self.n_pt = qd.field(dtype=gs.qd_int, shape=solver._B)
         self.n_ee = qd.field(dtype=gs.qd_int, shape=solver._B)
         # The pairs each contact vertex takes part in, as a CSR rebuilt every substep: a count per vertex, its
@@ -796,7 +798,7 @@ def func_edge_edge_geometry(a, b, c, d):
 
 
 @qd.func
-def func_pt_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
+def func_pt_actual_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     """Current distance, unit normal and closest-point weights of a point-triangle pair, with the rule thickness.
     Over the face the distance is signed by the outward triangle normal, so a point behind the surface is pushed
     back out. At an edge or a vertex it is the unsigned distance with the normal from the feature to the point: a
@@ -814,7 +816,7 @@ def func_pt_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template())
 
 
 @qd.func
-def func_ee_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
+def func_ee_actual_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
     """Current distance, unit normal (from the second edge towards the first) and closest-point parameters of an
     edge-edge pair, with the rule thickness."""
     ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
@@ -826,6 +828,60 @@ def func_ee_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template())
     dist, n, s, t = func_edge_edge_geometry(a, b, c, d)
     h = contact.rule_thickness[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
     return dist, n, s, t, h
+
+
+@qd.func
+def func_pt_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
+    """The optional signed plane follows the current vertices with previous closest weights and normal.
+
+    This is a substep-local contact row, not a first-order Taylor expansion of rigid rotation or CCD.
+    """
+    d = gs.qd_float(0.0)
+    n = gs.qd_vec3(0.0, 0.0, 0.0)
+    w = gs.qd_vec3(0.0, 0.0, 0.0)
+    h = gs.qd_float(0.0)
+    if qd.static(solver._contact_linearization == "substep"):
+        cv_x = contact.pt_pairs[i_p, i_b].a
+        tri = contact.tri_cv[contact.pt_pairs[i_p, i_b].b]
+        n = contact.pt_witness[i_p, i_b].normal
+        weights = contact.pt_witness[i_p, i_b].weights
+        x = func_cv_pos(f, cv_x, i_b, solver, contact)
+        a = func_cv_pos(f, tri[0], i_b, solver, contact)
+        b = func_cv_pos(f, tri[1], i_b, solver, contact)
+        c = func_cv_pos(f, tri[2], i_b, solver, contact)
+        d = n.dot((x - a) + weights[2] * (b - a) + weights[3] * (c - a))
+        for j in qd.static(range(3)):
+            w[j] = -weights[j + 1]
+        h = contact.rule_thickness[contact.cv_info[cv_x].group, contact.cv_info[tri[0]].group]
+    else:
+        d, n, w, h = func_pt_actual_geometry(f, i_p, i_b, solver, contact)
+    return d, n, w, h
+
+
+@qd.func
+def func_ee_geometry(f, i_p, i_b, solver: qd.template(), contact: qd.template()):
+    """The optional signed plane follows current edge endpoints with previous closest parameters."""
+    d = gs.qd_float(0.0)
+    n = gs.qd_vec3(0.0, 0.0, 0.0)
+    s = gs.qd_float(0.0)
+    t = gs.qd_float(0.0)
+    h = gs.qd_float(0.0)
+    if qd.static(solver._contact_linearization == "substep"):
+        ea = contact.edge_cv[contact.ee_pairs[i_p, i_b].a]
+        eb = contact.edge_cv[contact.ee_pairs[i_p, i_b].b]
+        n = contact.ee_witness[i_p, i_b].normal
+        weights = contact.ee_witness[i_p, i_b].weights
+        a = func_cv_pos(f, ea[0], i_b, solver, contact)
+        b = func_cv_pos(f, ea[1], i_b, solver, contact)
+        c = func_cv_pos(f, eb[0], i_b, solver, contact)
+        d_pos = func_cv_pos(f, eb[1], i_b, solver, contact)
+        s = weights[1]
+        t = -weights[3]
+        d = n.dot((a - c) + s * (b - a) - t * (d_pos - c))
+        h = contact.rule_thickness[contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group]
+    else:
+        d, n, s, t, h = func_ee_actual_geometry(f, i_p, i_b, solver, contact)
+    return d, n, s, t, h
 
 
 @qd.func
@@ -1000,22 +1056,48 @@ def func_pair_terms(f, code, i_b, solver: qd.template(), contact: qd.template())
 
 
 @qd.func
-def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact: qd.template()):
-    """Wrench (force, torque about `origin`) and 6x6 Gauss-Newton block of the contact pairs of every rigid contact
-    vertex of link i_l, for a free link with the world-frame rotation increment of the attachment block.
+def func_contact_pair_link_terms(f, i_l, i_b, origin, code, solver: qd.template(), contact: qd.template()):
+    """One pair's contribution to one link, accepted only through its first participant on that link.
 
-    The block is assembled per pair, not per vertex. When two or three participants of one pair ride on this link
-    (an edge of the bone against an edge, or a face of the bone against a point), they move together, so the
-    pair's curvature is k T^T n n^T T with T = sum_j w_j J_j over them. Summing each vertex's own k w_j^2 n n^T
-    instead drops the cross terms and underestimates the stiffness by (sum w_j)^2 / sum w_j^2, between one and
-    three: where contact dominates the block, as at a 1 ms substep on a light bone, the Newton step then
-    overshoots by that factor and the sweep oscillates rather than converges. A pair is taken once, through
-    its first participant on the link."""
+    The same routine feeds serial and cooperative assembly so their owner guard and contact law cannot drift.
+    """
     force6 = qd.Vector.zero(gs.qd_float, 6)
     hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
-    # A vertex the search gave no pair contributes an exactly zero force and an exactly zero block, so leaving it
-    # out changes no bit of the result. `link_active` holds the rest, in the order `link_rv` has them, which is
-    # what keeps the sum below independent of anything but the mesh.
+    accepted = False
+    if func_is_first_link_slot(code, i_l, i_b, contact):
+        y, n, k, scale, slide, cvs, weights, own, curved = func_pair_terms(f, code, i_b, solver, contact)
+        if curved:
+            T = qd.Matrix.zero(gs.qd_float, 3, 6)
+            for j in qd.static(range(4)):
+                if contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
+                    r = contact.rv_pos[contact.cv_info[cvs[j]].ref, i_b] - origin
+                    J = qd.Matrix.zero(gs.qd_float, 3, 6)
+                    for row in qd.static(range(3)):
+                        J[row, row] = 1.0
+                    J[0, 4] = r[2]
+                    J[0, 5] = -r[1]
+                    J[1, 3] = -r[2]
+                    J[1, 5] = r[0]
+                    J[2, 3] = r[1]
+                    J[2, 4] = -r[0]
+                    T += weights[j] * J
+            force6 = T.transpose() @ (-(y * n + scale * slide))
+            identity = qd.Matrix.identity(gs.qd_float, 3)
+            nn = n.outer_product(n)
+            hessian6 = T.transpose() @ (k * nn + scale * (identity - nn)) @ T
+            accepted = True
+    return force6, hessian6, accepted
+
+
+@qd.func
+def func_contact_link_terms(f, i_l, i_b, origin, solver: qd.template(), contact: qd.template()):
+    """Wrench and 6x6 block of each contact pair on this link, in the original slot order.
+
+    A pair is counted once through its first participant on the link. Its joint participant Jacobian retains
+    cross terms when several vertices of the same link belong to that pair.
+    """
+    force6 = qd.Vector.zero(gs.qd_float, 6)
+    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
     base = contact.link_rv_offset[i_l]
     for c in range(base, base + contact.link_active_n[i_l, i_b]):
         cv = contact.rv_cv[contact.link_active[c, i_b]]
@@ -1060,34 +1142,12 @@ def func_is_first_link_slot(code, i_l, i_b, contact: qd.template()):
 
 @qd.func
 def func_contact_slot_link_terms(f, i_l, i_b, origin, slot, solver: qd.template(), contact: qd.template()):
-    """One candidate slot's share of `func_contact_link_terms`: the pair's wrench and block if this slot is the
-    pair's first participant on link i_l and the pair is curved, else exactly zero. Adding an exact zero changes
-    no bit of a sum, so summing these over the link's slots in order is `func_contact_link_terms` itself."""
-    force6 = qd.Vector.zero(gs.qd_float, 6)
-    hessian6 = qd.Matrix.zero(gs.qd_float, 6, 6)
-    identity = qd.Matrix.identity(gs.qd_float, 3)
-    if func_is_first_link_slot(contact.cv_slot[slot, i_b], i_l, i_b, contact):
-        y, n, k, scale, slide, cvs, weights, own, curved = func_pair_terms(
-            f, contact.cv_slot[slot, i_b], i_b, solver, contact
-        )
-        if curved:
-            T = qd.Matrix.zero(gs.qd_float, 3, 6)
-            for j in qd.static(range(4)):
-                if contact.cv_info[cvs[j]].kind == 1 and contact.cv_info[cvs[j]].owner == i_l:
-                    r = contact.rv_pos[contact.cv_info[cvs[j]].ref, i_b] - origin
-                    J = qd.Matrix.zero(gs.qd_float, 3, 6)
-                    for row in qd.static(range(3)):
-                        J[row, row] = 1.0
-                    J[0, 4] = r[2]
-                    J[0, 5] = -r[1]
-                    J[1, 3] = -r[2]
-                    J[1, 5] = r[0]
-                    J[2, 3] = r[1]
-                    J[2, 4] = -r[0]
-                    T += weights[j] * J
-            force6 = T.transpose() @ (-(y * n + scale * slide))
-            nn = n.outer_product(n)
-            hessian6 = T.transpose() @ (k * nn + scale * (identity - nn)) @ T
+    """One candidate slot's share of `func_contact_link_terms`: its pair's terms through
+    `func_contact_pair_link_terms`, exactly zero unless the slot is the pair's first participant on link i_l and
+    the pair is curved. Adding an exact zero changes no bit of a sum."""
+    force6, hessian6, accepted = func_contact_pair_link_terms(
+        f, i_l, i_b, origin, contact.cv_slot[slot, i_b], solver, contact
+    )
     return force6, hessian6
 
 
@@ -1271,22 +1331,23 @@ def func_is_canonical_cell(cv, i_b, cell, lo, contact: qd.template()):
 
 
 @qd.func
-def func_is_own_cell(h, slot, i_b, cell, contact: qd.template()):
-    """Whether this bucket slot was inserted under the cell currently being searched.
+def func_is_canonical_edge_cell(i_e, i_b, cell, lo, contact: qd.template()):
+    """Accept one edge pair at the first cell shared by the queried and inserted swept edge boxes."""
+    canonical = qd.max(contact.edge_lo[i_e, i_b], lo)
+    return (cell == canonical).all() and (cell <= contact.edge_hi[i_e, i_b]).all()
 
-    Two cells of one swept vertex can hash to the same bucket, which puts the vertex in it twice, and both
+
+@qd.func
+def func_is_own_cell(h, slot, i_b, cell, contact: qd.template()):
+    """Whether this vertex- or edge-bucket slot was inserted under the cell currently being searched.
+
+    Two cells of one swept primitive can hash to the same bucket, which puts it there twice, and both
     entries then pass the canonical-cell test, since that test reads the searched cell and not the entry. But
     the two entries were inserted under different cells -- that is the only way they could collide rather than
     be the same insert -- so at most one of them can carry the cell being searched. Accepting only that one is
     what used to take `func_is_first_entry`'s O(slot) scan of the bucket; this is O(1).
     """
     return (contact.cell_c[h, slot, i_b] == cell).all()
-
-
-@qd.func
-def func_sweep_overlaps(cv, i_b, lo, hi, contact: qd.template()):
-    """Whether a vertex's swept cell range meets a searched cell range."""
-    return (contact.cv_hi[cv, i_b] >= lo).all() and (contact.cv_lo[cv, i_b] <= hi).all()
 
 
 @qd.func
@@ -1450,6 +1511,36 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                             ]
                                         else:
                                             qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS)
+    # PT has finished reading the vertex hash. Reuse its buckets for complete swept edge AABBs: two long
+    # perpendicular edges can meet at their interiors while all four endpoints lie outside one another's
+    # search boxes. Hashing only vertices therefore misses exactly the EE pair that can stop a crossing.
+    for h, i_b in qd.ndrange(contact.hash_buckets, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            contact.cell_n[h, i_b] = 0
+    for i_e, i_b in qd.ndrange(contact.n_edges, solver._B):
+        if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
+            edge = contact.edge_cv[i_e]
+            a = func_cv_pos(f, edge[0], i_b, solver, contact)
+            b = func_cv_pos(f, edge[1], i_b, solver, contact)
+            a0 = func_cv_pos_prev(f, edge[0], i_b, solver, contact)
+            b0 = func_cv_pos_prev(f, edge[1], i_b, solver, contact)
+            lo = func_cell(qd.min(qd.min(a, b), qd.min(a0, b0)), contact.cell)
+            hi = func_cell(qd.max(qd.max(a, b), qd.max(a0, b0)), contact.cell)
+            contact.edge_lo[i_e, i_b] = lo
+            contact.edge_hi[i_e, i_b] = hi
+            # An edge can be large while stationary. The sweep-cell cap bounds vertex travel, not primitive
+            # extent; the PT triangle and EE query boxes also traverse their full extents without that cap.
+            for ci in range(lo[0], hi[0] + 1):
+                for cj in range(lo[1], hi[1] + 1):
+                    for ck in range(lo[2], hi[2] + 1):
+                        cell = qd.Vector([ci, cj, ck], dt=gs.qd_int)
+                        h = func_cell_hash(cell, contact.hash_buckets)
+                        slot = qd.atomic_add(contact.cell_n[h, i_b], 1)
+                        if slot < contact.hash_cap:
+                            contact.cell_v[h, slot, i_b] = i_e
+                            contact.cell_c[h, slot, i_b] = cell
+                        else:
+                            qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
     for i_e, i_b in qd.ndrange(contact.n_edges, solver._B):
         if not solver.env_failed[i_b] and contact.rebuilding[i_b]:
             ea = contact.edge_cv[i_e]
@@ -1457,6 +1548,7 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
             b = func_cv_pos(f, ea[1], i_b, solver, contact)
             a0 = func_cv_pos_prev(f, ea[0], i_b, solver, contact)
             b0 = func_cv_pos_prev(f, ea[1], i_b, solver, contact)
+            reach = contact.max_thickness + contact.margin_max
             lo = func_cell(qd.min(qd.min(a, b), qd.min(a0, b0)) - reach, contact.cell)
             hi = func_cell(qd.max(qd.max(a, b), qd.max(a0, b0)) + reach, contact.cell)
             for ci in range(lo[0], hi[0] + 1):
@@ -1465,49 +1557,42 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                         cell = qd.Vector([ci, cj, ck], dt=gs.qd_int)
                         h = func_cell_hash(cell, contact.hash_buckets)
                         for slot in range(qd.min(contact.cell_n[h, i_b], contact.hash_cap)):
-                            cv = contact.cell_v[h, slot, i_b]
-                            is_new = func_is_canonical_cell(cv, i_b, cell, lo, contact) and func_is_own_cell(
+                            j_e = contact.cell_v[h, slot, i_b]
+                            is_new = func_is_canonical_edge_cell(j_e, i_b, cell, lo, contact) and func_is_own_cell(
                                 h, slot, i_b, cell, contact
                             )
-                            if is_new:
-                                for c_e in range(contact.cv_edge_offset[cv], contact.cv_edge_offset[cv + 1]):
-                                    j_e = contact.cv_edge[c_e]
-                                    eb = contact.edge_cv[j_e]
-                                    # an edge is reached through both endpoints: accept it through its first one, or
-                                    # through the second when the first sweeps outside the searched cells
-                                    is_accepted = cv == eb[0] or not func_sweep_overlaps(eb[0], i_b, lo, hi, contact)
-                                    if j_e > i_e and is_accepted and func_may_collide(ea[0], eb[0], contact):
-                                        is_adjacent = False
-                                        for j in qd.static(range(2)):
-                                            for l in qd.static(range(2)):
-                                                if func_shares_tetrahedron(ea[j], eb[l], solver, contact):
-                                                    is_adjacent = True
-                                        if not is_adjacent:
-                                            c = func_cv_pos(f, eb[0], i_b, solver, contact)
-                                            d = func_cv_pos(f, eb[1], i_b, solver, contact)
-                                            c0 = func_cv_pos_prev(f, eb[0], i_b, solver, contact)
-                                            d0 = func_cv_pos_prev(f, eb[1], i_b, solver, contact)
-                                            dist = func_swept_lower_bound(
-                                                func_pair_distance(a0, b0, c0, d0, EDGE_EDGE),
-                                                func_pair_distance(a, b, c, d, EDGE_EDGE),
-                                                func_sweep_bound(a - a0, b - b0, c - c0, d - d0, EDGE_EDGE),
-                                            )
-                                            h_rule = contact.rule_thickness[
-                                                contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
-                                            ]
-                                            if dist < h_rule + contact.margin_max:
-                                                i_p = qd.atomic_add(contact.n_ee[i_b], 1)
-                                                if i_p < contact.pair_cap:
-                                                    contact.ee_pairs[i_p, i_b].a = i_e
-                                                    contact.ee_pairs[i_p, i_b].b = j_e
-                                                    contact.ee_pairs[i_p, i_b].lam = 0.0
-                                                    contact.ee_pairs[i_p, i_b].k = contact.rule_stiffness[
-                                                        contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
-                                                    ]
-                                                else:
-                                                    qd.atomic_or(
-                                                        contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS
-                                                    )
+                            if j_e > i_e and is_new:
+                                eb = contact.edge_cv[j_e]
+                                if func_may_collide(ea[0], eb[0], contact):
+                                    is_adjacent = False
+                                    for j in qd.static(range(2)):
+                                        for l in qd.static(range(2)):
+                                            if func_shares_tetrahedron(ea[j], eb[l], solver, contact):
+                                                is_adjacent = True
+                                    if not is_adjacent:
+                                        c = func_cv_pos(f, eb[0], i_b, solver, contact)
+                                        d = func_cv_pos(f, eb[1], i_b, solver, contact)
+                                        c0 = func_cv_pos_prev(f, eb[0], i_b, solver, contact)
+                                        d0 = func_cv_pos_prev(f, eb[1], i_b, solver, contact)
+                                        dist = func_swept_lower_bound(
+                                            func_pair_distance(a0, b0, c0, d0, EDGE_EDGE),
+                                            func_pair_distance(a, b, c, d, EDGE_EDGE),
+                                            func_sweep_bound(a - a0, b - b0, c - c0, d - d0, EDGE_EDGE),
+                                        )
+                                        h_rule = contact.rule_thickness[
+                                            contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
+                                        ]
+                                        if dist < h_rule + contact.margin_max:
+                                            i_p = qd.atomic_add(contact.n_ee[i_b], 1)
+                                            if i_p < contact.pair_cap:
+                                                contact.ee_pairs[i_p, i_b].a = i_e
+                                                contact.ee_pairs[i_p, i_b].b = j_e
+                                                contact.ee_pairs[i_p, i_b].lam = 0.0
+                                                contact.ee_pairs[i_p, i_b].k = contact.rule_stiffness[
+                                                    contact.cv_info[ea[0]].group, contact.cv_info[eb[0]].group
+                                                ]
+                                            else:
+                                                qd.atomic_or(contact.errno[i_b], ErrorCode.OVERFLOW_VBD_CONTACT_PAIRS)
     # A pair's multiplier carries from one substep to the next, scaled by alpha gamma as the attachments' is
     # (Giles et al. 2025 Eq. 19), so the force that corrected an old violation is not replayed in full. Resetting
     # it every substep made each substep rebuild its resting forces from zero within its own sweeps; with a start
@@ -1535,6 +1620,17 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                         if code % 8 == ROLE_POINT:
                             if contact.previous_pt[code // 8, i_b].b == contact.pt_pairs[i_p, i_b].b:
                                 contact.pt_pairs[i_p, i_b].lam = contact.previous_pt[code // 8, i_b].lam
+                if qd.static(solver._contact_linearization == "substep"):
+                    d0, n0, w0 = func_point_triangle_geometry(
+                        func_cv_pos_prev(f, contact.pt_pairs[i_p, i_b].a, i_b, solver, contact),
+                        func_cv_pos_prev(f, tri[0], i_b, solver, contact),
+                        func_cv_pos_prev(f, tri[1], i_b, solver, contact),
+                        func_cv_pos_prev(f, tri[2], i_b, solver, contact),
+                    )
+                    contact.pt_witness[i_p, i_b].normal = n0
+                    contact.pt_witness[i_p, i_b].weights = gs.qd_vec4(1.0, -w0[0], -w0[1], -w0[2])
+                    if not (n0[0] == n0[0] and n0[1] == n0[1] and n0[2] == n0[2]):
+                        qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
                 contact.pt_pairs[i_p, i_b].lam *= contact.alpha * contact.gamma
                 contact.pt_pairs[i_p, i_b].c0 = 0.0
                 if contact.cv_info[contact.pt_pairs[i_p, i_b].a].kind != 1 or contact.cv_info[tri[0]].kind != 1:
@@ -1566,6 +1662,17 @@ def kernel_begin_contact(f: int, solver: qd.template(), contact: qd.template(), 
                                 and contact.previous_ee[old, i_b].b == contact.ee_pairs[i_p, i_b].b
                             ):
                                 contact.ee_pairs[i_p, i_b].lam = contact.previous_ee[old, i_b].lam
+                if qd.static(solver._contact_linearization == "substep"):
+                    d0, n0, s0, t0 = func_edge_edge_geometry(
+                        func_cv_pos_prev(f, ea[0], i_b, solver, contact),
+                        func_cv_pos_prev(f, ea[1], i_b, solver, contact),
+                        func_cv_pos_prev(f, eb[0], i_b, solver, contact),
+                        func_cv_pos_prev(f, eb[1], i_b, solver, contact),
+                    )
+                    contact.ee_witness[i_p, i_b].normal = n0
+                    contact.ee_witness[i_p, i_b].weights = gs.qd_vec4(1.0 - s0, s0, t0 - 1.0, -t0)
+                    if not (n0[0] == n0[0] and n0[1] == n0[1] and n0[2] == n0[2]):
+                        qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
                 contact.ee_pairs[i_p, i_b].lam *= contact.alpha * contact.gamma
                 contact.ee_pairs[i_p, i_b].c0 = 0.0
                 if contact.cv_info[ea[0]].kind != 1 or contact.cv_info[eb[0]].kind != 1:
@@ -1779,7 +1886,8 @@ def kernel_end_contact(f: int, substep_global: int, solver: qd.template(), conta
             contact.link_reaction[i_l, i_b] = qd.Vector.zero(qd.f64, 6)
     for i_p, i_b in qd.ndrange(contact.pair_cap, solver._B):
         if i_p < qd.min(contact.n_pt[i_b], contact.pair_cap) and not solver.env_failed[i_b]:
-            d, n, w, h = func_pt_geometry(f, i_p, i_b, solver, contact)
+            # The geometric signed-depth guard remains independent of the frozen local contact row.
+            d, n, w, h = func_pt_actual_geometry(f, i_p, i_b, solver, contact)
             if not (d == d):
                 qd.atomic_or(contact.errno[i_b], ErrorCode.INVALID_VBD_CONTACT_NAN)
             # signed over the face: a point this far behind the surface is past what the penalty can recover.

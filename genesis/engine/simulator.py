@@ -232,7 +232,7 @@ class Simulator(RBC):
 
     def reset(self, state: SimState, envs_idx=None):
         for solver, solver_state in zip(self._solvers, state):
-            if solver.n_entities > 0:
+            if solver.is_active:
                 solver.set_state(0, solver_state, envs_idx)
 
         self._coupler.reset(envs_idx=envs_idx)

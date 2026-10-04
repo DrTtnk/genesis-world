@@ -989,17 +989,15 @@ class VBDOptions(Options):
         with hundreds of contacts is not one thread's work. A substep with more entries fails with an error.
         Memory is 42 floats an entry. Defaults to 16384.
     contact_cell_cap : int, optional
-        Largest number of contact vertices a hash bucket may hold. Overflow fails the substep rather than
-        dropping a vertex silently. It has to be read together with `contact_cell_size`, because a cell sized
-        off the mesh holds far more vertices than one sized off the contact layer did: on the python head the
-        0.8 mm cell peaked at 8 vertices a bucket while the 3.1 mm cell reaches 61, and a settling pose crosses
-        64. Defaults to 256, which is 31 MB of grid on a 15 thousand vertex scene.
+        Largest number of entries a hash bucket may hold in either phase: swept vertices for point-triangle
+        search, then swept edge boxes for edge-edge search. Overflow fails the substep rather than dropping a
+        candidate silently. Read this with `contact_cell_size`: larger cells hold more entries. Defaults to
+        256, which is 31 MB of hash slots on a 15 thousand vertex scene.
     contact_sweep_cell_cap : int, optional
-        Largest number of hash-grid cells one contact vertex may sweep in a substep. The search follows each
-        vertex from the start of the substep to its predicted end, and writes it into every cell of that box, so
-        the work per vertex is the product of the three cell spans. A sweep past this cap fails the substep
-        instead of being searched: shorten the substep, or raise the margin, which raises the cell size with it.
-        Defaults to 512.
+        Largest number of hash-grid cells one contact vertex may sweep in a substep. Vertex motion is the
+        product of the three cell spans; overflow fails the substep instead of leaving its path unsearched.
+        Shorten the substep or increase this cap if motion exceeds it. Whole triangle and edge extents are
+        not limited by this vertex-travel cap. Defaults to 512.
     contact_k_max_ratio : float, optional
         Upper bound of a contact pair's stiffness as a multiple of its rule stiffness, separately from
         `constraint_k_max_ratio`, which governs attachments and ligaments. A hard attachment wants a high cap so
@@ -1010,16 +1008,16 @@ class VBDOptions(Options):
         stiffness its own rule asks for, and is refused. Defaults to `constraint_k_max_ratio`.
     contact_cell_size : float, optional
         Side of the uniform hash grid cell (m) the candidate search rasterises into. It decides nothing about
-        which pairs are found: a pair is collected when the primitive's own sweep, grown by the reach, overlaps
-        a vertex's swept box, and both are rasterised into whatever grid is in use, so the candidate set is an
-        invariant of this value and only the cost changes. Sizing it off the contact layer is the trap, because
+        which pairs are found while capacities are sufficient: point-triangle search tests triangle sweeps
+        against swept vertices, then edge-edge search tests the two swept edge boxes. Shared cells are accepted
+        once, so the candidate set is invariant to cell size. Sizing it off the contact layer is the trap, because
         the layer is a property of the tolerance and the boxes are a property of the mesh: the python head's
         0.2 mm layer gave a 0.8 mm cell for triangles averaging 2.8 mm across, so one triangle was rasterised
         into 350 cells, the largest into 36288, and a substep made 20 million cell visits to keep 560 pairs.
         Left unset it is the median contact edge length, floored at twice the reach so that growing a box by
         the reach can never add more than one cell a side. Raise it and each box touches fewer cells while each
-        cell holds more vertices; the product has a minimum near the mesh's own scale, and far above it
-        `contact_cell_cap` starts to overflow.
+        cell holds more vertices or edges; the product has a minimum near the mesh's own scale, and far above it
+        `contact_cell_cap` can overflow.
     contact_crossing_depth : float, optional
         How far behind a face (m) a contact point may be before the substep is refused as a crossing the penalty
         failed to hold. The signed point-triangle force already pushes a point that slipped behind back out, so
@@ -1046,6 +1044,16 @@ class VBDOptions(Options):
         scene's own gaps, not as a blind multiple of `contact_margin`, which may already be sized generously.
         It can never be below `contact_margin`, which is refused. Left unset it equals `contact_margin`, so every
         substep with any motion rebuilds -- the same cost this had before the option existed.
+    record_rigid_residual : bool, optional
+        Reassemble each free rigid block after the final sweep. Records its remaining wrench (N, N m)
+        and block correction (m, rad), without applying it. Diagnostic work, disabled by default.
+        This is not a complete rod/tissue/contact convergence criterion.
+    contact_linearization : str, optional
+        'iterate' evaluates the current closest geometry at each solver iteration (default).
+        'substep' is an experimental signed contact row with the normal and closest weights
+        held from the start of the substep. Witness points follow their vertices; rigid rotations
+        remain nonlinear. This is not continuous collision detection and does not guarantee
+        intersection-free steps. Candidate search and actual point-triangle crossing checks are unchanged.
     contact_ccd : bool, optional
         Whether a substep is rescaled so that no contact pair reaches `contact_ccd_gap`, instead of being refused
         when a pair crosses. After the primal solve every candidate pair is swept from the pose at the start of
@@ -1116,6 +1124,8 @@ class VBDOptions(Options):
     contact_cell_size: Optional[float] = None
     contact_crossing_depth: Optional[float] = None
     contact_k_max_ratio: Optional[float] = None
+    contact_linearization: Literal["iterate", "substep"] = "iterate"
+    record_rigid_residual: StrictBool = False
     contact_ccd: StrictBool = False
     contact_ccd_scale: PositiveFloat = 0.9
     contact_ccd_gap: NonNegativeFloat = 0.0

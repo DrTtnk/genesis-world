@@ -192,9 +192,9 @@ def _straight_rod(dtype, offset, segment, tilt):
 
 
 def test_the_rest_frame_check_holds_each_precision_to_what_it_can_represent():
-    """Half-millimetre segments 0.1 m from the origin, as in the snake head. In float32 their directions carry
-    about 1e-5 of rounding, so the check allows what the precision can represent (8 eps |x| / L); in float64
-    that bound is far below 1e-6, and 1e-6 stays the tolerance."""
+    """Half-millimetre segments 0.1 m from the origin. In float32 their directions carry about 1e-5 of rounding,
+    so the check allows what the precision can represent (8 eps |x| / L); in float64 that bound is far below
+    1e-6, and 1e-6 stays the tolerance. (The snake head has 3.8 mm segments up to 2.5 m out: |x| / L near 660.)"""
     offset = np.array([0.1, -0.08, 0.12])
     _straight_rod(torch.float32, offset, 5e-4, 0.0)
     with pytest.raises(ValueError, match="align with its centreline"):

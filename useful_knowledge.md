@@ -17,6 +17,14 @@ Lessons from wrong assumptions, recorded as they were found.
 - **A new worktree or a changed kernel source misses the offline cache.** The first run then includes the LLVM
   compile of every changed kernel. Compare test times only between runs with the same cache state.
 
+## Merging the perf branch under the WIP (2026-09-30)
+
+- **Check the function list after a scripted conflict resolution.** I replaced a function by slicing from its
+  `def` to the next blank-line pair after a line I searched for. The slice also took the next function,
+  `func_contact_dof_terms`, and every test then failed at `import genesis`. After a merge, compare the `def`
+  names of HEAD, the stash and the result; each name that is missing needs a reason. Here
+  `func_sweep_overlaps` was missing too, but for a good reason: the WIP removed its only caller.
+
 ## Rigid colouring (2026-09-30)
 
 - **Do not unroll a loop over colours with `qd.static` when the body is a whole block solve.** I did this first
@@ -190,3 +198,37 @@ A translated/rotated rest rod exposed an optimizer termination bug: Armijo backt
 ## Rod block stopping metrics
 
 The Cayley angular step has quaternion tangent norm half its angular norm. A machine-precision stopping test must use that stored coordinate metric. Coupled radius nodes use their vector norm. Head40/41 captured rotation and scale rest cases reproduced Armijo failures before these changes; energy and admissibility checks stay unchanged.
+
+- Genesis test CLI has no --precision option. The precision fixture defaults to float64 for CPU correctness tests; use the precision marker for explicit GPU float64 tests.
+
+- Quadrants can compile a variable read after an if/else only when it has an unconditional initial value. In the rigid contact owner gate, initialize the four-vertex vector before the point-triangle/edge-edge branch. Also avoid reusing one local for pair structs of different types across the branches.
+- In this checkout, `pytest` is not on the base shell PATH. Use `/home/zefiro/miniforge3/envs/snakesim/bin/python -m pytest` with `PYTHONPATH=$PWD` to run Genesis tests against this sibling checkout.
+- A box-on-plate contact scene can generate point-triangle pairs only with the falling bone as the point and the fixed plate as the triangle. Do not assume the search also emits the reverse point-triangle orientation; inspect live pair ownership before writing a coverage assertion. Edge-edge pairs in this scene contain two rigid vertices on each link.
+- Moving a pure ownership branch ahead of pair geometry preserved the physical wrench, but the Quadrants compiler changed a few last bits of the matrix arithmetic. An actual-engine oracle measured a 2.19e-17 force difference and a 1.73e-9 Hessian-entry difference; use scale-aware numerical equivalence rather than bitwise equality for this compiled path.
+
+- The old `/home/zefiro/miniconda3/envs/snakesim/bin/python` path is stale on this host. The current test interpreter is `/home/zefiro/miniforge3/envs/snakesim/bin/python`; checking the environment path before a test avoids a false execution failure.
+- In a batched Genesis scene, `RigidEntity.get_vel()` returns `(B, 3)`. NumPy `assert_allclose` requires the expected array to have the same shape; use `np.broadcast_to(expected_vec, actual.shape)` when checking all environments.
+- The 2026-09-27 stage-0 ownership gate covers 19 focused CPU tests: standalone rigid-only integration, analytical spring balance, two-environment reset, existing rigid coupling, and existing VBD joints. It is not a full engine suite or head-contact acceptance. Full log: `../snakeSimWithAstra/out/unified_avbd_implementation/vbd_owner_nearest_cpu.log`.
+
+## Frozen contact and complete edge candidates (2026-09-27)
+
+- A VBD scene can own free rigid bodies without tissue, but contact construction still allocated `vertex_cv` with a zero shape. Quadrants rejects zero dimensions. Keep one storage cell when `n_vertices == 0`, skip the empty copy, and leave the logical tissue loops at zero; do not add dummy tissue.
+- A point-triangle vertex hash is not a complete edge-edge broadphase. Two long perpendicular edges can be closer than the contact layer at their interiors while neither endpoint enters the other's swept search box. A real 60 mm crossed-bar fixture had a 0.13 mm positive gap under a 0.2 mm layer, zero PT pairs and zero EE pairs before the fix. Hash each swept edge AABB for EE, then accept only the canonical shared cell and exact hash-cell match. The PT and EE searches run sequentially, so the same hash buckets can be cleared and reused instead of allocating a second grid; I initially missed that storage reuse.
+- Candidate pair counts or tiny final reactions do not prove an active contact law. A proposed angular-momentum fixture counted pairs but produced at most tens of micronewtons after a spin; that mostly measured free integration. Require a resolved contact load or measured impulse before interpreting a conservation or refinement result. The symbolic fixed-normal torque defect remains a separate proof, not a native physical acceptance gate.
+
+- The new edge insertion initially applied `contact_sweep_cell_cap` to the whole edge AABB. That was the wrong owner for the limit: it historically bounds a vertex's *travel*, while PT triangle and EE query boxes already traverse full static primitive extents. Six contact regressions with a large fixed table failed on this new check. Remove only the edge-extent check; retain the moving-vertex cap and bucket/pair overflow. The six failed cases then passed, and dedicated tests prove both static >512-cell edges and moving-vertex overflow.
+
+- A swept-contact regression assumed that predicted-path deviation above the margin was the rebuild trigger. That is stale: `max_tissue_deviation` is diagnostic, while raw maximum vertex motion spends `d_budget`. With the complete EE grid, the native impact deviates 0.832 mm under a 1 mm margin but still spends its budget and rebuilds on the next step (counts 1 then 2, no environment failure). Test the budget and rebuild contract, not one response trajectory.
+- A cell-size invariance test compared candidate sets even when its 0.5 mm grid overflowed a 256-entry hash bucket: max occupancy was 433, errno 4224 included the fatal cell-overflow bit 128, and 14 EE pairs were absent. The helper silently clipped pair counts and ignored `env_status`. Require a healthy environment before comparing sets and choose an explicit capacity for the test's smallest cell; retain a separate real overflow test that expects failure. This is a capacity limit, not evidence that a valid grid changes physics.
+
+### 2026-09-27: standalone VBD reset must use solver activity
+
+A solver with zero owned entities can still be active: VBD may own free rigid links. `Simulator.reset` used `n_entities > 0`, so it skipped VBD state restoration, including the reset after the build warmup. The rigid residual test exposed this as a stale completed-solve marker. Use `solver.is_active` to select reset targets, as stepping does; test before-first-step refusal and reset replay on a coupled standalone scene.
+
+That reset also exposed a logical-size error: `kernel_set_vertex_state` iterated the minimum-one allocation size and read from an empty logical vertex snapshot. This caused a native segfault. Its loop must use `pos.shape[1]`, not `vertices.shape[1]`; padding is storage, not an extra physical vertex.
+
+- 2026-09-27 static VBD LDLT gate: the shell default `/home/zefiro/miniforge3/bin/python` has no pytest; use `/home/zefiro/miniforge3/envs/snakesim/bin/python` for engine tests. Quadrants `qd.static(range(row + 1, 6))` rejects `row = 5 - row_offset` because that assignment yields an Expr even when `row_offset` comes from a static loop. Iterate `qd.static(range(5, -1, -1))` directly to retain the 5-to-0 back-substitution order and make nested bounds compile-time constants. The existing 24-case SPD LDLT Torch oracle then passed on CPU and FP64 GPU.
+
+- 2026-09-27 snapshot regression fixture: VBD has no `Elastic` material class. Its supported tet material is `VBD.Muscle` (zero actuation gives the passive solid). Check the material exports before copying an API name from another solver. The first shape-test attempt failed during fixture construction, so it is not evidence of the intended RED condition.
+
+- 2026-09-27 snapshot boundary: copying the logical input length fixes zero-vertex VBD reset, but alone accepts a truncated nonempty snapshot and leaves live vertices stale. The real-scene RED check confirmed this for one and two environments. Validate both full `(B, n_vertices, 3)` shapes in `VBDSolver.set_state` before restoring rods or copying any fields.

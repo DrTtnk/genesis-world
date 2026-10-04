@@ -80,6 +80,8 @@ from genesis.engine.solvers.vbd_rigid_attachment import (
     func_update_attachment_dual,
     kernel_begin_attachment,
     kernel_end_attachment,
+    kernel_record_rigid_residual,
+    kernel_clear_rigid_residual,
     kernel_set_attachment_state,
     kernel_set_gravity_share,
     kernel_set_vertex_state,
@@ -120,6 +122,18 @@ from genesis.utils.array_class import ErrorCode
 from genesis.utils.misc import qd_to_torch, sanitize_index, tensor_to_array
 
 from .base_solver import Solver
+
+
+class RigidSolveDiagnostics(NamedTuple):
+    """Last solve's per-free-link wrench (N, N m) and unapplied correction (m, rad), shape (B, n_free, 6).
+
+    Components use world axes; torque is about the link origin. Recorded before velocity/CCD commit.
+    This checks rigid stationarity only, not free rod variables or contact feasibility.
+    """
+
+    wrench: torch.Tensor
+    correction: torch.Tensor
+    substep: torch.Tensor
 
 
 class TissueDiagnostics(NamedTuple):
@@ -223,6 +237,7 @@ class VBDSolver(Solver):
     def __init__(self, scene, sim, options):
         super().__init__(scene, sim, options)
         self._n_iterations = options.n_iterations
+        self._record_rigid_residual = options.record_rigid_residual
         self._acc = qd.f64 if options.accumulate_f64 else gs.qd_float
         self._floor_height = options.floor_height
         self._contact_stiffness = options.contact_stiffness
@@ -269,6 +284,7 @@ class VBDSolver(Solver):
                 f"below one: {self._contact_k_max_ratio} would put every contact under the stiffness its rule "
                 f"asks for."
             )
+        self._contact_linearization = options.contact_linearization
         self._contact_ccd = options.contact_ccd
         self._contact_ccd_scale = options.contact_ccd_scale
         self._contact_ccd_gap = options.contact_ccd_gap
@@ -284,6 +300,7 @@ class VBDSolver(Solver):
         self._mtu_units = []
         self._mtu_restraints = []
         self._rigid_joints = []
+        self._rigid_links = []
         self.joints = None
         self.rigid_colouring = None
         self._rod_models = []
@@ -325,6 +342,18 @@ class VBDSolver(Solver):
     @property
     def has_rigid_colouring(self):
         return self.rigid_colouring is not None
+
+    def add_rigid_link(self, link):
+        """Give VBD integration ownership of a free rigid link before scene.build()."""
+        if self._scene.is_built:
+            gs.raise_exception("Rigid links must be declared before scene.build().")
+        if not any(link is other for other in self._sim.rigid_solver.links):
+            gs.raise_exception("A VBD rigid link must belong to this scene.")
+        if link.is_fixed or not any(joint.type == gs.JOINT_TYPE.FREE for joint in link.joints):
+            gs.raise_exception("VBD integration ownership requires a free rigid link.")
+        if any(link is other for other in self._rigid_links):
+            gs.raise_exception("This rigid link is already declared for VBD integration.")
+        self._rigid_links.append(link)
 
     def add_rigid_joint(self, link_a, link_b, centre, axes, translational_stiffness, rotational_stiffness):
         """Declare a joint between two rigid links: a spring along each of three orthonormal axes and an alignment
@@ -524,6 +553,9 @@ class VBDSolver(Solver):
             gs.raise_exception("A muscle-tendon unit needs HillParameters.")
         if not parameters.f_max > 0.0 or not parameters.l_opt > 0.0 or not parameters.l_slack > 0.0:
             gs.raise_exception("A muscle-tendon unit needs f_max, l_opt and l_slack above zero.")
+        strain = parameters.tendon_strain_at_fmax
+        if isinstance(strain, bool) or not isinstance(strain, (int, float)) or not np.isfinite(strain) or strain <= 0:
+            gs.raise_exception("Tendon strain at f_max must be finite and above zero.")
         if not parameters.v_max > 0.0:
             gs.raise_exception("A muscle-tendon unit needs v_max above zero.")
         if not 0.0 <= activation0 <= 1.0:
@@ -655,6 +687,7 @@ class VBDSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def init_vertex_fields(self):
+        n_vertices = max(self._n_vertices, 1)
         struct_vert_info = qd.types.struct(
             mass=gs.qd_float,
             pinned=gs.qd_int,  # 1 when a bone owns this vertex, so the solve treats it as a boundary
@@ -664,11 +697,11 @@ class VBDSolver(Solver):
             mu_lateral=gs.qd_float,
         )
         struct_vert_state = qd.types.struct(pos=gs.qd_vec3, vel=gs.qd_vec3)
-        self.verts_info = struct_vert_info.field(shape=(self._n_vertices,), layout=qd.Layout.SOA)
+        self.verts_info = struct_vert_info.field(shape=(n_vertices,), layout=qd.Layout.SOA)
         # Frames: [f] is the state at the start of substep f, [f+1] the state after it. The buffer holds one step's
         # worth of substeps when requires_grad (the adjoint walks them backwards), a sliding pair otherwise.
         self.verts = struct_vert_state.field(
-            shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA
+            shape=(self._sim.substeps_local + 1, n_vertices, self._B), layout=qd.Layout.SOA
         )
         self.residual = qd.field(dtype=qd.f64, shape=())
         # Per-environment failure latch: 1 once a substep of that environment failed. A latched environment skips
@@ -679,20 +712,20 @@ class VBDSolver(Solver):
         # Where each pinned vertex is told to be. A prescribed boundary is per environment, because
         # every environment poses its skeleton differently, while which vertices are pinned is a
         # property of the rig and so is shared.
-        self.pin_target = qd.Vector.field(3, dtype=gs.qd_float, shape=(self._n_vertices, self._B))
+        self.pin_target = qd.Vector.field(3, dtype=gs.qd_float, shape=(n_vertices, self._B))
         # Adjoint state, one frame per position frame: dL/dx and dL/dv accumulated by the backward pass.
         struct_adj = qd.types.struct(pos=qd.types.vector(3, qd.f64), vel=qd.types.vector(3, qd.f64))
         self.adj = struct_adj.field(
-            shape=(self._sim.substeps_local + 1, self._n_vertices, self._B), layout=qd.Layout.SOA
+            shape=(self._sim.substeps_local + 1, n_vertices, self._B), layout=qd.Layout.SOA
         )
         self.z = qd.Vector.field(
-            3, dtype=qd.f64, shape=(self._n_vertices, self._B)
+            3, dtype=qd.f64, shape=(n_vertices, self._B)
         )  # adjoint of the stationarity condition
         self.xb = qd.Vector.field(
-            3, dtype=qd.f64, shape=(self._n_vertices, self._B)
+            3, dtype=qd.f64, shape=(n_vertices, self._B)
         )  # running position adjoint of the reverse sweep
-        self.yb = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # adjoint of the predictor y
-        self.gbar = qd.Vector.field(3, dtype=qd.f64, shape=(self._n_vertices, self._B))  # its right-hand side
+        self.yb = qd.Vector.field(3, dtype=qd.f64, shape=(n_vertices, self._B))  # adjoint of the predictor y
+        self.gbar = qd.Vector.field(3, dtype=qd.f64, shape=(n_vertices, self._B))  # its right-hand side
         self.adj_residual = qd.field(dtype=qd.f64, shape=())
         # Replay buffer for the solver-level adjoint: the update applied to each vertex at each sweep of each
         # substep. The reverse pass walks it backwards, subtracting each update to recover the state the forward
@@ -703,7 +736,7 @@ class VBDSolver(Solver):
         self.sweep_dx = qd.Vector.field(
             3,
             dtype=qd.f64,
-            shape=(self._sim.substeps_local, self._n_iterations, self._n_vertices, self._B)
+            shape=(self._sim.substeps_local, self._n_iterations, n_vertices, self._B)
             if self._record_sweeps
             else (1, 1, 1, 1),
         )
@@ -712,7 +745,7 @@ class VBDSolver(Solver):
         # in the same colour and be solved by the same launch. This buffer is refreshed at the start of every colour
         # pass, so a partner is at most one colour pass stale and no thread reads what another thread is writing.
         self.pos_lag = qd.Vector.field(
-            3, dtype=gs.qd_float, shape=(self._n_vertices, self._B) if self._self_thickness > 0.0 else (1, 1)
+            3, dtype=gs.qd_float, shape=(n_vertices, self._B) if self._self_thickness > 0.0 else (1, 1)
         )
 
     def init_element_fields(self):
@@ -937,7 +970,7 @@ class VBDSolver(Solver):
             (color[bends[:, a]] != color[bends[:, b]]).all()
             for a, b in ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
         )
-        n_colors = int(color.max()) + 1
+        n_colors = int(color.max()) + 1 if len(color) else 0
         perm = np.argsort(color, kind="stable")
         color_offsets = np.searchsorted(color[perm], np.arange(n_colors + 1)).tolist()
 
@@ -1076,7 +1109,10 @@ class VBDSolver(Solver):
                         torch.tensor([spec[2] for spec in self._rod_bundle_specs], dtype=gs.tc_float),
                     ),)
 
-            elems = np.concatenate([entity._v_start + entity.elems for entity in self._entities]).astype(np.int64)
+            elems = np.concatenate(
+                [entity._v_start + entity.elems for entity in self._entities]
+                + [np.zeros((0, 4), dtype=np.int64)]
+            ).astype(np.int64)
             tris = np.concatenate(
                 [entity._v_start + entity.tris for entity in self._entities if entity.n_triangles]
                 + [np.zeros((0, 3), dtype=np.int64)]
@@ -1131,8 +1167,9 @@ class VBDSolver(Solver):
                         )
             self.vo_offset, self.vo_cons = self._owner_csr(cons, color)
             self.vao_offset, self.vao_cons = self._owner_csr(acons, color)
-            self.color_perm = qd.field(dtype=gs.qd_int, shape=(self._n_vertices,))
-            self.color_perm.from_numpy(perm.astype(gs.np_int))
+            self.color_perm = qd.field(dtype=gs.qd_int, shape=(max(self._n_vertices, 1),))
+            if len(perm):
+                self.color_perm.from_numpy(perm.astype(gs.np_int))
             self.ve_offset = qd.field(dtype=gs.qd_int, shape=(self._n_vertices + 1,))
             self.ve_offset.from_numpy(ve_offset.astype(gs.np_int))
             self.ve_elem = qd.field(dtype=gs.qd_int, shape=(max(len(ve_elem), 1),))
@@ -1160,11 +1197,14 @@ class VBDSolver(Solver):
             # a vertex one edge in one substep, the largest term in the sum; times the relative precision of the
             # accumulator, that is the smallest residual the assembly can resolve.
             # A shell-only scene has no tets, so the edge scale falls back to its triangles.
-            edge_v = self.elems_info.v.to_numpy()[:, :2] if self._n_elements else self.tri_info.v.to_numpy()[:, :2]
-            pos0 = self.verts.pos.to_numpy()[0]
-            edge = float(np.linalg.norm(pos0[edge_v[:, 1], 0] - pos0[edge_v[:, 0], 0], axis=1).mean())
-            unit = float(self.verts_info.mass.to_numpy().max()) / self._substep_dt**2 * edge
-            self._force_noise = unit * (1e-13 if gs.np_float == np.float64 else 1e-6)
+            if self._n_vertices:
+                edge_v = self.elems_info.v.to_numpy()[:, :2] if self._n_elements else self.tri_info.v.to_numpy()[:, :2]
+                pos0 = self.verts.pos.to_numpy()[0]
+                edge = float(np.linalg.norm(pos0[edge_v[:, 1], 0] - pos0[edge_v[:, 0], 0], axis=1).mean())
+                unit = float(self.verts_info.mass.to_numpy().max()) / self._substep_dt**2 * edge
+                self._force_noise = unit * (1e-13 if gs.np_float == np.float64 else 1e-6)
+            else:
+                self._force_noise = 0.0
             if (self._n_triangles or self._n_stencils) and self._sim.requires_grad:
                 gs.raise_exception("Shell elements have no adjoint yet, so they cannot be used with requires_grad.")
             attached_entities = [
@@ -1179,9 +1219,19 @@ class VBDSolver(Solver):
                     for joint in self._sim.rigid_solver.joints
                 ):
                     gs.raise_exception("The rod reference supports free and fixed links only.")
-            if attached_entities:
+            if self._rigid_links:
+                undeclared = [
+                    joint.link.name for joint in self._sim.rigid_solver.joints
+                    if joint.type == gs.JOINT_TYPE.FREE
+                    and not any(joint.link is link for link in self._rigid_links)
+                ]
+                if undeclared:
+                    gs.raise_exception(f"Declare every free rigid link for VBD ownership: {sorted(undeclared)}.")
+            if attached_entities or self._rigid_links:
                 self.rigid_attachment = VBDRigidAttachment(self, attached_entities)
                 self._has_glue = self.rigid_attachment.has_glue
+            if self._record_rigid_residual and self.rigid_attachment is None:
+                gs.raise_exception("Rigid residual recording requires free VBD blocks.")
             if self._has_glue:
                 if self._contact_ccd:
                     gs.raise_exception("Rigid glue cannot be combined with contact_ccd: its rescale moves a glued "
@@ -1440,7 +1490,7 @@ class VBDSolver(Solver):
 
     @property
     def is_active(self):
-        return self.n_vertices > 0
+        return self.n_vertices > 0 or bool(self._rigid_links)
 
     def add_entity(self, idx, material, morph, surface, name: str | None = None) -> "VBDEntity":
         entity = VBDEntity(
@@ -2646,6 +2696,21 @@ class VBDSolver(Solver):
     def tissue_diagnostics(self):
         """Minimum `J / J0` and inverted tet count of the last substep, each of shape (B,). See `TissueDiagnostics`."""
         return TissueDiagnostics(qd_to_torch(self.min_j_ratio), qd_to_torch(self.n_inverted_tets))
+
+    def rigid_solve_diagnostics(self):
+        """Read the opt-in rigid residual recorded at the final solve iterate. Does not advance the scene."""
+        if not self.is_built or not self._record_rigid_residual:
+            gs.raise_exception("Build with record_rigid_residual=True to read rigid solve diagnostics.")
+        self.check_errno()
+        attachment = self.rigid_attachment
+        substep = qd_to_torch(attachment.residual_substep, copy=True)
+        if bool((substep < 0).any()):
+            gs.raise_exception("Rigid diagnostics require a completed solve after build or reset in every environment.")
+        return RigidSolveDiagnostics(
+            qd_to_torch(attachment.residual_wrench, transpose=True, copy=True),
+            qd_to_torch(attachment.residual_correction, transpose=True, copy=True),
+            substep,
+        )
 
     @qd.kernel
     def _kernel_residual(self, f: qd.i32):
@@ -4104,6 +4169,8 @@ class VBDSolver(Solver):
                     self._sim.cur_substep_global, self, self.rigid_attachment, self.rigid_colouring
                 )
             self.solve(f)
+            if self._record_rigid_residual:
+                kernel_record_rigid_residual(f, self._sim.cur_substep_global, self, self.rigid_attachment)
             if self.rod_native is not None:
                 kernel_rod_end(f, self._sim.cur_substep_global, self, self.rod_native)
             if self.contact is not None and self._contact_ccd:
@@ -4247,6 +4314,9 @@ class VBDSolver(Solver):
 
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
+            expected_shape = (self._B, self._n_vertices, 3)
+            if state.pos.shape != expected_shape or state.vel.shape != expected_shape:
+                gs.raise_exception(f"VBD vertex snapshot shape must be {expected_shape} for position and velocity.")
             envs_idx = sanitize_index(envs_idx, -1, self._B, 0, "envs_idx")
             if self.rod_native is not None:
                 self.rod_native.set_states(state.rod_states, envs_idx)
@@ -4264,6 +4334,8 @@ class VBDSolver(Solver):
                 kernel_set_gravity_share(envs_idx, state.attachment_gravity_share, self.rigid_attachment)
                 if self.rigid_colouring is not None:
                     kernel_clear_rigid_colour_errno(envs_idx, self.rigid_colouring)
+                if self._record_rigid_residual:
+                    kernel_clear_rigid_residual(envs_idx, self.rigid_attachment)
             if self.tissue_attachment is not None:
                 kernel_set_tissue_attachment_state(
                     envs_idx,

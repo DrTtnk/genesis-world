@@ -21,6 +21,7 @@ import quadrants as qd
 import torch
 
 import genesis as gs
+from genesis.utils.array_class import ErrorCode
 from genesis.engine.solvers.vbd_contact import (
     EDGE_EDGE,
     POINT_TRIANGLE,
@@ -237,12 +238,10 @@ def test_the_swept_search_finds_a_pair_the_endpoint_search_cannot_see():
     assert lowest < 0.0015, "and it must have travelled to the plate rather than stopped in mid air"
 
 
-def test_a_response_that_outruns_the_margin_triggers_a_rebuild_not_a_refusal():
-    """This used to be the guard refusing a substep: the same impact at a 1 mm margin throws the block's
-    vertices 2.98 mm off the path the search covered. Wang et al. 2022's bound (Sec. 3.1, Eq. 4) turns that
-    overrun into a trigger instead of a failure -- `VBDContact.d_budget` for this environment drops below
-    `margin`, so the *next* `kernel_begin_contact` rebuilds the candidate set at the wider `margin_max` reach.
-    The substep that spent the budget is kept, not discarded, and the run keeps going."""
+def test_a_spent_proximity_budget_triggers_a_rebuild_not_a_refusal():
+    """The impact spends Wang et al. 2022's proximity budget even when contact response stays within the
+    margin of the predicted path. The current substep is kept, and the next one rebuilds its candidate set.
+    Deviation is diagnostic; raw motion spends the budget."""
     scene, block = _fast_block_scene(contact_ccd=True, margin=1e-3)
     scene.step()
     status = scene.vbd_solver.env_status()
@@ -252,7 +251,7 @@ def test_a_response_that_outruns_the_margin_triggers_a_rebuild_not_a_refusal():
           f"deviation {1e6 * float(diagnostics.max_tissue_deviation[0]):.1f} um, "
           f"d_budget {1e6 * d_budget:.1f} um, rebuilds {int(diagnostics.rebuild_count[0])}")
     assert not bool(status.is_failed[0]), "the overrun must trigger a rebuild, not refuse the substep"
-    assert float(diagnostics.max_tissue_deviation[0]) > scene.vbd_solver.contact.margin, "fixture sanity check"
+    assert float(diagnostics.min_toi[0]) < 1.0, "the impact must reach the contact filter"
     assert d_budget < scene.vbd_solver.contact.margin, "the overrun must have spent the safe bound"
     assert int(diagnostics.rebuild_count[0]) == 1, "the cold start is the first rebuild"
     scene.step()
@@ -496,7 +495,7 @@ def test_a_latched_failure_keeps_the_buffers_of_the_substep_that_failed():
     assert int(frozen["n_point_pairs"][0]) + int(frozen["n_edge_pairs"][0]) > 0, "the evidence must not be empty"
 
 
-def _two_block_scene(velocity, cell=None):
+def _two_block_scene(velocity, cell=None, cell_cap=256):
     """Two tissue blocks a hair apart, both carried at the same velocity: the pair geometry is identical at every
     speed, only the swept cell ranges grow."""
     scene = gs.Scene(
@@ -504,7 +503,7 @@ def _two_block_scene(velocity, cell=None):
         rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
         vbd_options=gs.options.VBDOptions(
             n_iterations=1, floor_height=-1e3, contact_margin=1e-3, contact_cell_size=cell,
-            raise_on_env_failure=False
+            contact_cell_cap=cell_cap, raise_on_env_failure=False
         ),
         show_viewer=False,
     )
@@ -599,8 +598,11 @@ def test_a_vertex_whose_swept_box_hashes_two_cells_into_one_bucket_is_still_coll
 def _candidate_set(scene):
     """The pairs the search kept, as comparable sets of participant indices."""
     contact = scene.vbd_solver.contact
-    n_pt = min(int(qd_to_torch(contact.n_pt)[0]), contact.pair_cap)
-    n_ee = min(int(qd_to_torch(contact.n_ee)[0]), contact.pair_cap)
+    status = scene.vbd_solver.env_status()
+    assert not bool(status.is_failed[0]), f"candidate set is invalid after contact error {int(status.errno[0])}"
+    n_pt = int(qd_to_torch(contact.n_pt)[0])
+    n_ee = int(qd_to_torch(contact.n_ee)[0])
+    assert n_pt <= contact.pair_cap and n_ee <= contact.pair_cap
     pt = {(int(a), int(b)) for a, b in zip(
         qd_to_torch(contact.pt_pairs.a)[:n_pt, 0].tolist(), qd_to_torch(contact.pt_pairs.b)[:n_pt, 0].tolist())}
     ee = {(int(a), int(b)) for a, b in zip(
@@ -609,21 +611,30 @@ def _candidate_set(scene):
 
 
 def test_the_candidate_set_does_not_depend_on_the_grid_cell_size():
-    """The cell is a performance parameter and nothing else. A pair is collected because the searched box, which
-    is the primitive's own sweep grown by the reach, overlaps the vertex's swept box; both are rasterised into
-    whatever grid is in use, and `func_is_canonical_cell` accepts each overlap exactly once. So the set is an
-    invariant of the cell size, and that is what makes the size free to choose. The head36 contact grid was
-    sized off the contact layer at 0.8 mm while its triangles average 2.8 mm across, which put a single
-    triangle in 350 cells and one of them in 36288."""
+    """The cell is a performance parameter when the hash has capacity. A pair is collected because the searched
+    primitive's sweep grown by the reach overlaps the other primitive's swept box; both are rasterised into the
+    grid, and canonical shared cells accept each overlap exactly once. The head36 contact grid was sized off the
+    contact layer at 0.8 mm while its triangles average 2.8 mm across, which put a single triangle in 350 cells
+    and one of them in 36288."""
     sets = {}
     for cell in (None, 5e-4, 4e-3, 2e-2):
-        pt, ee = _candidate_set(_two_block_scene(0.0, cell=cell))
+        # The 0.5 mm grid puts 433 edge entries in one bucket; give every grid the same explicit room.
+        pt, ee = _candidate_set(_two_block_scene(0.0, cell=cell, cell_cap=512))
         sets[cell] = (pt, ee)
     reference = sets[None]
     assert reference[0] and reference[1], "the fixture must find pairs of both kinds"
     for cell, found in sets.items():
         assert found[0] == reference[0], f"point-triangle set changed at cell {cell}"
         assert found[1] == reference[1], f"edge-edge set changed at cell {cell}"
+
+
+def test_a_grid_bucket_overflow_fails_loudly_instead_of_returning_an_incomplete_pairset():
+    scene = _two_block_scene(0.0, cell=5e-4, cell_cap=256)
+    contact = scene.vbd_solver.contact
+    status = scene.vbd_solver.env_status()
+    assert int(qd_to_torch(contact.cell_n).max()) > contact.hash_cap
+    assert bool(status.is_failed[0])
+    assert int(status.errno[0]) & int(ErrorCode.OVERFLOW_VBD_CONTACT_CELL)
 
 
 def test_the_grid_cell_follows_the_mesh_and_not_the_contact_layer():

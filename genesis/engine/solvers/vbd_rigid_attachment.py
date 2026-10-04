@@ -40,6 +40,13 @@ class VBDRigidAttachment:
         # to -1 for a link that never moves. A fixed link still carries attachments: it just has no block.
         free_joints = [] if self.is_articulated else [j for j in self.rigid.joints if j.type == gs.JOINT_TYPE.FREE]
         self.n_free = len(free_joints)
+        if solver._record_rigid_residual:
+            if self.is_articulated or not self.n_free or (solver._rod_entities and not solver._rod_native):
+                gs.raise_exception("Rigid residual recording requires free VBD blocks and native rods when present.")
+            self.residual_wrench = qd.Vector.field(6, dtype=gs.qd_float, shape=(self.n_free, solver._B))
+            self.residual_correction = qd.Vector.field(6, dtype=gs.qd_float, shape=(self.n_free, solver._B))
+            self.residual_substep = qd.field(dtype=gs.qd_int, shape=solver._B)
+            self.residual_substep.fill(-1)
         # the links whose pose this class owns for the substep, which is what a caller must know to rescale them
         self.free_links = frozenset(joint.link.idx for joint in free_joints)
         free_slot = np.full(self.rigid.n_links, -1, dtype=gs.np_int)
@@ -207,10 +214,11 @@ class VBDRigidAttachment:
         glue_links = np.array(glue_links, dtype=gs.np_int)
         self.n_glued = len(glued)
         self.has_glue = self.n_glued > 0
-        self.glue_link = qd.field(dtype=gs.qd_int, shape=solver.n_vertices)
-        self.glue_local = qd.Vector.field(3, dtype=gs.qd_float, shape=solver.n_vertices)
-        link_of = np.full(solver.n_vertices, -1, dtype=gs.np_int)
-        local = np.zeros((solver.n_vertices, 3), dtype=gs.np_float)
+        n_vertices = max(solver.n_vertices, 1)
+        self.glue_link = qd.field(dtype=gs.qd_int, shape=n_vertices)
+        self.glue_local = qd.Vector.field(3, dtype=gs.qd_float, shape=n_vertices)
+        link_of = np.full(n_vertices, -1, dtype=gs.np_int)
+        local = np.zeros((n_vertices, 3), dtype=gs.np_float)
         if self.has_glue:
             if self.is_articulated:
                 gs.raise_exception("Rigid glue is not supported on articulated links yet.")
@@ -588,13 +596,25 @@ def func_apply_attachment_link(f, i_f, i_b, force, hessian, solver: qd.template(
 @qd.func
 def func_move_attachment_link(i_f, i_b, force, hessian, attachment: qd.template()):
     """Solve the block and move the body; the caches that follow its pose are left to the caller."""
+    func_commit_attachment_increment(i_f, i_b, func_ldlt6_solve(hessian, force), attachment)
+
+
+@qd.func
+def func_commit_attachment_increment(i_f, i_b, increment, attachment: qd.template()):
+    """Move the body by a solved block increment (translation, world rotation)."""
     i_l = attachment.free_info[i_f].link
     state = attachment.link_state[i_f, i_b]
-    increment = func_ldlt6_solve(hessian, force)
     attachment.link_state[i_f, i_b].pos += increment[:3]
     attachment.link_state[i_f, i_b].quat = func_quaternion_update(state.quat, increment[3:6])
     attachment.link_pose[i_l, i_b].pos = attachment.link_state[i_f, i_b].pos
     attachment.link_pose[i_l, i_b].quat = attachment.link_state[i_f, i_b].quat
+
+
+@qd.func
+def func_apply_attachment_increment(f, i_f, i_b, increment, solver: qd.template(), attachment: qd.template()):
+    """Commit one rigid block and refresh every pose-dependent coupling cache."""
+    func_commit_attachment_increment(i_f, i_b, increment, attachment)
+    func_refresh_attachment_link(f, i_f, i_b, solver, attachment)
 
 
 @qd.func
@@ -619,16 +639,18 @@ def func_refresh_attachment_link(f, i_f, i_b, solver: qd.template(), attachment:
 def func_solve_attachment_link(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
     """One free body's 6x6 block. Bodies couple only through the soft elements and contact, never through the
     mass matrix, so solving them one after another is Gauss-Seidel over blocks, which is what AVBD asks for."""
-    force, hessian = func_attachment_link_system(f, i_f, i_b, solver, attachment)
+    force, hessian = func_attachment_link_system(f, i_f, i_b, solver, attachment, True)
     func_apply_attachment_link(f, i_f, i_b, force, hessian, solver, attachment)
 
 
 @qd.func
-def func_attachment_link_system(f, i_f, i_b, solver: qd.template(), attachment: qd.template()):
-    """Negative gradient and 6x6 block of one free body at the current poses, with no state written."""
+def func_attachment_link_system(f, i_f, i_b, solver: qd.template(), attachment: qd.template(),
+                                include_contact: qd.template()):
+    """Negative gradient and 6x6 block of one free body at the current poses, with no state written; without
+    its contact pairs when `include_contact` is False (the cooperative prototype adds them itself)."""
     i_l = attachment.free_info[i_f].link
     force, hessian = func_attachment_link_base(f, i_f, i_b, solver, attachment)
-    if qd.static(solver.has_contact):
+    if qd.static(include_contact and solver.has_contact):
         force_c, hessian_c = func_contact_link_terms(
             f, i_l, i_b, attachment.link_state[i_f, i_b].pos, solver, solver.contact
         )
@@ -639,6 +661,24 @@ def func_attachment_link_system(f, i_f, i_b, solver: qd.template(), attachment: 
         force += force_m
         hessian += hessian_m
     return func_attachment_link_tail(i_f, i_b, force, hessian, solver, attachment)
+
+
+@qd.kernel
+def kernel_record_rigid_residual(f: int, substep: int, solver: qd.template(), attachment: qd.template()):
+    # Reassemble after all bodies and duals: a body's in-sweep force is stale once its neighbours move.
+    for i_f, i_b in qd.ndrange(attachment.n_free, solver._B):
+        if not solver.env_failed[i_b]:
+            force, hessian = func_attachment_link_system(f, i_f, i_b, solver, attachment, True)
+            attachment.residual_wrench[i_f, i_b] = force
+            attachment.residual_correction[i_f, i_b] = func_ldlt6_solve(hessian, force)
+    for i_b in range(solver._B):
+        attachment.residual_substep[i_b] = substep
+
+
+@qd.kernel
+def kernel_clear_rigid_residual(envs_idx: qd.types.ndarray(), attachment: qd.template()):
+    for i in range(envs_idx.shape[0]):
+        attachment.residual_substep[envs_idx[i]] = -1
 
 
 @qd.func
@@ -716,7 +756,7 @@ def kernel_set_gravity_share(envs_idx: qd.types.ndarray(), share: qd.types.ndarr
 def kernel_set_vertex_state(
     f: int, envs_idx: qd.types.ndarray(), pos: qd.types.ndarray(), vel: qd.types.ndarray(), vertices: qd.template()
 ):
-    for i_v, i_b_ in qd.ndrange(vertices.shape[1], envs_idx.shape[0]):
+    for i_v, i_b_ in qd.ndrange(pos.shape[1], envs_idx.shape[0]):
         i_b = envs_idx[i_b_]
         for j in qd.static(range(3)):
             vertices[f, i_v, i_b].pos[j] = pos[i_b, i_v, j]

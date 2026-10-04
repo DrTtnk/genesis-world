@@ -148,7 +148,7 @@ def _both_blocks(f: int, solver: qd.template(), attachment: qd.template(), colou
         if e < colouring.colour_entry_offset[colouring.cap, i_b]:
             func_rigid_entry_terms(f, e, i_b, solver, attachment, colouring)
     for i_f, i_b in qd.ndrange(attachment.n_free, solver._B):
-        serial_force, serial_hessian = func_attachment_link_system(f, i_f, i_b, solver, attachment)
+        serial_force, serial_hessian = func_attachment_link_system(f, i_f, i_b, solver, attachment, True)
         entry_force, entry_hessian = func_attachment_link_system_entries(f, i_f, i_b, solver, attachment, colouring)
         for r in qd.static(range(6)):
             serial[i_b, i_f, r, 6] = serial_force[r]
