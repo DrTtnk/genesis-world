@@ -368,3 +368,43 @@ def test_the_sweep_s_split_scale_passes_take_the_serial_block_s_step():
     assert int(native.errno.to_numpy()[0]) == 0
     assert np.abs(after_serial - before).max() > 1e-9, "the block took no step: nothing to compare"
     np.testing.assert_allclose(after_split, after_serial, rtol=0.0, atol=1e-13)
+
+
+def test_one_frame_read_returns_what_each_entity_returns():
+    """`VBDSolver.get_frame` reads every vertex position and every rod's scales and frames once, for a caller that
+    samples all entities each frame. Per entity, `get_positions` launches a kernel of its own and `get_rod_state`
+    reads every rod's state to return one, which made sampling the python head's 40 rods cost about 0.2 s a frame.
+    Both must agree exactly."""
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=1e-3, substeps=1, gravity=(0.0, 0.0, -9.81)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False, integrator=gs.integrator.Euler),
+        vbd_options=gs.options.VBDOptions(n_iterations=8, floor_height=-float("inf"), rod_solver="native"),
+        show_viewer=False,
+    )
+    short = np.array([[0.0, 0.0, 0.30], [0.0, 0.0, 0.294], [0.0, 0.0, 0.288], [0.0, 0.0, 0.282]])
+    long = np.array([[0.05, 0.0, 0.30 - 0.005 * i] for i in range(6)])
+    rod_a = scene.add_entity(morph=gs.morphs.Rod(verts=short, frames=_frames_along(short, np.zeros(3)), radius=6e-4),
+                             material=gs.materials.VBD.Rod(**MATERIAL))
+    tissue = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.01, 0.01, 0.01), pos=(-0.05, 0.0, 0.3), nobisect=False, maxvolume=2e-8),
+        material=gs.materials.VBD.Muscle(E=1e5, nu=0.4),
+    )
+    rod_b = scene.add_entity(morph=gs.morphs.Rod(verts=long, frames=_frames_along(long, np.zeros(5)), radius=6e-4),
+                             material=gs.materials.VBD.Rod(**MATERIAL))
+    scene.build()
+    for rod in (rod_a, rod_b):
+        pinned = np.zeros(rod.n_vertices, dtype=bool)
+        pinned[0] = True
+        rod.set_pinned(pinned)
+    for _ in range(5):
+        scene.step()
+    positions, rods = scene.sim.vbd_solver.get_frame()
+    for entity in (rod_a, tissue, rod_b):
+        np.testing.assert_array_equal(positions[:, entity.v_start : entity.v_start + entity.n_vertices],
+                                      tensor_to_array(entity.get_positions()))
+    assert set(rods) == {rod_a.idx, rod_b.idx}
+    for rod in (rod_a, rod_b):
+        state = rod.get_rod_state()
+        scale, quat = rods[rod.idx]
+        np.testing.assert_array_equal(scale, tensor_to_array(state.scale))
+        np.testing.assert_array_equal(quat, tensor_to_array(state.quat))

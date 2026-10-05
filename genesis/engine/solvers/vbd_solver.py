@@ -4431,6 +4431,23 @@ class VBDSolver(Solver):
                 else:
                     self.mtu.set_snapshot(state.mtu_state, envs_idx)
 
+    def get_frame(self):
+        """Every vertex's position at the current substep, (B, n_vertices, 3), and every rod's scales (B, n) and
+        frames (B, n - 1, 4) by entity index, as numpy arrays from one read of each field. For a caller that samples
+        all entities each frame: an entity's own `get_positions` launches a kernel of its own, and `get_rod_state`
+        reads every rod to return one, which made sampling the python head's 40 rods cost about 0.2 s a frame."""
+        pos = torch.empty((self._B, self._n_vertices, 3), dtype=gs.tc_float, device=gs.device)
+        vel = torch.empty_like(pos)
+        self._kernel_get_state(self._sim.cur_substep_local, pos, vel)
+        if self.rod_native is not None:
+            scales, quats = self.rod_native.get_arrays()
+        else:
+            states = [model.get_state() for model in self._rod_models]
+            scales = tuple(tensor_to_array(state.scale)[None] for state in states)
+            quats = tuple(tensor_to_array(state.quat)[None] for state in states)
+        rods = {entity.idx: (scale, quat) for entity, scale, quat in zip(self._rod_entities, scales, quats)}
+        return tensor_to_array(pos), rods
+
     def get_state(self, f):
         if not self.is_active:
             return None

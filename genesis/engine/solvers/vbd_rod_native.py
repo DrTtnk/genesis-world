@@ -141,21 +141,30 @@ class VBDRodNative:
         self.velocity.v1.fill(0.0)
         self.errno.fill(0)
 
+    def get_arrays(self):
+        """Every rod's scales (B, n) and frames (B, n - 1, 4) as numpy arrays, from one read of each field."""
+        scale, quat = self.scale.to_numpy(), self.quat.to_numpy()
+        return (
+            tuple(scale[node_start : node_start + n_segments + 1].T for node_start, n_segments, _ in self._layout),
+            tuple(quat[s0 : s0 + n_segments].transpose(1, 0, 2) for _, n_segments, s0 in self._layout),
+        )
+
     def get_states(self):
         """One `vbd_rod.RodState` per rod, each field with a leading environment axis: scale (B, n), frames
         (B, n - 1, 4) and director velocity (B, n - 1, 3, 2), the reference's layout per environment."""
         from genesis.engine.solvers.vbd_rod import RodState
 
-        scale, quat = self.scale.to_numpy(), self.quat.to_numpy()
+        scales, quats = self.get_arrays()
         v0, v1 = self.velocity.v0.to_numpy(), self.velocity.v1.to_numpy()
-        states = []
-        for node_start, n_segments, s0 in self._layout:
-            states.append(RodState(
-                torch.tensor(scale[node_start : node_start + n_segments + 1].T, device=gs.device),
-                torch.tensor(quat[s0 : s0 + n_segments].transpose(1, 0, 2), device=gs.device),
-                torch.tensor(np.stack((v0, v1), axis=-1)[s0 : s0 + n_segments].transpose(1, 0, 2, 3), device=gs.device),
-            ))
-        return tuple(states)
+        velocity = np.stack((v0, v1), axis=-1)
+        return tuple(
+            RodState(
+                torch.tensor(scale, device=gs.device),
+                torch.tensor(quat, device=gs.device),
+                torch.tensor(velocity[s0 : s0 + n_segments].transpose(1, 0, 2, 3), device=gs.device),
+            )
+            for scale, quat, (_, n_segments, s0) in zip(scales, quats, self._layout)
+        )
 
     def set_states(self, states, envs_idx):
         """Write snapshots taken by `get_states` back, for the environments in `envs_idx`."""
