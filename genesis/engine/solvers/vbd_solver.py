@@ -704,6 +704,14 @@ class VBDSolver(Solver):
             shape=(self._sim.substeps_local + 1, n_vertices, self._B), layout=qd.Layout.SOA
         )
         self.residual = qd.field(dtype=qd.f64, shape=())
+        # the device-side loop state of `_kernel_solve`: its two do_while counters (ndarrays, since a graph's
+        # condition must be the same physical buffer every launch), the sweep and colour it is at, and how many
+        # colours some environment uses this substep
+        self._solve_sweeps = qd.ndarray(gs.qd_int, shape=())
+        self._solve_colours = qd.ndarray(gs.qd_int, shape=())
+        self._solve_sweep = qd.field(dtype=gs.qd_int, shape=())
+        self._solve_colour = qd.field(dtype=gs.qd_int, shape=())
+        self._solve_colours_used = qd.field(dtype=gs.qd_int, shape=())
         # Per-environment failure latch: 1 once a substep of that environment failed. A latched environment skips
         # every update until it is reset, so its state stays at the failed attempt for diagnosis.
         self.env_failed = qd.field(dtype=gs.qd_int, shape=(self._B,))
@@ -2364,6 +2372,11 @@ class VBDSolver(Solver):
         kernel launches. The launches cost a few microseconds each against a step of about a millisecond, while
         the inlining costs about 4.6 seconds of Quadrants front-end work per sweep on every process start.
         """
+        self._func_sweeps(f, sweep)
+
+    @qd.func
+    def _func_sweeps(self, f, sweep):
+        """The body of `_kernel_sweeps`, shared with the one-launch solve `_kernel_solve`."""
         self._func_sweep(f, sweep)
         if qd.static(self.has_rod_native):
             # frames in two colours, then each rod's coupled scales, after the vertices of the same sweep
@@ -2400,6 +2413,11 @@ class VBDSolver(Solver):
 
         Three passes, one thread an item: the colour's entries (glue, contact slots, link anchors, joints), then
         each body's block summed from its own and solved, then the caches at the new poses."""
+        self._func_rigid_colour(f, c)
+
+    @qd.func
+    def _func_rigid_colour(self, f, c):
+        """The body of `_kernel_rigid_colour`, shared with the one-launch solve `_kernel_solve`."""
         for t in range(self.rigid_colouring.colour_entry_max[c] * self._B):
             i_b = t % self._B
             e = self.rigid_colouring.colour_entry_offset[c, i_b] + t // self._B
@@ -2421,6 +2439,52 @@ class VBDSolver(Solver):
     @qd.kernel
     def _kernel_sweep_duals(self, f: qd.i32, sweep: qd.i32):
         """The multiplier half of one sweep, after the vertices, rods and free bodies have moved."""
+        self._func_sweep_duals(f, sweep)
+
+    @qd.kernel(graph=True)
+    def _kernel_solve(
+        self, f: qd.i32, sweeps: qd.types.ndarray(qd.i32, ndim=0), colours: qd.types.ndarray(qd.i32, ndim=0)
+    ):
+        """All `n_iterations` sweeps of a substep in one launch: what `_sweep` does once a sweep, looped on the device.
+
+        Driven from Python, a sweep is one call for the vertices and rods, one for each of the `rigid_colour_cap`
+        colour slots whether a colour is in use or not, and one for the multipliers. On the python head's bones
+        that was 100 calls a substep at about 50 us of host time each, against 3 ms of GPU work, so the GPU sat
+        idle most of the step. Here the sweep index and the colour index live on the device, the outer loop runs
+        the sweeps and the inner one only the colours some environment uses (`n_colours`). A
+        `qd.graph.do_while` body runs once before its counter is read, so a substep with no colour in use still
+        runs colour 0, which holds no body then, and the counters never go below zero."""
+        for _ in range(1):
+            sweeps[()] = self._n_iterations
+            self._solve_sweep[None] = 0
+        while qd.graph.do_while(sweeps):
+            sweep = self._solve_sweep[None]
+            self._func_sweeps(f, sweep)
+            if qd.static(self.has_rigid_colouring):
+                for _ in range(1):
+                    used = 0
+                    for i_b in range(self._B):
+                        used = qd.max(used, self.rigid_colouring.n_colours[i_b])
+                    self._solve_colours_used[None] = used
+                    self._solve_colour[None] = 0
+                    colours[()] = used
+                while qd.graph.do_while(colours):
+                    # No runtime `if` around the passes: loops inside one are no longer top level and would run on
+                    # a single thread. A colour index with no bodies, which the do-while's first pass can be, finds
+                    # every item outside its colour's offsets and does nothing.
+                    c = self._solve_colour[None]
+                    self._func_rigid_colour(f, c)
+                    for _ in range(1):
+                        self._solve_colour[None] = c + 1
+                        colours[()] = qd.max(self._solve_colours_used[None] - c - 1, 0)
+            self._func_sweep_duals(f, sweep)
+            for _ in range(1):
+                self._solve_sweep[None] = sweep + 1
+                sweeps[()] = self._n_iterations - sweep - 1
+
+    @qd.func
+    def _func_sweep_duals(self, f, sweep):
+        """The body of `_kernel_sweep_duals`, shared with the one-launch solve `_kernel_solve`."""
         if qd.static(self.has_rigid_attachment):
             for i_a, i_b in qd.ndrange(self.rigid_attachment.n_attachments, self._B):
                 if not self.env_failed[i_b]:
@@ -2875,6 +2939,8 @@ class VBDSolver(Solver):
                     kernel_sweep_articulation(
                         f, sweep, self, rigid.dyn_state, rigid.dyn_info, rigid.rigid_info, rigid.rigid_config
                     )
+            elif not self._sim.requires_grad:
+                self._kernel_solve(f, self._solve_sweeps, self._solve_colours)
             else:
                 for sweep in range(self._n_iterations):
                     self._sweep(f, sweep)
