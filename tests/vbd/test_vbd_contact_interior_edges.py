@@ -228,3 +228,26 @@ def test_the_hash_pairsets_match_exhaustive_narrowphase_across_ruled_unruled_and
                     tuple(sorted((plate.links[0].idx, same_group.links[0].idx))),
                     tuple(sorted((free.links[0].idx, same_group.links[0].idx)))}
         assert bodies == expected, f"{kind}: pairs between {bodies}, expected exactly {expected}"
+
+
+def test_each_edge_s_query_cells_start_at_the_prefix_sum_of_the_box_volumes(show_viewer):
+    """The search deals the cells of all query boxes round-robin over its threads, so one long primitive no longer
+    runs as one thread: on the python head one edge's grown box held 945 cells, and its thread made 21 thousand
+    lookups while the mean edge made 588, which set the time of the whole search. A thread finds the primitive of a
+    cell from the exclusive prefix sum of the box volumes. After a step the arrays hold the edge-edge phase: each
+    edge's box grown by the reach, and its cells starting where the sum says."""
+    scene, _, upper = _crossed_bars(0, show_viewer, cell_size=0.001, sweep_cap=8192)
+    upper.set_dofs_velocity((0.0, 0.0, -0.02, 0.0, 0.0, 0.0))
+    scene.step()
+    contact = scene.vbd_solver.contact
+    n = contact.n_edges
+    lo = contact.query_lo.to_numpy()[:n, 0]
+    hi = contact.query_hi.to_numpy()[:n, 0]
+    start = contact.query_start.to_numpy()[: n + 1, 0]
+    edge_lo = contact.edge_lo.to_numpy()[:, 0]
+    edge_hi = contact.edge_hi.to_numpy()[:, 0]
+    assert ((edge_lo - 1 <= lo) & (lo <= edge_lo)).all() and ((edge_hi <= hi) & (hi <= edge_hi + 1)).all(), (
+        "a query box is the edge's box grown by the reach, at most a cell a side"
+    )
+    assert start[0] == 0 and (np.diff(start) == np.prod(hi - lo + 1, axis=1)).all()
+    assert np.prod(hi - lo + 1, axis=1).max() > 100, "the fixture must hold a long edge, or this proves nothing"
