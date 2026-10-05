@@ -546,12 +546,12 @@ def test_a_vertex_whose_swept_box_hashes_two_cells_into_one_bucket_is_still_coll
     under -- and `func_is_own_entry`, which checks it against the cell currently being searched, are what keep
     that vertex collected exactly once, in O(1) rather than the O(slot) scan `func_is_first_entry` used to do."""
     contact = types.SimpleNamespace(
-        cell_key=qd.Vector.field(4, dtype=gs.qd_int, shape=(2, 1)),
+        cell_key=qd.Vector.field(4, dtype=gs.qd_int, shape=2),
         rule_stiffness=qd.field(dtype=gs.qd_float, shape=(1, 1)),
         cv_lo=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 1)),
         cv_hi=qd.Vector.field(3, dtype=gs.qd_int, shape=(1, 1)),
     )
-    cell_v = qd.field(dtype=gs.qd_int, shape=(2, 1))
+    cell_v = qd.field(dtype=gs.qd_int, shape=2)
     hits = qd.field(dtype=gs.qd_int, shape=(2,))
 
     @qd.kernel
@@ -563,22 +563,22 @@ def test_a_vertex_whose_swept_box_hashes_two_cells_into_one_bucket_is_still_coll
         contact.cv_lo[0, 0] = cell_k
         contact.cv_hi[0, 0] = cell_c
         contact.rule_stiffness[0, 0] = 1.0
-        cell_v[0, 0] = 0
-        contact.cell_key[0, 0] = qd.Vector([0, 0, 0, 0], dt=gs.qd_int)
-        cell_v[1, 0] = 0
-        contact.cell_key[1, 0] = qd.Vector([1, 0, 0, 0], dt=gs.qd_int)
+        cell_v[0] = 0
+        contact.cell_key[0] = qd.Vector([0, 0, 0, 0], dt=gs.qd_int)
+        cell_v[1] = 0
+        contact.cell_key[1] = qd.Vector([1, 0, 0, 0], dt=gs.qd_int)
         # search cell K (the canonical cell of the pair, since the search box's own lower corner is K
         # too): the bucket holds both of cv 0's entries, and only the one stored under K may match
         hits[0] = 0
         for slot in range(2):
-            cv = cell_v[slot, 0]
+            cv = cell_v[slot]
             if func_is_own_entry(slot, 0, cell_k, 0, contact) and func_is_canonical_cell(cv, 0, cell_k, cell_k, contact):
                 hits[0] += 1
         # search cell C: never canonical against a search box whose lower corner is K, so it must
         # contribute nothing, collision or not
         hits[1] = 0
         for slot in range(2):
-            cv = cell_v[slot, 0]
+            cv = cell_v[slot]
             if func_is_own_entry(slot, 0, cell_c, 0, contact) and func_is_canonical_cell(cv, 0, cell_c, cell_k, contact):
                 hits[1] += 1
 
@@ -691,3 +691,25 @@ def test_a_free_rigid_body_departs_from_its_prediction_by_nothing_while_it_falls
     assert not bool(status.is_failed[0]), f"the fall must not be refused (errno {int(status.errno[0])})"
     assert worst_motion > 5.0 * scene.vbd_solver.contact.margin, "the bone must really have outrun the margin"
     assert worst_deviation < 0.1 * worst_motion, "and its travel must be the prediction's, not the solve's"
+
+
+@pytest.mark.parametrize("n", [1, 31, 32, 33, 1023, 1024, 1025, 40001, 349323])
+def test_the_flat_scan_is_an_exclusive_cumulative_sum_at_every_size(n):
+    """The hash and the query boxes start each bucket and box at the exclusive prefix sum of their counts
+    (`func_flat_scan`). It sums in chunks of `SCAN_CHUNK` level by level up and writes the prefixes back down, so
+    every size that ends a chunk or a level early is a case."""
+    from genesis.engine.solvers.vbd_contact import func_flat_scan, scan_scratch_slots
+
+    count = qd.field(dtype=gs.qd_int, shape=n)
+    start = qd.field(dtype=gs.qd_int, shape=n)
+    scratch = qd.field(dtype=gs.qd_int, shape=scan_scratch_slots(n))
+
+    @qd.kernel
+    def kernel():
+        func_flat_scan(count, start, scratch, n)
+
+    values = np.random.default_rng(n).integers(0, 6, n).astype(np.int32)
+    count.from_numpy(values)
+    kernel()
+    assert (start.to_numpy() == np.concatenate(([0], np.cumsum(values)[:-1]))).all()
+    assert (count.to_numpy() == values).all(), "the counts are left as they were"

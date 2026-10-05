@@ -243,7 +243,7 @@ def test_each_edge_s_query_cells_start_at_the_prefix_sum_of_the_box_volumes(show
     n = contact.n_edges
     lo = contact.query_lo.to_numpy()[:n, 0]
     hi = contact.query_hi.to_numpy()[:n, 0]
-    start = contact.query_start.to_numpy()[: n + 1, 0]
+    start = contact.query_start.to_numpy()[: n + 1]
     edge_lo = contact.edge_lo.to_numpy()[:, 0]
     edge_hi = contact.edge_hi.to_numpy()[:, 0]
     assert ((edge_lo - 1 <= lo) & (lo <= edge_lo)).all() and ((edge_hi <= hi) & (hi <= edge_hi + 1)).all(), (
